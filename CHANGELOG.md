@@ -1,3 +1,8 @@
+## <small>0.10.19 (2026-09-27)</small>
+
+* fix(memory): single-flight Brain hydration so racing cold readers never search an empty index ([0fb803187b064106f180aa37481744b8b161cf93](https://github.com/framerslab/agentos/commit/0fb803187b064106f180aa37481744b8b161cf93))
+* chore(sandbox): write the forge result marker as escapes so the file diffs as text ([1e9921837385b8218774955b699d949c233e52ea](https://github.com/framerslab/agentos/commit/1e9921837385b8218774955b699d949c233e52ea))
+
 ## <small>0.10.18 (2026-09-12)</small>
 
 * fix(providers): don't throw on reasoning-only /v1/responses output ([e116f4ed5cbcecb35f0ddbb350ff2fa0ea42eec3](https://github.com/framerslab/agentos/commit/e116f4ed5cbcecb35f0ddbb350ff2fa0ea42eec3))
