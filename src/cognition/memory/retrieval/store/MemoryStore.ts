@@ -548,8 +548,12 @@ export class MemoryStore {
    * the durable backing store that survives process restarts.
    */
   private brain: import('./Brain.js').Brain | null = null;
-  /** Whether {@link MemoryStore.ensureHydratedFromBrain} has already run for this instance. */
-  private brainHydrated = false;
+  /**
+   * Single-flight hydration from the attached Brain: null until the first
+   * reader arrives, then the one shared load every later (and concurrent)
+   * reader awaits. See {@link MemoryStore.ensureHydratedFromBrain}.
+   */
+  private brainHydration: Promise<void> | null = null;
   /** Namespace shared by stores that address the same backing resource. */
   private coordinationNamespace: object;
   /** Lifecycle-registered callbacks used to invalidate sibling store caches. */
@@ -873,11 +877,27 @@ export class MemoryStore {
    * holds the user's full history. Runs at most once per instance and is
    * best-effort: a SQL/schema error must never break the query path.
    */
-  private async ensureHydratedFromBrain(): Promise<void> {
-    if (this.brainHydrated) return;
+  private ensureHydratedFromBrain(): Promise<void> {
+    if (!this.brain) return Promise.resolve();
+    // Single-flight, not a boolean latch. The old flag was set before the
+    // first await, so a second query arriving while the first was still
+    // loading rows skipped this guard, searched a still-empty index, and
+    // silently recalled nothing (on a host that reuses one store across
+    // concurrent readers, that surfaced as a companion "forgetting"
+    // everything on the first turn after its facade was rebuilt). Every
+    // caller now awaits the SAME load. The promise stays settled after a
+    // failure on purpose: hydration is best-effort and must not retry on
+    // every query.
+    if (!this.brainHydration) {
+      this.brainHydration = this.hydrateFromBrain();
+    }
+    return this.brainHydration;
+  }
+
+  /** The one hydration pass behind {@link MemoryStore.ensureHydratedFromBrain}. */
+  private async hydrateFromBrain(): Promise<void> {
     const brain = this.brain;
     if (!brain) return;
-    this.brainHydrated = true; // set first: a failure must not retry on every query
     const namespace = this.coordinationNamespace;
     const hydrationDeleteEpoch = getDeleteEpoch(namespace);
     try {
