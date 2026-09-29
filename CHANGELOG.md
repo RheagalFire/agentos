@@ -1,3 +1,7 @@
+## <small>0.10.20 (2026-09-29)</small>
+
+* fix(memory): MemoryStore keeps the full-text index in step with durable writes ([75373d681dcd9a2fe03888b2609e08c4ff493de6](https://github.com/framerslab/agentos/commit/75373d681dcd9a2fe03888b2609e08c4ff493de6))
+
 ## <small>0.10.19 (2026-09-27)</small>
 
 * fix(memory): single-flight Brain hydration so racing cold readers never search an empty index ([0fb803187b064106f180aa37481744b8b161cf93](https://github.com/framerslab/agentos/commit/0fb803187b064106f180aa37481744b8b161cf93))
