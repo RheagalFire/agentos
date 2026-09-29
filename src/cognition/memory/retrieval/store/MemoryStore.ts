@@ -524,6 +524,53 @@ async function withTraceOperation<T>(
 // MemoryStore
 // ---------------------------------------------------------------------------
 
+/**
+ * Sync one durable trace row into the Brain's full-text index.
+ *
+ * `memory_traces_fts` is an external-content index with no triggers, so it
+ * only covers rows a writer syncs explicitly — the Memory facade and
+ * MemoryAddTool do. Without this, every trace written through
+ * `MemoryStore.store()` (the whole cognitive pipeline) was invisible to
+ * lexical recall and MemorySearchTool.
+ *
+ * The rowid lookup is scoped by `(brain_id, id)`: several brains may share
+ * one database, and a trace id alone can match another brain's row. The
+ * caller skips Postgres — the adapter's `syncInsert` there can only target
+ * `WHERE id = $1`, which is not brain-scoped on a shared table (no Postgres
+ * sync existed on this path before either).
+ *
+ * The index is secondary: a sync failure never fails the durable write. Any
+ * row the index misses — and any stale posting an `INSERT OR REPLACE`
+ * revival leaves behind — is repaired the next time the Brain opens (see
+ * `Brain._repairFullTextIndex`). The write and the sync are separate
+ * statements, so two processes reviving the SAME trace id at once could in
+ * principle leave one revision's tokens under the other's row; that race
+ * needs same-id revival across processes and is not caught by the open-time
+ * check, which compares row sets rather than content.
+ */
+async function syncTraceFullTextIndex(
+  brain: import('./Brain.js').Brain,
+  trace: MemoryTrace,
+): Promise<void> {
+  try {
+    await brain.run(
+      brain.features.fts.syncInsert(
+        'memory_traces_fts',
+        '(SELECT rowid FROM memory_traces WHERE brain_id = ? AND id = ?)',
+        ['content', 'tags'],
+      ),
+      [brain.brainId, trace.id, trace.content, JSON.stringify(trace.tags)],
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // SQL.js builds without FTS5 never create the index; nothing to sync.
+    if (message.includes('no such module: fts5') || message.includes('no such table: memory_traces_fts')) {
+      return;
+    }
+    console.warn(`[MemoryStore] full-text index sync failed for trace ${trace.id}: ${message}`);
+  }
+}
+
 export class MemoryStore {
   /** Max traces hydrated from the Brain per instance (most-recent first); bounds the per-request load. */
   private static readonly HYDRATION_LIMIT = 1000;
@@ -1136,37 +1183,36 @@ export class MemoryStore {
     if (brain) {
       try {
         const { dialect } = brain.features;
-        const result = await brain.run(
-          dialect.insertOrReplace(
-            'memory_traces',
-            ['brain_id', 'id', 'type', 'scope', 'content', 'embedding', 'strength', 'created_at', 'last_accessed', 'retrieval_count', 'tags', 'emotions', 'metadata', 'deleted'],
-            ['?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '0'],
-            'brain_id, id',
-          ),
-          [
-            brain.brainId,
-            trace.id,
-            trace.type,
-            trace.scope,
-            trace.content,
-            embeddingToBlob(embedding),
-            trace.encodingStrength,
-            trace.createdAt,
-            trace.lastAccessedAt,
-            trace.retrievalCount,
-            JSON.stringify(trace.tags),
-            JSON.stringify(trace.emotionalContext),
-            JSON.stringify({
-              scopeId: trace.scopeId,
-              provenance: trace.provenance,
-              entities: trace.entities,
-              stability: trace.stability,
-              importance: trace.importance,
-              associatedTraceIds: trace.associatedTraceIds,
-              structuredData: trace.structuredData,
-            }),
-          ],
+        const insertSql = dialect.insertOrReplace(
+          'memory_traces',
+          ['brain_id', 'id', 'type', 'scope', 'content', 'embedding', 'strength', 'created_at', 'last_accessed', 'retrieval_count', 'tags', 'emotions', 'metadata', 'deleted'],
+          ['?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '?', '0'],
+          'brain_id, id',
         );
+        const insertParams = [
+          brain.brainId,
+          trace.id,
+          trace.type,
+          trace.scope,
+          trace.content,
+          embeddingToBlob(embedding),
+          trace.encodingStrength,
+          trace.createdAt,
+          trace.lastAccessedAt,
+          trace.retrievalCount,
+          JSON.stringify(trace.tags),
+          JSON.stringify(trace.emotionalContext),
+          JSON.stringify({
+            scopeId: trace.scopeId,
+            provenance: trace.provenance,
+            entities: trace.entities,
+            stability: trace.stability,
+            importance: trace.importance,
+            associatedTraceIds: trace.associatedTraceIds,
+            structuredData: trace.structuredData,
+          }),
+        ];
+        const result = await brain.run(insertSql, insertParams);
         if (result.changes === 0) {
           throw new Error('durable write affected no rows');
         }
@@ -1178,6 +1224,14 @@ export class MemoryStore {
         // vector that could belong to that successful writer.
         markTraceDeleted(namespace, trace.id, false);
         throw new Error('MemoryStore.store: durable trace write failed');
+      }
+      // The durable row is committed; bring the full-text index with it.
+      // Deliberately NOT a nested brain.transaction(): store() may itself run
+      // inside a caller's transaction, and the adapter's transaction queue
+      // would deadlock on a second owner. A missed sync is repaired by the
+      // exact open-time check in Brain.
+      if (brain.features.dialect.name !== 'postgres') {
+        await syncTraceFullTextIndex(brain, trace);
       }
     }
 
