@@ -176,25 +176,41 @@ export class MetapromptExecutor {
     const pendingEvents = this.config.getPendingEvents();
 
     for (const metaPrompt of persona.metaPrompts) {
-      if (!metaPrompt.trigger) continue;
+      const trigger = metaPrompt.trigger;
+      if (!trigger) continue;
 
-      if (metaPrompt.trigger.type === 'turn_interval') {
-        if (countTurn && (await this.advanceTurnInterval(metaPrompt, metaPrompt.trigger.intervalTurns))) {
-          triggeredMetaPrompts.push(metaPrompt);
+      switch (trigger.type) {
+        case 'turn_interval':
+          if (countTurn && (await this.advanceTurnInterval(metaPrompt, trigger.intervalTurns))) {
+            triggeredMetaPrompts.push(metaPrompt);
+          }
+          break;
+        case 'event_based': {
+          const eventName = trigger.eventName;
+          if (pendingEvents.has(eventName as GMIEventType)) {
+            triggeredMetaPrompts.push(metaPrompt);
+            pendingEvents.delete(eventName as GMIEventType);
+          }
+          break;
         }
-      } else if (metaPrompt.trigger.type === 'event_based') {
-        const eventName = metaPrompt.trigger.eventName;
-        if (pendingEvents.has(eventName as GMIEventType)) {
-          triggeredMetaPrompts.push(metaPrompt);
-          pendingEvents.delete(eventName as GMIEventType);
+        case 'manual': {
+          const manualFlag = await this.config.workingMemory.get<boolean>(
+            `manual_trigger_${metaPrompt.id}`,
+          );
+          if (manualFlag) {
+            triggeredMetaPrompts.push(metaPrompt);
+            await this.config.workingMemory.delete(`manual_trigger_${metaPrompt.id}`);
+          }
+          break;
         }
-      } else if (metaPrompt.trigger.type === 'manual') {
-        const manualFlag = await this.config.workingMemory.get<boolean>(
-          `manual_trigger_${metaPrompt.id}`,
-        );
-        if (manualFlag) {
-          triggeredMetaPrompts.push(metaPrompt);
-          await this.config.workingMemory.delete(`manual_trigger_${metaPrompt.id}`);
+        default: {
+          // Persona JSON is cast rather than type-checked, so other trigger
+          // types reach this point at runtime. Nothing ever fires them.
+          const unsupportedType = String((trigger as { type?: unknown }).type);
+          this.warnInvalidTrigger(
+            metaPrompt,
+            `trigger type '${unsupportedType}' is not supported (expected turn_interval, event_based or manual)`,
+          );
         }
       }
     }
@@ -659,8 +675,10 @@ export class MetapromptExecutor {
    *
    * 1. Extracts the template string from the metaprompt definition.
    * 2. Substitutes `{{variable}}` placeholders with provided values.
-   * 3. Calls the LLM with JSON response format.
-   * 4. Parses the JSON response with LLM-based recovery via IUtilityAI.
+   * 3. Resolves the model and provider: the metaprompt's own, then the
+   *    persona defaults, then the GMI defaults.
+   * 4. Calls the LLM with JSON response format.
+   * 5. Parses the JSON response with LLM-based recovery via IUtilityAI.
    *
    * @param metaPrompt - The metaprompt definition.
    * @param variables - Key-value pairs to substitute into the template.
@@ -682,16 +700,13 @@ export class MetapromptExecutor {
       finalPrompt = finalPrompt.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), value);
     }
 
-    const persona = this.config.getPersona();
-    const modelId = metaPrompt.modelId || persona.defaultModelId;
-    const providerId = metaPrompt.providerId || persona.defaultProviderId;
-
-    if (!modelId || !providerId) {
-      throw new GMIError(
-        'No model or provider specified for metaprompt',
-        GMIErrorCode.CONFIGURATION_ERROR,
-      );
-    }
+    // Same resolution as the self-reflection path: the metaprompt's own model
+    // and provider, then the persona defaults, then the GMI's configured
+    // defaults. Throws a CONFIGURATION_ERROR GMIError when nothing resolves.
+    const { modelId, providerId } = this.config.getModelAndProvider(
+      metaPrompt.modelId,
+      metaPrompt.providerId,
+    );
 
     this.config.addTraceEntry(
       'DEBUG',

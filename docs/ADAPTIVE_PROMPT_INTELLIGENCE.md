@@ -99,9 +99,9 @@ export interface MetaPromptDefinition {
   description?: string;
   /** The prompt template, with `{{variable}}` placeholders. */
   promptTemplate: string | { template: string; variables?: string[] };
-  /** Model override (falls back to persona.defaultModelId). */
+  /** Model override (falls back to persona.defaultModelId, then the GMI's default model). */
   modelId?: string;
-  /** Provider override (falls back to persona.defaultProviderId). */
+  /** Provider override (falls back to persona.defaultProviderId, then the GMI's default provider). */
   providerId?: string;
   /** Max tokens for the metaprompt response. Default 512. */
   maxOutputTokens?: number;
@@ -119,7 +119,7 @@ export interface MetaPromptDefinition {
 
 A persona's `metaPrompts?: MetaPromptDefinition[]` lives at [`IPersonaDefinition.ts:438`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/personas/IPersonaDefinition.ts). The runtime merges these with the active preset list (see [Built-in presets](#built-in-presets) below); persona-defined entries override preset entries on matching ID.
 
-The template uses `{{variable}}` placeholders that the executor substitutes with values from the running context. Every handler has its own variable set, documented inline alongside the preset definitions in [`metaprompt_presets.ts`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/personas/metaprompt_presets.ts).
+The template uses `{{variable}}` placeholders that the executor substitutes with values from the running context. Every handler has its own variable set, documented inline alongside the preset definitions in [`metaprompt_presets.ts`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/personas/metaprompt_presets.ts). The `gmi_self_trait_adjustment` handler supplies `evidence`, `current_mood`, `user_skill` and `task_complexity`. A placeholder outside the handler's set reaches the model unreplaced. On the response side, `applyMetapromptUpdates` applies `updatedGmiMood`, `updatedUserSkillLevel`, `updatedTaskComplexity` and `newMemoryImprints`; any other field is ignored.
 
 ## Three trigger types
 
@@ -165,6 +165,8 @@ flowchart TD
 ```
 
 The metaprompts that fire on one turn form one batch, and the metaprompts in a batch execute in parallel via `Promise.allSettled`, so one slow handler does not block the others. Batches run in the background, one at a time per GMI, in the order they were triggered, so two batches never race on the same mood or context field. Failures are logged to the reasoning trace and do not block the user-visible response. Metaprompt work never changes the GMI's lifecycle state (`getCurrentState()`), so the next turn can start while a batch is still running.
+
+These three are the only trigger types. A metaprompt with any other `trigger.type` never fires: the executor records one `WARNING` trace entry for it, and [`validatePersona`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/personas/PersonaValidation.ts) reports it as `unsupported_metaprompt_trigger`. Validation also reports `invalid_metaprompt_interval` for an `intervalTurns` that is not a number of at least 1, and `unknown_metaprompt_event` for an `eventName` that is not a [`GMIEventType`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/GMIEvent.ts) value. All three are warnings, so strict validation marks such a persona `degraded` rather than blocking it, unless `treatWarningsAsErrors` or `blockOnCodes` names the code.
 
 ### `turn_interval` — periodic self-regulation
 
@@ -318,8 +320,8 @@ onMemoryImprint: (content: string, tags: string[]) => Promise<void>;
 | Surface | Field name in metaprompt response | Where it surfaces in next turn |
 |---|---|---|
 | **GMI mood** | `updatedGmiMood` | The mood string is appended to the system prompt and read by the LLM as voice/tone guidance. Mood values are validated against the [`GMIMood`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/IGMI.ts) enum; unknown values are dropped. |
-| **User context** | `updatedUserSkillLevel`, `updatedUserSentiment`, `updatedUserPreferences` | The inferred user profile injected into the prompt and consumed by `ContextualPromptElement.criteria.userSkillLevel` matching. |
-| **Task context** | `updatedTaskComplexity`, `updatedTaskPhase`, `updatedActiveGoal` | The task profile injected into the prompt and consumed by `ContextualPromptElement.criteria.taskComplexity` matching. |
+| **User context** | `updatedUserSkillLevel` | The inferred user profile injected into the prompt and consumed by `ContextualPromptElement.criteria.userSkillLevel` matching. |
+| **Task context** | `updatedTaskComplexity` | The task profile injected into the prompt and consumed by `ContextualPromptElement.criteria.taskComplexity` matching. |
 | **Working memory imprints** | `newMemoryImprints: [{ key, value, description? }]` | Set on working memory via `workingMemory.set(key, value)`. Imprints persist across turns within the session and are readable by any subsequent prompt assembly or tool. |
 | **HEXACO traits** | (Not a metaprompt surface — mutated by [`AdaptPersonalityTool`](https://github.com/framerslab/agentos/blob/master/src/cognition/emergent/AdaptPersonalityTool.ts) and `PersonaDriftMechanism`.) | The trait values modulate three cognitive memory mechanisms (involuntary recall, consolidation, schema encoding) and the trait paragraph appended to the system prompt. |
 
@@ -546,7 +548,7 @@ Three knobs change the cost curve directly:
 |---|---|
 | `intervalTurns` on the self-reflection metaprompt | Linear. Doubling from 5 to 10 halves the periodic-reflection cost. |
 | `consecutiveTurnsForTrigger` on `sentimentTracking` | Reduces event firings. Default 2; raise to 3-4 to require more sustained signal before paying for a recovery metaprompt. |
-| `metaPrompt.modelId` per metaprompt | Override the persona's model with a cheaper one for reflection. The presets ship with `modelId: undefined` so they fall back to the persona default; setting them to a small model isolates adaptive overhead from your main completion model. |
+| `metaPrompt.modelId` per metaprompt | Override the persona's model with a cheaper one for reflection. The presets ship with `modelId: undefined` so they fall back to the persona default, or to the GMI's default model when the persona sets none; setting them to a small model isolates adaptive overhead from your main completion model. |
 
 ### Latency
 

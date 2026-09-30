@@ -1,12 +1,14 @@
 /**
- * @fileoverview Metaprompt lifecycle tests for the GMI.
+ * @fileoverview GMI metaprompt tests: lifecycle state, one-at-a-time batches,
+ * shutdown, turn_interval cadence, and the metaprompts of the shipped voice
+ * assistant persona.
  *
  * Each case drives a real GMI, MetapromptExecutor, PromptEngine and
  * InMemoryWorkingMemory. Only the LLM provider is stubbed, along with the tool
- * orchestrator and utility AI, which these turns use for nothing beyond an
- * empty tool list and JSON parsing. Metaprompt completions are either answered
- * at once or held open and settled by hand, so each case controls when a
- * background batch finishes relative to the turns around it.
+ * orchestrator and the IUtilityAI dependency, which these turns use for
+ * nothing beyond an empty tool list and JSON parsing. Metaprompt completions
+ * are either answered at once or held open and settled by hand, so each case
+ * controls when a background batch finishes relative to the turns around it.
  */
 import { beforeAll, describe, expect, it, vi, type Mock } from 'vitest';
 
@@ -23,6 +25,7 @@ import {
   ReasoningTraceEntry,
 } from '../IGMI';
 import type { IPersonaDefinition, MetaPromptDefinition } from '../personas/IPersonaDefinition';
+import { getBuiltInPersona } from '../personas/definitions';
 import { InMemoryWorkingMemory } from '../memory/InMemoryWorkingMemory';
 import { PromptEngine } from '../../../core/llm/PromptEngine';
 import type { AIModelProviderManager } from '../../../core/llm/providers/AIModelProviderManager';
@@ -530,4 +533,56 @@ describe('turn_interval cadence', () => {
       expect(warningsMentioning(h.gmi, 'intervalTurns')).toHaveLength(1);
     },
   );
+});
+
+describe('metaprompts the executor cannot run', () => {
+  it('reports an unsupported trigger type once and never fires it', async () => {
+    // Persona JSON is cast, not type-checked, so this shape reaches the executor.
+    const preResponse = {
+      id: 'voice_polish',
+      promptTemplate: 'Polish {{recent_conversation}} and reply with JSON.',
+      trigger: { type: 'pre_response' },
+      modelId: MODEL_ID,
+      providerId: PROVIDER_ID,
+    } as unknown as MetaPromptDefinition;
+    const h = await createHarness(createPersona([preResponse]), 'not json');
+
+    await runTurn(h.gmi, 'turn-1');
+    await runTurn(h.gmi, 'turn-2');
+
+    expect(triggeredTurnIds(h.gmi)).toEqual([]);
+    expect(h.generateCompletion).not.toHaveBeenCalled();
+    expect(warningsMentioning(h.gmi, "'voice_polish'").map((entry) => entry.message)).toEqual([
+      "Metaprompt 'voice_polish' will not run: trigger type 'pre_response' is not supported (expected turn_interval, event_based or manual).",
+    ]);
+  });
+});
+
+describe('shipped voice assistant persona', () => {
+  it('runs its trait adjustment every 7 user turns on the GMI default model and applies the result', async () => {
+    const persona = getBuiltInPersona('voice_assistant_persona');
+    if (!persona) throw new Error('voice_assistant_persona is not a built-in persona');
+    const h = await createHarness(
+      persona,
+      JSON.stringify({ updatedGmiMood: GMIMood.FOCUSED, adjustmentRationale: 'The user wants short spoken answers.' }),
+    );
+
+    for (let turn = 1; turn <= 7; turn += 1) {
+      await runTurn(h.gmi, `turn-${turn}`);
+    }
+    expect(triggeredTurnIds(h.gmi)).toEqual(['turn-7']);
+    await waitForTrace(h.gmi, ReasoningEntryType.SELF_REFLECTION_COMPLETE, 1);
+
+    // The persona pins no model, so the reflection runs on the GMI's configured default.
+    expect(h.generateCompletion).toHaveBeenCalledTimes(1);
+    const [modelId, messages, options] = h.generateCompletion.mock.calls[0];
+    expect(modelId).toBe(MODEL_ID);
+    expect(options).toMatchObject({ maxTokens: 400, responseFormat: { type: 'json_object' } });
+    const prompt = String(messages[0]?.content);
+    expect(prompt).toContain('Current mood: helpful_engaged.');
+    expect(prompt).not.toMatch(/\{\{\s*\w+\s*\}\}/);
+
+    expect(await currentMood(h)).toBe(GMIMood.FOCUSED);
+    expect(warningsMentioning(h.gmi, 'will not run')).toEqual([]);
+  });
 });
