@@ -1,3 +1,16 @@
+## <small>0.10.23 (2026-09-30)</small>
+
+* fix(agent): replay tool calls, tool results and thinking from session history ([426867dadea39209386b51d3b2d145cc2c5a41bd](https://github.com/framerslab/agentos/commit/426867dadea39209386b51d3b2d145cc2c5a41bd))
+* fix(api): apply the global default model only to tasks it can serve ([e5c569a21695fe61df174a20ee1d983c6ecebf78](https://github.com/framerslab/agentos/commit/e5c569a21695fe61df174a20ee1d983c6ecebf78))
+* fix(api): fail over when the primary provider cannot initialize ([11a611969117b24e18d3950a33b7fc5b9f9be682](https://github.com/framerslab/agentos/commit/11a611969117b24e18d3950a33b7fc5b9f9be682))
+* fix(gemini): send a tool result that is not a JSON object as { result } ([e65007319b8ebf0bb172d650681e89dc89821899](https://github.com/framerslab/agentos/commit/e65007319b8ebf0bb172d650681e89dc89821899))
+* fix(mistral): send tool call ids in the nine-character form Mistral accepts ([61038a5df5b486f3c3ed1ba8d207b57a8ebc0f26](https://github.com/framerslab/agentos/commit/61038a5df5b486f3c3ed1ba8d207b57a8ebc0f26))
+* fix(providers): keep Gemini-only customModelParams off other vendors' requests ([d0b597999ffb0fa52d543a035a4cff942a65b688](https://github.com/framerslab/agentos/commit/d0b597999ffb0fa52d543a035a4cff942a65b688))
+* fix(providers): list each model once per provider that serves it ([2279d4a495079945f816b12ee2b3ca97f2cf62ee](https://github.com/framerslab/agentos/commit/2279d4a495079945f816b12ee2b3ca97f2cf62ee))
+* fix(together): default to a model Together serverless still serves ([325e36ec3af658b250951f7b40257e56750572fc](https://github.com/framerslab/agentos/commit/325e36ec3af658b250951f7b40257e56750572fc))
+* docs: session replay, failover on init failure and after output, customModelParams per leg, global default scope ([6c314d00dc715ba0d142ac7acde20ba5c658daf7](https://github.com/framerslab/agentos/commit/6c314d00dc715ba0d142ac7acde20ba5c658daf7))
+* refactor(providers): share the request secret masking helper ([8812c4b949ad1f7ede6538d97f43c6c462559d97](https://github.com/framerslab/agentos/commit/8812c4b949ad1f7ede6538d97f43c6c462559d97))
+
 ## <small>0.10.22 (2026-09-30)</small>
 
 * fix(providers): mask configured secrets in Gemini request errors ([167e3161680c92bf9fbe3087a537e793ad60f8a4](https://github.com/framerslab/agentos/commit/167e3161680c92bf9fbe3087a537e793ad60f8a4))
