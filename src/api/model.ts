@@ -350,6 +350,50 @@ export function resolveModelOption(opts: ModelOption, task: TaskType = 'text'): 
  */
 const managerCache = new Map<string, Promise<AIModelProviderManager>>();
 
+/**
+ * Thrown by {@link createProviderManager} when the requested provider did not
+ * initialize: a rejected or revoked API key (the provider's model listing
+ * answers 401), an unreachable endpoint, or a provider id the manager does
+ * not know. The fallback walker treats it as retryable, so a primary whose
+ * key stopped working fails over like one that answers 401 on the call.
+ *
+ * `httpStatus` repeats the cause's HTTP status when it has one, which the
+ * provider health registry uses to pick its cooldown.
+ */
+export class ProviderInitializationError extends Error {
+  /** Provider that failed to initialize. */
+  public readonly providerId: string;
+  /** HTTP status of the underlying failure, when it had one. */
+  public readonly httpStatus?: number;
+  /** The error the provider threw during initialization, when there was one. */
+  public readonly cause?: unknown;
+
+  constructor(providerId: string, cause?: unknown) {
+    const detail =
+      cause instanceof Error
+        ? cause.message
+        : cause !== undefined
+          ? String(cause)
+          : 'the provider was not registered';
+    super(`Provider '${providerId}' failed to initialize: ${detail}`);
+    this.name = 'ProviderInitializationError';
+    this.providerId = providerId;
+    this.cause = cause;
+    const status = httpStatusOf(cause);
+    if (status !== undefined) this.httpStatus = status;
+  }
+}
+
+/** Reads a numeric HTTP status from the fields provider errors use. */
+function httpStatusOf(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const e = error as { httpStatus?: unknown; status?: unknown; statusCode?: unknown };
+  for (const value of [e.httpStatus, e.status, e.statusCode]) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
 function buildCacheKey(resolved: ResolvedProvider): string {
   return `${resolved.providerId}::${resolved.apiKey ?? ''}::${resolved.baseUrl ?? ''}`;
 }
@@ -363,11 +407,16 @@ function buildCacheKey(resolved: ResolvedProvider): string {
  *
  * The manager is cached process-wide by resolved key + base URL, so repeated
  * calls with the same credentials reuse one manager instead of allocating
- * a new one per LLM call.
+ * a new one per LLM call. A provider that fails to initialize is not cached:
+ * the call throws and the next call with the same credentials initializes
+ * again, so a transient failure (a network blip, a 503 from the model
+ * listing) does not disable the provider for the life of the process.
  *
  * @param resolved - A `ResolvedProvider` produced by {@link resolveProvider}
  *   or `resolveMediaProvider()`.
  * @returns A fully initialised {@link AIModelProviderManager} instance.
+ * @throws {ProviderInitializationError} When the requested provider did not
+ *   initialize.
  */
 export async function createProviderManager(
   resolved: ResolvedProvider
@@ -396,6 +445,16 @@ export async function createProviderManager(
         },
       ],
     });
+
+    // initialize() logs a provider's failure and leaves it unregistered.
+    // Surface it with its cause so callers can fail over, and reject so the
+    // handler below drops this manager from the cache.
+    if (!manager.getProvider(resolved.providerId)) {
+      throw new ProviderInitializationError(
+        resolved.providerId,
+        manager.getProviderInitError(resolved.providerId),
+      );
+    }
 
     return manager;
   })();

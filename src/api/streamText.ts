@@ -13,7 +13,7 @@ import { attachGenAiAttributes, attachUsageAttributes, toTurnMetricUsage } from 
 import { fireLlmUsageObserver } from './observers.js';
 import { hostPolicyToRouteParams, mergeRequiredCapabilities } from './runtime/hostPolicy.js';
 import { adaptTools } from './runtime/toolAdapter.js';
-import { runEmulatedToolLoop, type ToolMode } from './runtime/tool-emulation/index.js';
+import { runEmulatedToolLoop, toShimMessages, type ToolMode } from './runtime/tool-emulation/index.js';
 import {
   buildPolicyAwareFallbackChain,
   createPlan,
@@ -311,6 +311,10 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
   // report `ttfbMs`; stays undefined when the stream errors before
   // producing any part.
   let firstPartAt: number | undefined;
+  // Set once the prompt-tool shim runs a tool: its rounds are buffered and
+  // yield nothing until the end, so firstPartAt cannot show them. A stream
+  // whose tools ran is not restarted on a fallback provider.
+  let shimRanTool = false;
 
   async function* runStream(): AsyncGenerator<StreamPart> {
     const startedAt = Date.now();
@@ -535,10 +539,12 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
       async function* runShimStream(): AsyncGenerator<StreamPart> {
         const loopResult = await runEmulatedToolLoop({
           tools: Array.from(toolMap.values()),
-          messages: messages.map((m) => ({
-            role: String(m.role),
-            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
-          })),
+          onToolExecute: () => {
+            shimRanTool = true;
+          },
+          // Native tool turns in the history become the shim's own
+          // <tool_call> / <tool_response> text.
+          messages: toShimMessages(messages),
           maxRoundtrips: opts.maxSteps ?? 5,
           callModel: async (msgs) => {
             // provider is guaranteed non-undefined by the `if (!provider) throw`
@@ -1118,7 +1124,12 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
         ? buildPolicyAwareFallbackChain(opts.policyTier, recordedProviderId)
        : opts.fallbackProviders;
 
-      if (effectiveFallbacks.length && isRetryableError(error)) {
+      // A stream that already handed text or tool activity to the consumer
+      // is not restarted on another provider: the consumer would receive the
+      // partial answer followed by a fresh one, and tools could run twice.
+      // firstPartAt is stamped when the first part reaches the consumer.
+      const deliveredOutput = firstPartAt !== undefined || shimRanTool;
+      if (effectiveFallbacks.length && isRetryableError(error) && !deliveredOutput) {
         let lastFallbackError: Error = error;
         let fallbackSucceeded = false;
         let fallbackFinishReason: StreamFinishReason = 'stop';

@@ -378,7 +378,12 @@ export {
   clearDefaultProvider,
   type GlobalDefaultProvider,
 } from './api/runtime/global-default.js';
-export { parseModelString, resolveProvider, resolveModelOption } from './api/model.js';
+export {
+  parseModelString,
+  resolveProvider,
+  resolveModelOption,
+  ProviderInitializationError,
+} from './api/model.js';
 export { PROVIDER_DEFAULTS, autoDetectProvider } from './api/runtime/provider-defaults.js';
 export type { ProviderDefaults } from './api/runtime/provider-defaults.js';
 export {

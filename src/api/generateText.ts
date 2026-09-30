@@ -21,7 +21,7 @@ import {
   type HostLLMPolicy,
 } from './runtime/hostPolicy.js';
 import { adaptTools, type AdaptableToolInput } from './runtime/toolAdapter.js';
-import { runEmulatedToolLoop, type ToolMode } from './runtime/tool-emulation/index.js';
+import { runEmulatedToolLoop, toShimMessages, type ToolMode } from './runtime/tool-emulation/index.js';
 import type { AgentOSUsageLedgerOptions } from './runtime/usageLedger.js';
 import { resolveDynamicToolCalls } from './runtime/dynamicToolCalling.js';
 import type { ITool, ToolExecutionContext } from '../core/tools/ITool.js';
@@ -742,6 +742,15 @@ export interface GenerateTextOptions {
    * captured positionally). Not part of the public API.
    */
   _transcriptIncludeTrailingCallerMessages?: number;
+  /**
+   * INTERNAL (failover): the call a fallback leg continues. The leg keeps
+   * the call's tool run id, so tool execution contexts carry the same
+   * session, numbers its steps from `stepOffset` in hooks, synthetic tool
+   * call ids and tool contexts, and reports the call's original `prompt` to
+   * hooks (a leg that continues after tool rounds receives it inside
+   * `messages` instead). Not part of the public API.
+   */
+  _continuation?: { helperToolRunId: string; stepOffset: number; prompt?: string };
 }
 
 /**
@@ -1119,6 +1128,78 @@ function formatPlanForPrompt(plan: Plan): string {
  */
 const RETRYABLE_HTTP_STATUSES = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
 
+/** Native tool rounds a generateText attempt completed before it failed. */
+interface CompletedToolRounds {
+  /** The conversation so far, without the leading system block. */
+  messages: Array<Record<string, unknown>>;
+  /** How many of those messages are caller history rather than this call's. */
+  callerHistoryCount: number;
+  /** Tool calls the completed rounds recorded. */
+  toolCalls: ToolCallRecord[];
+  /** Model steps the completed rounds used. */
+  steps: number;
+}
+
+/**
+ * Whether the tool round a continuation answers was requested without
+ * thinking blocks, as it is when another provider's model ran it.
+ */
+function toolTurnLacksThinking(messages: ReadonlyArray<Record<string, unknown>>): boolean {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role !== 'assistant' || !Array.isArray(message.tool_calls) || message.tool_calls.length === 0) {
+      continue;
+    }
+    return !Array.isArray(message.thinkingBlocks) || message.thinkingBlocks.length === 0;
+  }
+  return false;
+}
+
+/** Property key that marks an error thrown after the call's tools ran. */
+const TOOLS_RAN = Symbol.for('agentos.generateText.toolsRan');
+
+/**
+ * Marks `error` as thrown after the call's tools ran, so a fallback walker
+ * that called this call as a leg stops instead of restarting on another
+ * provider, which would run the tools again. A non-object is wrapped in an
+ * Error first.
+ *
+ * @returns The marked error.
+ */
+function markToolsRan(error: unknown): unknown {
+  const target = error !== null && typeof error === 'object' ? error : new Error(String(error));
+  try {
+    Object.defineProperty(target, TOOLS_RAN, { value: true, configurable: true });
+  } catch {
+    // A frozen error cannot carry the mark.
+  }
+  return target;
+}
+
+/** Whether `error` was marked by {@link markToolsRan}. */
+function toolsRanBefore(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    (error as Record<symbol, unknown>)[TOOLS_RAN] === true
+  );
+}
+
+/**
+ * Provider error codes for request-level failures that another provider may
+ * not share: unreachable endpoints, request timeouts, and retries exhausted
+ * inside the provider. Mid-stream codes (STREAM_IDLE_TIMEOUT,
+ * STREAM_INCOMPLETE) are left out, because a stream that already delivered
+ * text must not be restarted on another provider.
+ */
+const RETRYABLE_PROVIDER_ERROR_CODES = new Set([
+  'NETWORK_ERROR',
+  'REQUEST_TIMEOUT',
+  'REQUEST_HARD_TIMEOUT',
+  'TIMEOUT',
+  'MAX_RETRIES_REACHED',
+]);
+
 /**
  * Detect content-policy refusals across providers so the fallback chain
  * can route them to a more permissive model (typically uncensored
@@ -1192,18 +1273,28 @@ export function isContentPolicyRefusal(error: unknown): boolean {
 export function isRetryableError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
 
+  // A primary that cannot initialize (rejected key, unreachable endpoint)
+  // is unusable for this call whatever the cause; the next provider may not be.
+  if (error.name === 'ProviderInitializationError') return true;
+
   // Typed provider errors carry the HTTP status as a numeric field. Prefer that
   // over message-grepping, since providers often substitute the body description
   // (e.g. "This request requires more credits...") for the status code.
   const status = (error as { httpStatus?: unknown }).httpStatus;
   if (typeof status === 'number' && RETRYABLE_HTTP_STATUSES.has(status)) return true;
 
+  // Typed provider errors name request-level network failures and timeouts
+  // by code; their messages vary by provider (OpenAIProvider rewrites an
+  // exhausted network failure as "Network error: unable to reach ...").
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === 'string' && RETRYABLE_PROVIDER_ERROR_CODES.has(code)) return true;
+
   const msg = error.message;
   // HTTP status codes that warrant a provider switch (string-grepped fallback
   // when the error type is not a typed provider error).
   if (/\b(402|429|500|502|503|504|401|403)\b/.test(msg)) return true;
   // Network-level failures
-  if (/fetch failed|ECONNREFUSED|ETIMEDOUT|ENOTFOUND/i.test(msg)) return true;
+  if (/fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|network error/i.test(msg)) return true;
   // Provider-specific phrases that always imply a retryable condition.
   // `credit balance` covers Anthropic's billing message ("Your credit
   // balance is too low to access the Anthropic API") which carries
@@ -1497,6 +1588,25 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
   let metricUsage: TokenUsage | undefined;
   let metricProviderId: string | undefined;
   let metricModelId: string | undefined;
+  // What this attempt did that a failover must not repeat. Written inside
+  // the span callback and read by the fallback walk below, so it lives on an
+  // object rather than in narrowed locals.
+  const toolProgress: {
+    // Native tool rounds this attempt completed. A failover continues the
+    // conversation from them instead of restarting the call, which would
+    // run those tools a second time (a sent email, a write). Refreshed after
+    // every full round.
+    completedToolRounds?: CompletedToolRounds;
+    // Set once the prompt-tool shim runs a tool. The shim keeps its rounds
+    // to itself, so they cannot be continued, and such a call does not fail
+    // over.
+    shimRanTool: boolean;
+  } = { shimRanTool: false };
+  // The tool run this call's tool execution contexts belong to, and the
+  // step it starts at. A fallback leg that continues the call keeps both,
+  // so tools see one session across providers and steps keep counting.
+  const helperToolRunId = opts._continuation?.helperToolRunId ?? randomUUID();
+  const stepOffset = opts._continuation?.stepOffset ?? 0;
 
   try {
     const successResult: GenerateTextResult = await withAgentOSSpan('agentos.api.generate_text', async (span) => {
@@ -1590,7 +1700,6 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
       const tools = adaptTools(opts.tools);
       const toolMap = new Map<string, ITool>();
       for (const t of tools) toolMap.set(t.name, t);
-      const helperToolRunId = randomUUID();
 
       // Build messages
       const messages: Array<Record<string, unknown>> = [];
@@ -1631,6 +1740,10 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
         messages.push({ role: 'system', content: parts });
       }
 
+      // Everything above is built from opts (system prompt, chain-of-thought
+      // instruction); a failover continuation rebuilds it, so it is left out
+      // of the conversation a continuation carries.
+      const generatedSystemCount = messages.length;
       if (opts.messages) {
         // Session history replays through here, so keep the tool pairing
         // and thinking fields (see toProviderReplayMessage).
@@ -1642,6 +1755,12 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
       // messages belong to the delta.
       let transcriptDeltaStart =
         messages.length - (opts._transcriptIncludeTrailingCallerMessages ?? 0);
+      // Caller history (its system messages included) that precedes this
+      // call's contribution.
+      const callerHistoryCount = Math.max(0, transcriptDeltaStart - generatedSystemCount);
+      // The plan's system message, when planning adds one; a continuation
+      // leaves it out (the fallback plans again if planning is on).
+      let planMessage: Record<string, unknown> | undefined;
       if (opts.prompt) messages.push({ role: 'user', content: opts.prompt });
 
       span?.setAttribute('agentos.api.tool_count', tools.length);
@@ -1704,7 +1823,8 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
           const planPrompt = formatPlanForPrompt(resolvedPlan);
           const firstNonSystem = messages.findIndex((m) => m.role !== 'system');
           const insertIdx = firstNonSystem === -1 ? messages.length: firstNonSystem;
-          messages.splice(insertIdx, 0, { role: 'system', content: planPrompt });
+          planMessage = { role: 'system', content: planPrompt };
+          messages.splice(insertIdx, 0, planMessage);
           // The plan lands ahead of this call's transcript delta; keep the
           // delta starting at the same message.
           if (insertIdx <= transcriptDeltaStart) transcriptDeltaStart += 1;
@@ -1722,10 +1842,12 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
       const runShim = async (): Promise<GenerateTextResult> => {
         const loopResult = await runEmulatedToolLoop({
           tools: Array.from(toolMap.values()),
-          messages: messages.map((m) => ({
-            role: String(m.role),
-            content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
-          })),
+          onToolExecute: () => {
+            toolProgress.shimRanTool = true;
+          },
+          // Native tool turns (session history, a failover continuation)
+          // become the shim's own <tool_call> / <tool_response> text.
+          messages: toShimMessages(messages),
           maxRoundtrips: shimMaxRoundtrips,
           callModel: async (msgs) => {
             const r = await provider.generateCompletion(resolved.modelId, msgs as any, {
@@ -1861,6 +1983,9 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
       let lastCacheDiagnostics: CacheDiagnostics | null | undefined;
       try {
       for (let step = 0; step < maxSteps; step++) {
+        // The step's index in the whole call: a fallback leg that continues
+        // after completed tool rounds numbers on from them.
+        const runStep = stepOffset + step;
         // --- onBeforeGeneration hook ---
         let effectiveMessages = messages;
         if (opts.onBeforeGeneration) {
@@ -1871,8 +1996,8 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
               tools: Array.from(toolMap.values()),
               model: resolved.modelId,
               provider: resolved.providerId,
-              step,
-              prompt: opts.prompt,
+              step: runStep,
+              prompt: opts.prompt ?? opts._continuation?.prompt,
             };
             const modified = await opts.onBeforeGeneration(hookCtx);
             if (modified) {
@@ -1888,7 +2013,7 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
           async (stepSpan) => {
             stepSpan?.setAttribute('llm.provider', resolved.providerId);
             stepSpan?.setAttribute('llm.model', resolved.modelId);
-            stepSpan?.setAttribute('agentos.api.step', step + 1);
+            stepSpan?.setAttribute('agentos.api.step', runStep + 1);
             stepSpan?.setAttribute('agentos.api.tool_count', tools.length);
 
             const stepResponse = await provider.generateCompletion(
@@ -2023,7 +2148,7 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
         let textContent = typeof content === 'string' ? content: ((content as any)?.text ?? '');
         let toolCallsInChoice = resolveDynamicToolCalls(choice.message?.tool_calls, {
           text: textContent,
-          step,
+          step: runStep,
           toolsAvailable: tools.length > 0,
         });
 
@@ -2046,7 +2171,7 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
               text: textContent,
               toolCalls: toolCallRecords,
               usage: stepUsage,
-              step,
+              step: runStep,
               ...(response.cacheDiagnostics !== undefined
                 ? { cacheDiagnostics: response.cacheDiagnostics }
                 : {}),
@@ -2169,7 +2294,7 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
                   name: fnName,
                   args: parsedArgs as Record<string, unknown>,
                   id: tcId || '',
-                  step,
+                  step: runStep,
                 };
                 const hookResult = await opts.onBeforeToolExecution(hookInfo);
                 if (hookResult === null) {
@@ -2195,7 +2320,7 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
                   buildHelperToolExecutionContext(
                     'generateText',
                     helperToolRunId,
-                    step,
+                    runStep,
                     tcId || undefined,
                   ),
                 );
@@ -2224,6 +2349,12 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
             }
             allToolCalls.push(record);
           }
+          toolProgress.completedToolRounds = {
+            messages: messages.slice(generatedSystemCount).filter((m) => m !== planMessage),
+            callerHistoryCount,
+            toolCalls: [...allToolCalls],
+            steps: step + 1,
+          };
           continue;
         }
 
@@ -2361,9 +2492,12 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
       ? buildPolicyAwareFallbackChain(opts.policyTier, metricProviderId)
      : opts.fallbackProviders;
 
+    // A call whose prompt-shim tools already ran cannot be continued, and a
+    // restart would run them again; it surfaces the error instead.
     if (
       effectiveFallbacks.length &&
-      isRetryableError(error)
+      isRetryableError(error) &&
+      !toolProgress.shimRanTool
     ) {
       let lastError = error;
       let attempt = 0;
@@ -2455,6 +2589,34 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
             // end-to-end. The final entry passes [] -> explicit opt-out -> throw.
             fallbackProviders: effectiveFallbacks.slice(attempt),
             onFallback: undefined,
+            // Continue after the tool rounds this attempt completed: the leg
+            // receives the conversation so far (prompt included, so no new
+            // prompt), counts all of it as this call's transcript delta, and
+            // keeps the steps that remain.
+            _continuation: {
+              helperToolRunId,
+              stepOffset: stepOffset + (toolProgress.completedToolRounds?.steps ?? 0),
+              prompt: opts.prompt ?? opts._continuation?.prompt,
+            },
+            ...(toolProgress.completedToolRounds
+              ? {
+                  messages: toolProgress.completedToolRounds.messages as unknown as Message[],
+                  prompt: undefined,
+                  _transcriptIncludeTrailingCallerMessages:
+                    toolProgress.completedToolRounds.messages.length - toolProgress.completedToolRounds.callerHistoryCount,
+                  maxSteps: Math.max(1, (opts.maxSteps ?? 1) - toolProgress.completedToolRounds.steps),
+                  // Claude's budgeted thinking requires the tool turn being
+                  // answered to open with its signed thinking, and a turn
+                  // another model ran has none, so the continuation runs
+                  // without a thinking budget. Adaptive thinking turns itself
+                  // off for such a turn.
+                  ...(opts.thinking !== undefined &&
+                  (fb.provider === 'anthropic' || /claude/i.test(fb.model ?? '')) &&
+                  toolTurnLacksThinking(toolProgress.completedToolRounds.messages)
+                    ? { thinking: undefined }
+                    : {}),
+                }
+              : {}),
           });
           fallbackLogger.info('provider fallback succeeded', {
             event: 'fallback_succeeded',
@@ -2475,6 +2637,9 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
           );
           return {
             ...fallbackResult,
+            ...(toolProgress.completedToolRounds
+              ? { toolCalls: [...toolProgress.completedToolRounds.toolCalls, ...fallbackResult.toolCalls] }
+              : {}),
             fallback: {
               fired: true,
               finalProvider: fallbackResult.provider,
@@ -2485,6 +2650,9 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
         } catch (fbError) {
           lastError = fbError;
           fallbackHops.push({ provider: fb.provider, model: fb.model, ok: false });
+          // The leg ran tools before it failed. A later leg would start
+          // from a conversation that does not show them and run them again.
+          if (toolsRanBefore(fbError)) break;
         }
       }
       // All fallbacks exhausted: fall through to throw
@@ -2498,11 +2666,12 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
         errorMessage: lastErr.message.slice(0, 200),
       });
       metricStatus = 'error';
-      throw lastError;
+      throw toolProgress.shimRanTool || toolProgress.completedToolRounds ? markToolsRan(lastError) : lastError;
     }
 
     metricStatus = 'error';
-    throw error;
+    // Marked so a walker that called this one as a fallback leg stops too.
+    throw toolProgress.shimRanTool || toolProgress.completedToolRounds ? markToolsRan(error) : error;
   } finally {
     try {
       await recordAgentOSUsageLazy({

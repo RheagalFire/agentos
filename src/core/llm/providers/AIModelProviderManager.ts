@@ -60,6 +60,8 @@ export class AIModelProviderManager {
   private defaultProviderId?: string;
   private readonly modelToProviderMap: Map<string, string> = new Map();
   private allModelsCache: ModelInfo[] | null = null;
+  /** Errors thrown by providers that failed to initialize, keyed by configured provider id. */
+  private readonly providerInitErrors: Map<string, unknown> = new Map();
   public isInitialized: boolean = false;
 
   constructor() {}
@@ -101,6 +103,7 @@ export class AIModelProviderManager {
       console.warn("AIModelProviderManager: Manager is already initialized. Re-initializing will reset providers.");
       this.providers.clear();
       this.modelToProviderMap.clear();
+      this.providerInitErrors.clear();
       this.allModelsCache = null;
       this.defaultProviderId = undefined;
     }
@@ -171,6 +174,7 @@ export class AIModelProviderManager {
         await this.cacheModelsFromProvider(providerInstance);
 
       } catch (error: unknown) {
+        this.providerInitErrors.set(providerEntry.providerId, error);
         const gmiError = createGMIErrorFromError( // Using the imported function
           error, // Pass the original error
           GMIErrorCode.LLM_PROVIDER_ERROR,
@@ -220,6 +224,19 @@ export class AIModelProviderManager {
         console.error(gmiError.message, gmiError.details);
       }
     }
+  }
+
+  /**
+   * Returns the error a provider threw during {@link initialize}, so a caller
+   * that finds the provider missing can report why (for example the HTTP 401
+   * of a rejected API key) instead of a bare "not available".
+   *
+   * @param providerId - The provider id as configured.
+   * @returns The thrown error, or undefined when the provider initialized or
+   *   was never configured.
+   */
+  public getProviderInitError(providerId: string): unknown {
+    return this.providerInitErrors.get(providerId);
   }
 
   public getProvider(providerId: string): IProvider | undefined {
