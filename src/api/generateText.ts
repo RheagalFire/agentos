@@ -290,6 +290,34 @@ export interface FallbackProviderEntry {
    * full control: omit to inherit, or set a ttl to cache a hop deliberately.
    */
   cache?: { ttl?: '5m' | '1h' } | false;
+  /**
+   * Extra output tokens granted ONLY when THIS entry serves the call: the hop
+   * runs with `maxTokens = <the original call's maxTokens> + headroom`. For
+   * models whose hidden reasoning shares the output cap. Every current Gemini
+   * 3.x model thinks, and its thinking tokens count against
+   * `maxOutputTokens`; a rescue hop inherits a budget sized for the primary,
+   * and without room for the thinking the visible reply comes back cut short
+   * or empty (measured 2026-09-30: `gemini-3.1-pro-preview` at 400 tokens
+   * spent 382 thinking and returned 60 characters).
+   *
+   * Ignored when the call set no `maxTokens`. Never compounds: every hop is
+   * granted its own headroom over the ORIGINAL budget, and an entry without
+   * headroom runs at the original.
+   */
+  maxTokensHeadroom?: number;
+}
+
+/**
+ * The original call's values for the options a fallback entry can override,
+ * carried down the fallback recursion so every hop's overrides are computed
+ * over the ORIGINAL call and never over the previous hop.
+ *
+ * @internal
+ */
+export interface FallbackHopBase {
+  maxTokens?: number;
+  effort?: string;
+  cache?: { ttl?: '5m' | '1h' } | false;
 }
 
 /**
@@ -613,6 +641,16 @@ export interface GenerateTextOptions {
    * @internal
    */
   __fallbackDepth?: number;
+  /**
+   * Internal — DO NOT set from application code. The outermost call's
+   * `maxTokens`, `effort` and `cache`, threaded into the provider-fallback
+   * recursion so a hop's per-entry overrides (see
+   * {@link fallbackHopOverrides}) apply to that hop alone. Absent on a
+   * top-level call, where the call's own values are the base.
+   *
+   * @internal
+   */
+  __hopBase?: FallbackHopBase;
   /**
    * Optional model router for intelligent provider/model selection.
    * When provided, the router's `selectModel()` is called before provider
@@ -1201,7 +1239,7 @@ export function isRetryableError(error: unknown): boolean {
  * 1. OpenAI (`gpt-5.6-sol`)
  * 2. Anthropic (`claude-sonnet-5`)
  * 3. OpenRouter (`openai/gpt-5.6-sol`)
- * 4. Gemini (`gemini-2.5-flash`)
+ * 4. Gemini (`gemini-3.1-pro-preview`)
  *
  * @param excludeProvider - Provider to omit from the chain (typically the
  *   primary provider that already failed).
@@ -1249,10 +1287,62 @@ export function buildFallbackChain(
     chain.push({ provider: 'openrouter', model: 'openai/gpt-5.6-sol', cache: false });
   }
   if (process.env.GEMINI_API_KEY && excludeProvider !== 'gemini') {
-    chain.push({ provider: 'gemini', cache: false });
+    // Pinned at the pro tier, like every other leg: a model-less entry took
+    // the provider default (`gemini-2.5-flash`) and served a whole degraded
+    // run on a flash model (2026-09-29). `gemini-3.1-pro-preview` is the top
+    // pro model Google serves; if Google retires the preview id, the Gemini
+    // provider retries the request on its alias (`gemini-pro-latest`), so the
+    // leg keeps its tier.
+    //
+    // Gemini 3.x always thinks and the thinking shares the output cap, so
+    // the rescue hop gets bounded thinking (`effort: 'low'`, 380-470 tokens
+    // measured on the pro model) and the room for it on top of the caller's
+    // budget.
+    chain.push({
+      provider: 'gemini',
+      model: 'gemini-3.1-pro-preview',
+      cache: false,
+      effort: 'low',
+      maxTokensHeadroom: 1024,
+    });
   }
 
   return chain;
+}
+
+/**
+ * The options a fallback hop runs with where its entry can override the
+ * call: `effort`, `cache` and the output budget. Each is the entry's own
+ * value when it has one and the ORIGINAL call's otherwise, with the original
+ * values carried along as `__hopBase` so a fallback of the fallback starts
+ * from them again. The budget is the original `maxTokens` plus the entry's
+ * {@link FallbackProviderEntry.maxTokensHeadroom}; a call without `maxTokens`
+ * stays uncapped. Shared by the `generateText` and `streamText` walkers.
+ */
+export function fallbackHopOverrides(
+  opts: Pick<GenerateTextOptions, 'maxTokens' | 'effort' | 'cache' | '__hopBase'>,
+  entry: Pick<FallbackProviderEntry, 'effort' | 'cache' | 'maxTokensHeadroom'>,
+): {
+  maxTokens: number | undefined;
+  effort: string | undefined;
+  cache: { ttl?: '5m' | '1h' } | false | undefined;
+  __hopBase: FallbackHopBase;
+} {
+  const base: FallbackHopBase = opts.__hopBase ?? {
+    maxTokens: opts.maxTokens,
+    effort: opts.effort,
+    cache: opts.cache,
+  };
+  const headroom =
+    typeof entry.maxTokensHeadroom === 'number' && entry.maxTokensHeadroom > 0
+      ? Math.floor(entry.maxTokensHeadroom)
+      : 0;
+  return {
+    maxTokens: typeof base.maxTokens === 'number' ? base.maxTokens + headroom : base.maxTokens,
+    effort: entry.effort !== undefined ? entry.effort : base.effort,
+    cache: entry.cache !== undefined ? entry.cache : base.cache,
+    __hopBase: base,
+  };
 }
 
 /**
@@ -2329,18 +2419,18 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
             // Stamp the leg's observer events with its hop depth (see
             // LlmUsageEvent.fallbackDepth).
             __fallbackDepth: (opts.__fallbackDepth ?? 0) + 1,
-            // Per-hop effort: when this fallback entry sets `effort`, it
-            // overrides the call-level effort for THIS hop only (the spread
-            // above carries opts.effort; an entry without `effort` inherits it).
-            // Lets an explicit chain run the fallback at a higher depth than the
-            // primary without changing the primary call's effort.
-            ...(fb.effort !== undefined ? { effort: fb.effort } : {}),
-            // Per-hop cache: same override semantics as per-hop effort above.
-            // The canonical chains pin `cache: false` on their legs so a
-            // rescue hop sends zero cache_control (no write premium paid on
-            // one-shot failover traffic); an entry without `cache` inherits
-            // the call-level disposition via the `...opts` spread.
-            ...(fb.cache !== undefined ? { cache: fb.cache } : {}),
+            // Per-hop effort, cache and output budget. An entry's `effort` /
+            // `cache` override the call level for THIS hop only, and its
+            // `maxTokensHeadroom` is added to the call's maxTokens; an entry
+            // without one takes the ORIGINAL call's value — not the previous
+            // hop's, which is what the `...opts` spread used to hand the next
+            // entry when a hop failed and fell back again. Lets an explicit
+            // chain run a fallback at a different depth than the primary
+            // without changing the primary call's effort, and the canonical
+            // chains pin `cache: false` on their legs so a rescue hop sends
+            // zero cache_control (no write premium on one-shot failover
+            // traffic).
+            ...fallbackHopOverrides(opts, fb),
             // Clear explicit keys/URLs so resolution uses env vars for the
             // fallback provider rather than the primary's overrides.
             apiKey: undefined,

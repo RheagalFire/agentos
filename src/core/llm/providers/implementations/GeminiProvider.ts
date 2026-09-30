@@ -119,7 +119,75 @@ interface GeminiGenerationConfig {
   stopSequences?: string[];
   responseMimeType?: string;
   responseSchema?: Record<string, unknown>;
+  thinkingConfig?: GeminiThinkingConfig;
 }
+
+/**
+ * Thinking controls. The 3.x generation takes a `thinkingLevel`; the 2.5
+ * family takes a `thinkingBudget` and rejects a level.
+ */
+interface GeminiThinkingConfig {
+  thinkingLevel?: string;
+  thinkingBudget?: number;
+  includeThoughts?: boolean;
+}
+
+type GeminiThinkingLevel = 'low' | 'medium' | 'high';
+
+/**
+ * Thinking levels each model accepts, keyed by exact model id and limited to
+ * what was verified against the live API (2026-09-30). The set differs per
+ * model, not per family: the 3.x image models take `minimal` | `high`, the
+ * 2.5 family rejects any level with 400 INVALID_ARGUMENT, and an alias can
+ * move to a model with a different set. A model missing here never receives
+ * a level, which is always accepted.
+ */
+const GEMINI_THINKING_LEVELS: Readonly<Record<string, ReadonlySet<GeminiThinkingLevel>>> = {
+  'gemini-3.1-pro-preview': new Set<GeminiThinkingLevel>(['low', 'medium', 'high']),
+};
+
+/**
+ * The thinking level to send for the provider-neutral `effort` on `modelId`,
+ * or `undefined` when the API default should stand: no effort, an effort
+ * with no Gemini equivalent, or a model that does not take that level.
+ */
+function geminiThinkingLevelFor(
+  modelId: string,
+  effort: string | undefined,
+): GeminiThinkingLevel | undefined {
+  const level: GeminiThinkingLevel | undefined =
+    effort === 'low' || effort === 'medium'
+      ? effort
+      : effort === 'high' || effort === 'xhigh' || effort === 'max'
+        ? 'high'
+        : undefined;
+  if (!level) return undefined;
+  return GEMINI_THINKING_LEVELS[modelId]?.has(level) ? level : undefined;
+}
+
+/**
+ * Pinned model ids and the alias that keeps serving their tier once Google
+ * retires them. Preview ids are retired without a redirect (the retired id
+ * answers HTTP 404); when a request for a key here fails that way, the
+ * provider retries it once on the alias.
+ */
+const GEMINI_RETIRED_MODEL_ALIAS: Readonly<Record<string, string>> = {
+  'gemini-3.1-pro-preview': 'gemini-pro-latest',
+};
+
+/** Pinned ids already reported as retired, so the warning prints once each. */
+const warnedRetiredGeminiModels = new Set<string>();
+
+/**
+ * Long-context price tier: above `abovePromptTokens` prompt tokens the whole
+ * request bills at these per-1M rates instead of the catalog's.
+ */
+const GEMINI_LONG_CONTEXT_PRICING: Readonly<
+  Record<string, { abovePromptTokens: number; input: number; output: number }>
+> = {
+  'gemini-3.1-pro-preview': { abovePromptTokens: 200_000, input: 4.00, output: 18.00 },
+  'gemini-pro-latest': { abovePromptTokens: 200_000, input: 4.00, output: 18.00 },
+};
 
 /** A single function declaration for tool calling. */
 interface GeminiFunctionDeclaration {
@@ -138,6 +206,11 @@ interface GeminiUsageMetadata {
   promptTokenCount?: number;
   candidatesTokenCount?: number;
   totalTokenCount?: number;
+  /**
+   * Tokens the model spent thinking. Separate from `candidatesTokenCount`,
+   * included in `totalTokenCount`, and billed at the output rate.
+   */
+  thoughtsTokenCount?: number;
   /**
    * Prompt tokens served from Gemini's cache (implicit caching is default-on
    * for 2.5+ models; explicit cachedContents count here too). A subset of
@@ -183,6 +256,34 @@ interface GeminiAPIError {
 
 /** Static catalog of well-known Gemini models and their metadata. */
 const GEMINI_MODELS: ModelInfo[] = [
+  {
+    modelId: 'gemini-3.1-pro-preview',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.1 Pro Preview',
+    description: 'Top pro-tier Gemini model. Always thinks; thinking tokens bill as output.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    // Prompts up to 200k tokens; see GEMINI_LONG_CONTEXT_PRICING above that.
+    pricePer1MTokensInput: 2.00,
+    pricePer1MTokensOutput: 12.00,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-pro-latest',
+    providerId: 'gemini',
+    displayName: 'Gemini Pro (latest alias)',
+    description: 'Alias of the current pro-tier model (gemini-3.1-pro-preview as of 2026-09-30).',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    // Priced as the model the alias resolves to today.
+    pricePer1MTokensInput: 2.00,
+    pricePer1MTokensOutput: 12.00,
+    supportsStreaming: true,
+    status: 'active',
+  },
   {
     modelId: 'gemini-2.5-flash',
     providerId: 'gemini',
@@ -348,9 +449,38 @@ export class GeminiProvider implements IProvider {
     const payload = this.buildRequestPayload(modelId, messages, options);
     // Gemini uses model-scoped endpoints: /models/{model}:generateContent
     const endpoint = `/models/${modelId}:generateContent`;
-    const apiResponse = await this.makeApiRequest<GeminiResponse>(endpoint, payload, options.requestTimeout);
+    let apiResponse: GeminiResponse;
+    try {
+      apiResponse = await this.makeApiRequest<GeminiResponse>(endpoint, payload, options.requestTimeout);
+    } catch (error: unknown) {
+      // A retired pinned id: serve the call from its alias, whose response
+      // reports the alias as the model that answered.
+      const alias = this.retiredModelAlias(modelId, error);
+      if (!alias) throw error;
+      return this.generateCompletion(alias, messages, options);
+    }
 
     return this.mapResponseToCompletion(apiResponse, modelId);
+  }
+
+  /**
+   * The alias to retry on when a request for `modelId` failed because the id
+   * is gone: HTTP 404 on an id listed in {@link GEMINI_RETIRED_MODEL_ALIAS}.
+   * `undefined` for every other error and every other id, which propagate.
+   * Warns once per retired id.
+   */
+  private retiredModelAlias(modelId: string, error: unknown): string | undefined {
+    if (!(error instanceof GeminiProviderError) || error.httpStatus !== 404) return undefined;
+    const alias = GEMINI_RETIRED_MODEL_ALIAS[modelId];
+    if (!alias) return undefined;
+    if (!warnedRetiredGeminiModels.has(modelId)) {
+      warnedRetiredGeminiModels.add(modelId);
+      console.warn(
+        `[GeminiProvider] ${modelId} answered 404 (retired, or not available to this key); ` +
+          `serving ${alias} instead. Update the pin.`,
+      );
+    }
+    return alias;
   }
 
   // -------------------------------------------------------------------------
@@ -392,7 +522,17 @@ export class GeminiProvider implements IProvider {
 
     // Streaming endpoint uses ?alt=sse and the API key query param
     const endpoint = `/models/${modelId}:streamGenerateContent`;
-    const stream = await this.makeStreamRequest(endpoint, payload, options.requestTimeout);
+    let stream: ReadableStream<Uint8Array>;
+    try {
+      stream = await this.makeStreamRequest(endpoint, payload, options.requestTimeout);
+    } catch (error: unknown) {
+      // A retired pinned id fails here, before any chunk: serve the whole
+      // stream from its alias (its chunks carry the alias as modelId).
+      const alias = this.retiredModelAlias(modelId, error);
+      if (!alias) throw error;
+      yield* this.generateCompletionStream(alias, messages, options);
+      return;
+    }
 
     // Accumulators for building the complete response
     let accumulatedContent = '';
@@ -703,14 +843,14 @@ export class GeminiProvider implements IProvider {
    * 3. Tool messages mapped to `functionResponse` parts within user turns.
    * 4. OpenAI-style tool definitions converted to `functionDeclarations`.
    *
-   * @param {string} _modelId - Target model (used for endpoint, not in body).
+   * @param {string} modelId - Target model (endpoint; also its output ceiling and thinking levels).
    * @param {ChatMessage[]} messages - Conversation messages.
    * @param {ModelCompletionOptions} options - Completion options.
    * @returns {Record<string, unknown>} The request body for Gemini's API.
    * @private
    */
   private buildRequestPayload(
-    _modelId: string,
+    modelId: string,
     messages: ChatMessage[],
     options: ModelCompletionOptions,
   ): Record<string, unknown> {
@@ -750,7 +890,15 @@ export class GeminiProvider implements IProvider {
     // --- Generation config ---
     const generationConfig: GeminiGenerationConfig = {};
     if (options.temperature !== undefined) generationConfig.temperature = options.temperature;
-    if (options.maxTokens !== undefined) generationConfig.maxOutputTokens = options.maxTokens;
+    if (options.maxTokens !== undefined) {
+      // Never above the model's output ceiling: the API rejects the whole
+      // request, and a rescue hop's headroom
+      // (FallbackProviderEntry.maxTokensHeadroom) can lift a large budget
+      // past it. Models outside the catalog pass through unclamped.
+      const outputLimit = GEMINI_MODELS.find(m => m.modelId === modelId)?.outputTokenLimit;
+      generationConfig.maxOutputTokens =
+        typeof outputLimit === 'number' ? Math.min(options.maxTokens, outputLimit) : options.maxTokens;
+    }
     if (options.topP !== undefined) generationConfig.topP = options.topP;
     if (options.stopSequences?.length) generationConfig.stopSequences = options.stopSequences;
     // JSON mode: Gemini uses responseMimeType to enforce JSON output.
@@ -780,6 +928,18 @@ export class GeminiProvider implements IProvider {
     if (options.customModelParams?.topK !== undefined) {
       generationConfig.topK = options.customModelParams.topK as number;
     }
+    // Thinking depth. A caller-supplied thinkingConfig is forwarded as is;
+    // otherwise the provider-neutral `effort` becomes the model's thinking
+    // level when the model is known to take that level. Thinking shares the
+    // maxOutputTokens cap: room for it on a rescue hop comes from
+    // FallbackProviderEntry.maxTokensHeadroom, not from this provider.
+    const customThinking = options.customModelParams?.thinkingConfig;
+    if (customThinking && typeof customThinking === 'object') {
+      generationConfig.thinkingConfig = customThinking as GeminiThinkingConfig;
+    } else {
+      const thinkingLevel = geminiThinkingLevelFor(modelId, options.effort);
+      if (thinkingLevel) generationConfig.thinkingConfig = { thinkingLevel };
+    }
 
     if (Object.keys(generationConfig).length > 0) {
       payload.generationConfig = generationConfig;
@@ -795,7 +955,9 @@ export class GeminiProvider implements IProvider {
     // and never OpenRouter's routing controls — Gemini 400s on unknown
     // top-level names like `provider`; see openrouter-only-params).
     if (options.customModelParams) {
-      const { topK, ...rest } = options.customModelParams;
+      // thinkingConfig belongs inside generationConfig (set above); at the
+      // payload root Gemini rejects it as an unknown field.
+      const { topK, thinkingConfig, ...rest } = options.customModelParams;
       const passthrough = stripOpenRouterOnlyParams(rest);
       if (passthrough) {
         Object.assign(payload, passthrough);
@@ -1046,7 +1208,12 @@ export class GeminiProvider implements IProvider {
    */
   private mapUsage(meta: GeminiUsageMetadata | undefined, modelId: string): ModelUsage {
     const promptTokens = meta?.promptTokenCount ?? 0;
-    const completionTokens = meta?.candidatesTokenCount ?? 0;
+    // Thinking tokens are output the model generated and Google bills at the
+    // output rate ("output price, including thinking tokens"), reported apart
+    // from candidatesTokenCount. Counted here so completion tokens and cost
+    // match the bill — the same convention as OpenAI's completion_tokens,
+    // which includes reasoning tokens.
+    const completionTokens = (meta?.candidatesTokenCount ?? 0) + (meta?.thoughtsTokenCount ?? 0);
     const totalTokens = meta?.totalTokenCount ?? (promptTokens + completionTokens);
     // Gemini implicit caching (default-on for 2.5+) reports the cached
     // subset of promptTokenCount in cachedContentTokenCount; normalize it
@@ -1108,9 +1275,14 @@ export class GeminiProvider implements IProvider {
   ): number | undefined {
     const info = GEMINI_MODELS.find(m => m.modelId === modelId);
     if (!info?.pricePer1MTokensInput || !info?.pricePer1MTokensOutput) return undefined;
+    // Long prompts bill the whole request at a higher tier on some models.
+    const longContext = GEMINI_LONG_CONTEXT_PRICING[modelId];
+    const isLong = longContext !== undefined && inputTokens > longContext.abovePromptTokens;
+    const inputRate = isLong ? longContext.input : info.pricePer1MTokensInput;
+    const outputRate = isLong ? longContext.output : info.pricePer1MTokensOutput;
     return (
-      (inputTokens / 1_000_000) * info.pricePer1MTokensInput +
-      (outputTokens / 1_000_000) * info.pricePer1MTokensOutput
+      (inputTokens / 1_000_000) * inputRate +
+      (outputTokens / 1_000_000) * outputRate
     );
   }
 

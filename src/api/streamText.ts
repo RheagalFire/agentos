@@ -17,6 +17,7 @@ import { runEmulatedToolLoop, type ToolMode } from './runtime/tool-emulation/ind
 import {
   buildPolicyAwareFallbackChain,
   createPlan,
+  fallbackHopOverrides,
   isRetryableError,
   resolveChainOfThought,
   type GenerateTextOptions,
@@ -1146,11 +1147,13 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
               ...opts,
               provider: fb.provider,
               model: fb.model,
-              // Per-hop cache disposition, mirroring generateText's fallback
-              // recursion: canonical chain legs pin `cache: false` so a rescue
-              // hop pays no cache-write premium its one-shot traffic never
-              // reads back; entries without `cache` inherit the call level.
-              ...(fb.cache !== undefined ? { cache: fb.cache } : {}),
+              // Per-hop effort, cache and output budget over the ORIGINAL
+              // call, shared with generateText's walker (see
+              // fallbackHopOverrides). Canonical chain legs pin `cache: false`
+              // so a rescue hop pays no cache-write premium its one-shot
+              // traffic never reads back; entries without an override take
+              // the call level.
+              ...fallbackHopOverrides(opts, fb),
               // Stamp the leg's observer events with its hop depth (see
               // LlmUsageEvent.fallbackDepth).
               __fallbackDepth: (opts.__fallbackDepth ?? 0) + 1,
