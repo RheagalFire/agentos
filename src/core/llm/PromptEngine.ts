@@ -39,6 +39,42 @@ import {
 import { ConversationMessage as Message, MessageRole, ConversationToolCallRequest } from '../conversation/ConversationMessage'; // Corrected import: Used alias and added MessageRole
 import { ChatMessage, MessageContentPart } from './providers/IProvider'; // Added MessageContentPart
 import { ITool, JSONSchemaObject } from '../tools/ITool'; // Corrected import path
+import { sha256Hex } from '../utils/sha256';
+
+/**
+ * Text of `value` for a prompt cache key, built by JSON.stringify so each
+ * value serializes as prompt construction's JSON copy sees it (a `toJSON`
+ * hook gets its property key; functions and undefined drop out). Three kinds
+ * of value that JSON cannot carry as-is become placeholders: a bigint, an
+ * object seen before (so a cycle cannot throw), and a typed array (hashed, so
+ * large audio or image bytes are not turned into text). Each placeholder is
+ * also listed after the JSON with the position it took, so an input string
+ * that looks like a placeholder never reads as one.
+ */
+function cacheKeyText(value: unknown): string {
+  const seen = new Map<object, number>();
+  const placeholders: string[] = [];
+  let position = 0;
+  const text = JSON.stringify(value, (_key: string, current: unknown) => {
+    position += 1;
+    const placeholder = (description: string): string => {
+      placeholders.push(`${position}:${description}`);
+      return `\u0000${description}`;
+    };
+    if (typeof current === 'bigint') return placeholder(`bigint:${current}`);
+    if (current === null || typeof current !== 'object') return current;
+    if (ArrayBuffer.isView(current)) {
+      const digest = sha256Hex(new Uint8Array(current.buffer, current.byteOffset, current.byteLength));
+      return placeholder(`bytes:${current.constructor?.name ?? 'view'}:${digest}`);
+    }
+    const order = seen.get(current);
+    if (order !== undefined) return placeholder(`ref:${order}`);
+    seen.set(current, seen.size);
+    return current;
+  });
+  // JSON escapes control characters, so a raw \u0001 cannot occur in `text`.
+  return `${text ?? 'undefined'}\u0001${placeholders.join(',')}`;
+}
 
 
 /**
@@ -205,6 +241,10 @@ export class PromptEngine implements IPromptEngine {
     }
 
     try {
+      // Copied now, in the same step as the cache key and before the first
+      // await, so the key and the prompt describe the same input even when
+      // the caller changes its components object while this call runs.
+      const components = JSON.parse(JSON.stringify(baseComponents)) as PromptComponents;
       let selectedElements: ContextualPromptElement[] = [];
       // Corrected: use contextualPromptElements directly from IPersonaDefinition
       if (executionContext?.activePersona?.contextualPromptElements) {
@@ -226,7 +266,7 @@ export class PromptEngine implements IPromptEngine {
       }
 
       const augmentedComponents = this.augmentBaseComponents(
-        baseComponents,
+        components,
         selectedElements,
         executionContext,
       );
@@ -510,65 +550,63 @@ export class PromptEngine implements IPromptEngine {
     }
   }
 
+  /**
+   * Builds the key a constructed prompt is cached under. A cached result is
+   * served to any later call with the same key, so the key covers everything
+   * that shapes the prompt: every component (the whole history, retrieved and
+   * memory context, tools), the model target, the template, and the
+   * execution context that templates and contextual elements read (the
+   * persona definition, mood, task, skill level, language, signals,
+   * preferences). The working memory handle is left out, since contextual
+   * criteria do not query it. The key is a SHA-256 digest, so it carries none
+   * of that content into logs.
+   */
   private generateCacheKey(
     components: Readonly<PromptComponents>,
     modelInfo: Readonly<ModelTargetInfo>,
     executionContext?: Readonly<PromptExecutionContext>,
     templateName?: string
   ): string {
-    /**
-     * Generates a stable cache key for a prospective prompt construction result.
-     * Key Composition Strategy (intentional truncation for privacy & size):
-     *  - First 50 chars of each system prompt concatenated (order sensitive)
-     *  - First 100 chars of user input
-     *  - Last turn content excerpt (first 50 chars; structured content is
-     *    serialized, see cacheKeyContentExcerpt) for light history sensitivity
-     *  - Tool id list (joined)
-     *  - Model id, template name, persona id, mood, task hint
-     *
-     * Hashing: Simple 32‑bit additive hash -> base36 to keep key short; collision risk acceptable for cache.
-     *
-     * NOTE: Omits retrievedContext & full history intentionally to avoid large keys and leaking RAG content into logs.
-     */
-    const relevantData = {
-      system: components.systemPrompts?.map(p => p.content.substring(0,50)).join(';'),
-      userInput: components.userInput?.substring(0,100),
-      historyLastTurn: this.cacheKeyContentExcerpt(
-        components.conversationHistory?.[components.conversationHistory.length - 1]?.content,
+    const { workingMemory: _workingMemory, ...context } = executionContext ?? ({} as Partial<PromptExecutionContext>);
+    const persona = executionContext?.activePersona;
+    // The components serialize at the root and as given, as prompt
+    // construction's JSON copy serializes them, so a toJSON hook or a getter
+    // it reads sees the same object and key.
+    const parts = [
+      cacheKeyText(components),
+      // A tool class may define its name and schema as getters, which JSON
+      // serialization of own properties would miss.
+      cacheKeyText(
+        components.tools?.map((tool) => ({
+          id: tool.id,
+          name: tool.name,
+          description: tool.description,
+          inputSchema: tool.inputSchema,
+        })),
       ),
-      tools: components.tools?.map(t => t.id).join(','),
-      modelId: modelInfo.modelId,
-      template: templateName,
-      personaId: executionContext?.activePersona.id,
-      mood: executionContext?.currentMood,
-      task: executionContext?.taskHint,
-      userPreferences: this.buildUserPreferenceCacheKey(executionContext?.userPreferences),
-    };
-    const keyString = Object.values(relevantData).filter(v => v !== undefined).join('||');
-    let hash = 0;
-    for (let i = 0; i < keyString.length; i++) {
-      const char = keyString.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash |= 0;
-    }
-    return `promptcache:${modelInfo.modelId}:${hash.toString(36)}`;
-  }
-
-  /**
-   * Returns the excerpt of the last history message that goes into the cache
-   * key. Structured (multimodal) content is serialized and gets the same 100
-   * characters the key takes from `userInput`: its `toString()` is
-   * "[object Object]" for every message, and GMI sends a multimodal message
-   * as history rather than as `userInput`, so without its text two different
-   * multimodal turns would share one cached prompt.
-   *
-   * @param content - Content of the last history message, if any.
-   * @returns The excerpt, or `undefined` when there is no content.
-   */
-  private cacheKeyContentExcerpt(content: Message['content'] | undefined): string | undefined {
-    if (content === null || content === undefined) return undefined;
-    if (typeof content === 'string') return content.substring(0, 50);
-    return JSON.stringify(content).substring(0, 100);
+      cacheKeyText({
+        modelInfo,
+        templateName,
+        context,
+        // Read the way prompt construction reads them, so values a context
+        // or persona object holds on its prototype still count.
+        read: {
+          personaId: persona?.id,
+          contextualPromptElements: persona?.contextualPromptElements,
+          preferencePrompts: this.buildUserPreferencePrompts(executionContext),
+          currentMood: executionContext?.currentMood,
+          userSkillLevel: executionContext?.userSkillLevel,
+          taskHint: executionContext?.taskHint,
+          taskComplexity: executionContext?.taskComplexity,
+          language: executionContext?.language,
+          conversationSignals: executionContext?.conversationSignals,
+        },
+      }),
+    ];
+    // Hashed synchronously: constructPrompt copies the components in the same
+    // step, so the key and the prompt describe the same input.
+    const digest = sha256Hex(parts.map((part) => `${part.length}:${part}`).join(''));
+    return `promptcache:${modelInfo.modelId}:${digest}`;
   }
 
   private setupCacheEviction(): void {
@@ -579,7 +617,7 @@ export class PromptEngine implements IPromptEngine {
      * No size‑based LRU yet; maxCacheSizeBytes reserved for future implementation.
      */
     const interval = (this.config.performance.cacheTimeoutSeconds / 2) * 1000;
-    setInterval(() => {
+    const timer = setInterval(() => {
       const now = Date.now();
       for (const [key, entry] of this.cache.entries()) {
         if ((now - entry.timestamp) > this.config.performance.cacheTimeoutSeconds * 1000) {
@@ -587,6 +625,8 @@ export class PromptEngine implements IPromptEngine {
         }
       }
     }, Math.max(interval, 60000));
+    // Eviction is housekeeping; it must not keep the process alive.
+    (timer as unknown as { unref?: () => void }).unref?.();
   }
 
   private startPerformanceTimer(timerId: string): void {
@@ -609,12 +649,12 @@ export class PromptEngine implements IPromptEngine {
   }
 
   private augmentBaseComponents(
-    base: Readonly<PromptComponents>,
+    augmented: PromptComponents,
     selectedElements: ReadonlyArray<ContextualPromptElement>,
     executionContext?: Readonly<PromptExecutionContext>,
   ): PromptComponents {
     /**
-     * Applies selected contextual elements onto the immutable base components producing a mutable augmented copy.
+     * Applies selected contextual elements onto `augmented`, the copy of the base components constructPrompt owns, and returns it.
      * Merging Rules:
      *  - System prompt augmenters append as new system prompts with synthetic source tag.
      *  - Few‑shot examples accumulate under customComponents.fewShotExamples.
@@ -622,8 +662,6 @@ export class PromptEngine implements IPromptEngine {
      *  - All other element types fall back to a dynamic bucket keyed by normalized type.
      * Sorting: Final systemPrompts sorted ascending by priority to preserve intended ordering.
      */
-    const augmented = JSON.parse(JSON.stringify(base)) as PromptComponents;
-
     if (!augmented.systemPrompts) augmented.systemPrompts = [];
     if (!augmented.customComponents) augmented.customComponents = {};
 
@@ -749,23 +787,6 @@ export class PromptEngine implements IPromptEngine {
     }
 
     return undefined;
-  }
-
-  private buildUserPreferenceCacheKey(preferences?: Record<string, unknown>): string | undefined {
-    if (!preferences || typeof preferences !== 'object') {
-      return undefined;
-    }
-
-    const verbosity = this.normalizeVerbosityPreference(preferences.verbosity);
-    const preferredFormat = this.normalizePreferredFormatPreference(preferences);
-    if (!verbosity && !preferredFormat) {
-      return undefined;
-    }
-
-    return JSON.stringify({
-      ...(verbosity ? { verbosity } : {}),
-      ...(preferredFormat ? { preferredFormat } : {}),
-    });
   }
 
   private async applyTokenBudget(
