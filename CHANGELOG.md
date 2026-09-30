@@ -1,3 +1,11 @@
+## <small>0.10.22 (2026-09-30)</small>
+
+* fix(providers): mask configured secrets in Gemini request errors ([167e3161680c92bf9fbe3087a537e793ad60f8a4](https://github.com/framerslab/agentos/commit/167e3161680c92bf9fbe3087a537e793ad60f8a4))
+* docs(providers): align model tables with the current catalogs ([0efb81186bf29c27c797765ce28cf2b31f26e46a](https://github.com/framerslab/agentos/commit/0efb81186bf29c27c797765ce28cf2b31f26e46a))
+* feat(providers): add Claude Opus 5.5 and Fable 5.1; retire the Claude 4 snapshots ([e8d192d3154d4c381186a037228faa3c4a22a948](https://github.com/framerslab/agentos/commit/e8d192d3154d4c381186a037228faa3c4a22a948))
+* feat(providers): add GPT-6 Sol and Luna; correct OpenAI catalog metadata ([13990d0362d8b5d70925b39fc27cbd549a5bcdf0](https://github.com/framerslab/agentos/commit/13990d0362d8b5d70925b39fc27cbd549a5bcdf0))
+* feat(providers): support the Gemini 3 line, embeddings and thought signatures ([92fb959fac4433d9dae897bda6d5aa57c4ed2103](https://github.com/framerslab/agentos/commit/92fb959fac4433d9dae897bda6d5aa57c4ed2103))
+
 ## <small>0.10.21 (2026-09-30)</small>
 
 * fix(llm): pin the Gemini fallback leg at the pro tier and give thinking models room on rescue hops ([0c376665e9cf0cceb0e6c7dacb0292bc993e2a18](https://github.com/framerslab/agentos/commit/0c376665e9cf0cceb0e6c7dacb0292bc993e2a18))
