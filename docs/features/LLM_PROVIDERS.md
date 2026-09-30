@@ -184,8 +184,25 @@ const writer = agent({
 ## Fallback Behavior
 
 AgentOS supports automatic fallback when a provider request fails on a
-retryable error (HTTP 402/429/5xx, network errors). Fallback is **on by
-default** with an auto-built chain — to disable it, pass an empty array.
+retryable error: HTTP 401/402/403/429/5xx, a network failure or request
+timeout, or a primary provider that cannot initialize (for example a revoked
+key that its model listing rejects). Fallback is **on by default** with an
+auto-built chain — to disable it, pass an empty array.
+
+A failover never repeats work the caller already received or that had side
+effects. A stream that has delivered text or tool activity is not restarted
+on a fallback provider; it ends with an `error` part, so the consumer never
+receives a partial answer followed by a second one. A `generateText` call
+that already ran native tool rounds continues on the fallback provider from
+those rounds (the fallback sees each tool call and its result) instead of
+starting over and running the tools again. A call whose prompt-emulated
+tools (`toolMode: 'prompt'`) ran throws the error instead of failing over.
+
+Each leg receives the caller's `customModelParams` minus the fields only
+another vendor accepts: OpenRouter's routing controls (`provider`, `models`,
+`route`, `transforms`) reach only OpenRouter, and Gemini's request fields
+(`thinkingConfig`, `topK`, `safetySettings` and the rest of
+[`GEMINI_ONLY_PARAM_KEYS`](https://github.com/framerslab/agentos/blob/master/src/core/llm/providers/openrouter-only-params.ts)) reach only Gemini.
 
 ```
 Primary Provider (e.g., Anthropic)

@@ -78,7 +78,7 @@ await session.send('Can you expand on that?'); // remembers context
 
 [Full quickstart](https://docs.agentos.sh/getting-started) * [Examples cookbook](https://docs.agentos.sh/getting-started/examples) * [API reference](https://docs.agentos.sh/api)
 
-**Sessions.** A session keeps the whole conversation, including tool calls and their results, whether memory is on or off. History is capped at about 120K tokens by default. Set `history: false` for a stateless session, set `history: { maxTokens }` to change the cap, and call `reseed()` to replace the history with a shorter set of messages you build yourself.
+**Sessions.** A session keeps the whole conversation whether memory is on or off: each `send()` records its tool calls, their results and the model's signed thinking, and every later request replays them. `stream()` records its turn as the prompt and the final text. History is capped at about 120K tokens by default. Set `history: false` for a stateless session, set `history: { maxTokens }` to change the cap, and call `reseed()` to replace the history with a shorter set of messages you build yourself.
 
 ```ts
 const stateless = agent({ model, memory: false, history: false }).session('job-1');
