@@ -1,3 +1,8 @@
+## <small>0.10.21 (2026-09-30)</small>
+
+* fix(llm): pin the Gemini fallback leg at the pro tier and give thinking models room on rescue hops ([0c376665e9cf0cceb0e6c7dacb0292bc993e2a18](https://github.com/framerslab/agentos/commit/0c376665e9cf0cceb0e6c7dacb0292bc993e2a18))
+* docs(readme): trim the sessions note to the current API ([2ba513a596865611773beab779f01746617decd6](https://github.com/framerslab/agentos/commit/2ba513a596865611773beab779f01746617decd6))
+
 ## <small>0.10.20 (2026-09-29)</small>
 
 * fix(memory): MemoryStore keeps the full-text index in step with durable writes ([75373d681dcd9a2fe03888b2609e08c4ff493de6](https://github.com/framerslab/agentos/commit/75373d681dcd9a2fe03888b2609e08c4ff493de6))
