@@ -201,6 +201,17 @@ export interface AnthropicCacheCreationBreakdown {
   ephemeral_1h_input_tokens?: number;
 }
 
+/**
+ * Why the model declined, sent beside `stop_reason: 'refusal'`. Kept verbatim
+ * on the content-policy error the provider raises.
+ */
+interface AnthropicStopDetails {
+  type?: string;
+  /** The policy area the request fell under, such as `cyber`. */
+  category?: string | null;
+  explanation?: string | null;
+}
+
 /** The Anthropic Messages API response shape. */
 interface AnthropicMessagesResponse {
   id: string;
@@ -208,8 +219,18 @@ interface AnthropicMessagesResponse {
   role: 'assistant';
   content: AnthropicContentBlock[];
   model: string;
-  stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null;
+  stop_reason:
+    | 'end_turn'
+    | 'max_tokens'
+    | 'stop_sequence'
+    | 'tool_use'
+    | 'pause_turn'
+    | 'refusal'
+    | 'model_context_window_exceeded'
+    | null;
   stop_sequence: string | null;
+  /** Present with `stop_reason: 'refusal'`. */
+  stop_details?: AnthropicStopDetails | null;
   usage: {
     input_tokens: number;
     output_tokens: number;
@@ -312,6 +333,8 @@ interface AnthropicStreamMessageDelta {
   delta: {
     stop_reason: string | null;
     stop_sequence: string | null;
+    /** Present with `stop_reason: 'refusal'`. */
+    stop_details?: AnthropicStopDetails | null;
   };
   usage: {
     output_tokens: number;
@@ -820,7 +843,10 @@ export class AnthropicProvider implements IProvider {
    * @param {ModelCompletionOptions} options - Completion options. `maxTokens` is strongly
    *   recommended; defaults to {@link AnthropicProviderConfig.defaultMaxTokens} if omitted.
    * @returns {Promise<ModelCompletionResponse>} A normalized completion response.
-   * @throws {AnthropicProviderError} On authentication, validation, or network errors.
+   * @throws {AnthropicProviderError} On authentication, validation, or network
+   *   errors, and with code `content_filter` when the model refuses
+   *   (`stop_reason: 'refusal'`); partial output from a refused turn is
+   *   discarded.
    */
   public async generateCompletion(
     modelId: string,
@@ -998,6 +1024,11 @@ export class AnthropicProvider implements IProvider {
    * {@link mapResponseToCompletion} stays the single mapping path
    * (structured output, stop reasons, cost, thinking blocks).
    *
+   * A refusal returns normally with `stop_reason: 'refusal'` and its
+   * `stop_details`, even when it cut a tool_use input off mid-JSON:
+   * {@link mapResponseToCompletion} raises it as a content-policy error, and
+   * a transport error here would be retried instead.
+   *
    * @throws {AnthropicProviderError} `STREAM_ERROR_EVENT` on an SSE error
    *   event, `STREAM_INCOMPLETE` when the stream ends before `message_delta`
    *   or a tool_use input JSON is truncated, plus whatever
@@ -1021,6 +1052,7 @@ export class AnthropicProvider implements IProvider {
     let id = `anthropic-stream-${Date.now()}`;
     let model = '';
     let stopReason: AnthropicMessagesResponse['stop_reason'] = null;
+    let stopDetails: AnthropicStopDetails | null | undefined;
     let inputTokens = 0;
     let outputTokens = 0;
     let cacheCreationTokens: number | undefined;
@@ -1091,6 +1123,7 @@ export class AnthropicProvider implements IProvider {
         case 'message_delta': {
           sawMessageDelta = true;
           stopReason = (event.delta.stop_reason ?? null) as AnthropicMessagesResponse['stop_reason'];
+          stopDetails = event.delta.stop_details ?? stopDetails;
           // Anthropic reports the cumulative output total here — latest wins.
           outputTokens = event.usage?.output_tokens ?? outputTokens;
           break;
@@ -1117,6 +1150,9 @@ export class AnthropicProvider implements IProvider {
     }
 
     const content: AnthropicContentBlock[] = Array.from(blocks.entries())
+      // A refusal can cut a tool input off mid-JSON. The refused turn is
+      // discarded whole, so its tool calls are dropped rather than parsed.
+      .filter(([, block]) => stopReason !== 'refusal' || block.type !== 'tool_use')
       .sort((a, b) => a[0] - b[0])
       .map(([, block]) => {
         if (block.type === 'tool_use') {
@@ -1148,6 +1184,7 @@ export class AnthropicProvider implements IProvider {
       model,
       stop_reason: stopReason,
       stop_sequence: null,
+      ...(stopDetails !== undefined && { stop_details: stopDetails }),
       usage: {
         input_tokens: inputTokens,
         output_tokens: outputTokens,
@@ -1177,7 +1214,10 @@ export class AnthropicProvider implements IProvider {
    * @param {ChatMessage[]} messages - Conversation messages.
    * @param {ModelCompletionOptions} options - Completion options.
    * @returns {AsyncGenerator<ModelCompletionResponse>} Incremental response chunks.
-   * @throws {AnthropicProviderError} On connection or stream errors.
+   * @throws {AnthropicProviderError} On connection errors, and with code
+   *   `content_filter` when the model refuses (`stop_reason: 'refusal'`),
+   *   before or after text has streamed. Other stream errors end the stream
+   *   with an error chunk.
    */
   public async *generateCompletionStream(
     modelId: string,
@@ -1420,6 +1460,14 @@ export class AnthropicProvider implements IProvider {
               options.cache === false,
             );
 
+            // A refusal ends the turn unsuccessfully, whatever streamed before
+            // it. Anthropic's contract is to discard the partial output; a
+            // final chunk would let the caller keep it as the answer and run
+            // tool calls parsed out of it.
+            if (event.delta.stop_reason === 'refusal') {
+              throw this.refusalError(modelId, event.delta.stop_details, accumulatedContent, usage);
+            }
+
             yield {
               id: responseId,
               object: 'chat.completion.chunk',
@@ -1469,6 +1517,12 @@ export class AnthropicProvider implements IProvider {
         }
       }
     } catch (streamError: unknown) {
+      // A refusal propagates as a thrown content-policy error, as
+      // GeminiProvider's safety block does, so the fallback chain can act on
+      // it instead of reading an error chunk.
+      if (streamError instanceof AnthropicProviderError && streamError.code === 'content_filter') {
+        throw streamError;
+      }
       const message = streamError instanceof Error ? streamError.message : 'Anthropic stream processing error';
       console.error(`AnthropicProvider stream error for model ${modelId}:`, message);
       yield {
@@ -2464,6 +2518,9 @@ export class AnthropicProvider implements IProvider {
    * @param requestedModelId - The model the request named. Prices the call
    *   when the response carries no model echo.
    * @returns {ModelCompletionResponse} Normalized completion response.
+   * @throws {AnthropicProviderError} With code `content_filter` when the model
+   *   refused (`stop_reason: 'refusal'`), whether or not it wrote any output
+   *   first.
    * @private
    */
   private mapResponseToCompletion(
@@ -2471,11 +2528,36 @@ export class AnthropicProvider implements IProvider {
     structuredOutputName?: string,
     requestedModelId?: string,
   ): ModelCompletionResponse {
+    const pricedModelId = apiResponse.model || requestedModelId || '';
+
     // Collect text content
     const textParts = apiResponse.content
       .filter(block => block.type === 'text' && block.text)
       .map(block => block.text!);
     let fullText = textParts.join('');
+
+    const usage: ModelUsage = {
+      promptTokens: apiResponse.usage.input_tokens,
+      completionTokens: apiResponse.usage.output_tokens,
+      totalTokens: apiResponse.usage.input_tokens + apiResponse.usage.output_tokens,
+      costUSD: estimateAnthropicCostUSD(pricedModelId, apiResponse.usage),
+      cacheCreationInputTokens: apiResponse.usage.cache_creation_input_tokens,
+      cacheReadInputTokens: apiResponse.usage.cache_read_input_tokens,
+      // Anthropic's input_tokens EXCLUDES cache reads/writes; the
+      // provider-independent inclusive input total adds them back
+      // (OpenAI/OpenRouter report prompt_tokens already inclusive).
+      inclusiveInputTokens:
+        apiResponse.usage.input_tokens
+        + (apiResponse.usage.cache_read_input_tokens ?? 0)
+        + (apiResponse.usage.cache_creation_input_tokens ?? 0),
+    };
+
+    // A refused turn is discarded whole, even when the model wrote text or
+    // tool_use blocks before refusing, so it never reaches tool-call mapping
+    // and the caller can never run a tool from it.
+    if (apiResponse.stop_reason === 'refusal') {
+      throw this.refusalError(pricedModelId, apiResponse.stop_details, fullText, usage);
+    }
 
     // Collect tool_use blocks and convert to OpenAI-style tool_calls
     const toolCalls = apiResponse.content
@@ -2524,25 +2606,6 @@ export class AnthropicProvider implements IProvider {
     const hasToolCalls = toolCalls.length > 0;
     const finishReason = this.mapStopReason(apiResponse.stop_reason);
 
-    const usage: ModelUsage = {
-      promptTokens: apiResponse.usage.input_tokens,
-      completionTokens: apiResponse.usage.output_tokens,
-      totalTokens: apiResponse.usage.input_tokens + apiResponse.usage.output_tokens,
-      costUSD: estimateAnthropicCostUSD(
-        apiResponse.model || requestedModelId || '',
-        apiResponse.usage,
-      ),
-      cacheCreationInputTokens: apiResponse.usage.cache_creation_input_tokens,
-      cacheReadInputTokens: apiResponse.usage.cache_read_input_tokens,
-      // Anthropic's input_tokens EXCLUDES cache reads/writes; the
-      // provider-independent inclusive input total adds them back
-      // (OpenAI/OpenRouter report prompt_tokens already inclusive).
-      inclusiveInputTokens:
-        apiResponse.usage.input_tokens
-        + (apiResponse.usage.cache_read_input_tokens ?? 0)
-        + (apiResponse.usage.cache_creation_input_tokens ?? 0),
-    };
-
     const choice: ModelCompletionChoice = {
       index: 0,
       message: {
@@ -2573,7 +2636,14 @@ export class AnthropicProvider implements IProvider {
    * - `end_turn` → `"stop"` (natural completion)
    * - `tool_use` → `"tool_calls"` (model wants to invoke tools)
    * - `max_tokens` → `"length"` (hit token limit)
+   * - `model_context_window_exceeded` → `"length"` (output cut off at the
+   *   context window)
    * - `stop_sequence` → `"stop"` (hit a caller-specified stop sequence)
+   * - `refusal` → `"content_filter"`, the name GeminiProvider and
+   *   OpenAIProvider use. Both response paths raise a refusal as an error
+   *   before a finish reason is reported; the mapping keeps the vocabulary
+   *   complete.
+   * - anything else (such as `pause_turn`) passes through unchanged.
    *
    * @param {string | null} stopReason - Anthropic's stop_reason value.
    * @returns {string} Normalized finish reason.
@@ -2584,9 +2654,45 @@ export class AnthropicProvider implements IProvider {
       case 'end_turn': return 'stop';
       case 'tool_use': return 'tool_calls';
       case 'max_tokens': return 'length';
+      case 'model_context_window_exceeded': return 'length';
       case 'stop_sequence': return 'stop';
+      case 'refusal': return 'content_filter';
       default: return stopReason ?? 'stop';
     }
+  }
+
+  /**
+   * The error a refused turn raises. Code `content_filter` is what
+   * `isContentPolicyRefusal` recognizes, so the generateText and streamText
+   * fallback chains act on it, and the provider-health registry does not
+   * count it as a provider failure. The message carries no HTTP status or
+   * rate-limit wording, which retry classifiers grep for.
+   *
+   * @param modelId Model that refused.
+   * @param stopDetails The response's `stop_details`, kept verbatim.
+   * @param partialText Text the model wrote before refusing, discarded as an
+   *   answer but kept for diagnostics.
+   * @param usage Tokens the refused call consumed.
+   * @returns An error with code `content_filter` and Anthropic error type
+   *   `refusal`.
+   * @private
+   */
+  private refusalError(
+    modelId: string,
+    stopDetails: AnthropicStopDetails | null | undefined,
+    partialText: string,
+    usage: ModelUsage,
+  ): AnthropicProviderError {
+    const category = stopDetails?.category;
+    return new AnthropicProviderError(
+      `Claude declined the request on ${modelId || 'the requested model'} (stop_reason refusal${
+        category ? `, category ${category}` : ''
+      }).`,
+      'content_filter',
+      undefined,
+      'refusal',
+      { stopReason: 'refusal', stopDetails: stopDetails ?? null, partialText, usage },
+    );
   }
 
   /**

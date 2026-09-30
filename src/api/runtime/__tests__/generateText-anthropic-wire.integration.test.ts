@@ -12,8 +12,9 @@ import { z } from 'zod';
 const fetchMock = vi.fn();
 vi.stubGlobal('fetch', fetchMock);
 
-import { generateText } from '../../generateText.js';
+import { generateText, isContentPolicyRefusal } from '../../generateText.js';
 import { generateObject } from '../../generateObject.js';
+import { streamText, type StreamPart } from '../../streamText.js';
 import { globalLLMProviderHealth } from '../../../core/safety/LLMProviderHealthRegistry.js';
 
 type Json = Record<string, any>;
@@ -53,6 +54,72 @@ function textTurn(model: string, text: string, usage: Json = { input_tokens: 10 
       },
       { type: 'message_stop' },
     ]);
+}
+
+/**
+ * A reply Claude refuses (`stop_reason: 'refusal'`), after writing
+ * `partialText` when one is given.
+ */
+function refusalTurn(model: string, partialText = ''): Reply {
+  return () =>
+    sse([
+      messageStart(model, { input_tokens: 12 }),
+      ...(partialText
+        ? [
+            { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+            { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: partialText } },
+            { type: 'content_block_stop', index: 0 },
+          ]
+        : []),
+      {
+        type: 'message_delta',
+        delta: {
+          stop_reason: 'refusal',
+          stop_sequence: null,
+          stop_details: { type: 'refusal', category: 'example_category', explanation: 'Declined.' },
+        },
+        usage: { output_tokens: 4 },
+      },
+      { type: 'message_stop' },
+    ]);
+}
+
+/**
+ * Partial text a refusal cuts off. It holds a ReAct-style tool call that the
+ * text tool-call parser would pick up if the partial text were kept as a turn.
+ */
+const PARTIAL_WITH_TOOL_CALL = 'Let me check.\nAction: get_weather\nInput: {"city":"Paris"}';
+
+/** A weather tool whose executions the refusal tests count. */
+function weatherTools() {
+  const execute = vi.fn(async (args: { city: string }) => ({ city: args.city, temp_c: 18 }));
+  return {
+    execute,
+    tools: {
+      get_weather: {
+        description: 'Current weather for a city.',
+        parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+        execute,
+      },
+    },
+  };
+}
+
+/** Awaits `promise` and returns what it rejected with. */
+async function rejectionOf(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected the call to reject');
+}
+
+/** Collects every part of a stream (streamText runs only while it is read). */
+async function collect(stream: AsyncIterable<StreamPart>): Promise<StreamPart[]> {
+  const parts: StreamPart[] = [];
+  for await (const part of stream) parts.push(part);
+  return parts;
 }
 
 /** Routes each POST to the next reply queued for the model its body names. */
@@ -132,5 +199,129 @@ describe('Anthropic catalog and pricing through the public API', () => {
 
     // $0.004 input + $0.02 cache reads + $0.01 output.
     expect(result.usage.costUSD).toBeCloseTo(0.034, 6);
+  });
+});
+
+describe('Claude refusals through the public API', () => {
+  it('generateText falls back to the next model when Claude refuses before any output', async () => {
+    route({
+      'claude-opus-5-5': [refusalTurn('claude-opus-5-5')],
+      'claude-opus-4-8': [textTurn('claude-opus-4-8', 'Recovered.')],
+    });
+
+    const result = await generateText({
+      provider: 'anthropic',
+      model: 'claude-opus-5-5',
+      prompt: 'What is the weather in Paris?',
+      fallbackProviders: [{ provider: 'anthropic', model: 'claude-opus-4-8' }],
+    });
+
+    expect(result.text).toBe('Recovered.');
+    expect(result.fallback?.fired).toBe(true);
+    expect(result.fallback?.hops).toEqual([
+      { provider: 'anthropic', model: 'claude-opus-5-5', ok: false },
+      { provider: 'anthropic', model: 'claude-opus-4-8', ok: true },
+    ]);
+  });
+
+  it('generateText rejects with a content-policy error when no fallback is configured', async () => {
+    route({ 'claude-opus-5-5': [refusalTurn('claude-opus-5-5')] });
+
+    const error = await rejectionOf(
+      generateText({
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        prompt: 'What is the weather in Paris?',
+        fallbackProviders: [],
+      }),
+    );
+
+    // Never an empty-string success.
+    expect(isContentPolicyRefusal(error)).toBe(true);
+  });
+
+  it('generateText never runs a tool call parsed from the text of a refused turn', async () => {
+    route({ 'claude-opus-5-5': [refusalTurn('claude-opus-5-5', PARTIAL_WITH_TOOL_CALL)] });
+    const { execute, tools } = weatherTools();
+
+    const error = await rejectionOf(
+      generateText({
+        provider: 'anthropic',
+        model: 'claude-opus-5-5',
+        prompt: 'What is the weather in Paris?',
+        tools,
+        maxSteps: 3,
+        fallbackProviders: [],
+      }),
+    );
+
+    expect(isContentPolicyRefusal(error)).toBe(true);
+    expect(execute).not.toHaveBeenCalled();
+    expect(postedBodies()).toHaveLength(1);
+  });
+
+  it('leaves the Anthropic breaker closed after six refusals in a row', async () => {
+    route({ 'claude-opus-5-5': Array.from({ length: 6 }, () => refusalTurn('claude-opus-5-5')) });
+
+    for (let i = 0; i < 6; i++) {
+      const error = await rejectionOf(
+        generateText({
+          provider: 'anthropic',
+          model: 'claude-opus-5-5',
+          prompt: `Question ${i}`,
+          fallbackProviders: [],
+        }),
+      );
+      // A refusal counted as a provider failure would open the breaker after
+      // five, and the sixth call would fail with circuit-open instead.
+      expect(isContentPolicyRefusal(error)).toBe(true);
+    }
+    expect(globalLLMProviderHealth.isOpen('anthropic')).toBe(false);
+  });
+
+  it('streamText falls back when Claude refuses before any text streamed', async () => {
+    route({
+      'claude-opus-5-5': [refusalTurn('claude-opus-5-5')],
+      'claude-opus-4-8': [textTurn('claude-opus-4-8', 'Recovered.')],
+    });
+
+    const result = streamText({
+      provider: 'anthropic',
+      model: 'claude-opus-5-5',
+      prompt: 'What is the weather in Paris?',
+      fallbackProviders: [{ provider: 'anthropic', model: 'claude-opus-4-8' }],
+    });
+    const parts = await collect(result.fullStream);
+
+    expect(parts).toEqual([{ type: 'text', text: 'Recovered.' }]);
+    expect(await result.finishReason).toBe('stop');
+  });
+
+  it('streamText ends unsuccessfully and runs no tool when Claude refuses after text streamed', async () => {
+    route({
+      'claude-opus-5-5': [refusalTurn('claude-opus-5-5', PARTIAL_WITH_TOOL_CALL)],
+      'claude-opus-4-8': [textTurn('claude-opus-4-8', 'Recovered.')],
+    });
+    const { execute, tools } = weatherTools();
+
+    const result = streamText({
+      provider: 'anthropic',
+      model: 'claude-opus-5-5',
+      prompt: 'What is the weather in Paris?',
+      tools,
+      maxSteps: 3,
+      fallbackProviders: [{ provider: 'anthropic', model: 'claude-opus-4-8' }],
+    });
+    const parts = await collect(result.fullStream);
+
+    expect(parts[0]).toEqual({ type: 'text', text: PARTIAL_WITH_TOOL_CALL });
+    const last = parts[parts.length - 1];
+    expect(last.type).toBe('error');
+    expect(isContentPolicyRefusal(last.type === 'error' ? last.error : undefined)).toBe(true);
+    expect(parts.some((part) => part.type === 'tool-call' || part.type === 'tool-result')).toBe(false);
+    expect(execute).not.toHaveBeenCalled();
+    expect(await result.finishReason).toBe('error');
+    // The refused text already reached the consumer, so no fallback request.
+    expect(postedBodies().map((body) => body.model)).toEqual(['claude-opus-5-5']);
   });
 });

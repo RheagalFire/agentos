@@ -1125,8 +1125,9 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
        : opts.fallbackProviders;
 
       // A stream that already handed text or tool activity to the consumer
-      // is not restarted on another provider: the consumer would receive the
-      // partial answer followed by a fresh one, and tools could run twice.
+      // is not restarted on another provider (a refusal after text
+      // included): the consumer would receive the partial answer followed by
+      // a fresh one, and tools could run twice.
       // firstPartAt is stamped when the first part reaches the consumer.
       const deliveredOutput = firstPartAt !== undefined || shimRanTool;
       if (effectiveFallbacks.length && isRetryableError(error) && !deliveredOutput) {

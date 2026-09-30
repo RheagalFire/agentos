@@ -327,6 +327,8 @@ Reasoning-default models (`claude-opus-5-5`, `claude-fable-5-1`, `claude-sonnet-
 
 `usage.costUSD` prices cache reads at 0.1x the input price, except Claude Opus 5.5 (0.05x) and Claude Fable 5.1 (0.025x), and cache writes at 1.25x for the 5-minute TTL and 2x for the 1-hour TTL, read from the response's `cache_creation` split.
 
+When Claude declines a request (`stop_reason: "refusal"`), the provider throws an `AnthropicProviderError` with code `content_filter`, whether the refusal came before any output or partway through it. The error carries `stop_details` and any partial text in `details`, and no tool call from the refused turn runs. `generateText` and `streamText` treat it like other content-policy errors: the fallback chain fires, and with `fallbackProviders: []` the call fails. A `streamText` refusal that arrives after text has streamed ends the stream with an `error` part and finish reason `error` instead of falling back, because the refused text has already reached the consumer. Refusals do not count toward the provider-health breaker.
+
 ### Google Gemini
 
 ```bash
