@@ -803,19 +803,6 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
               streamedAnyText = true;
             }
 
-            if (chunk.error) {
-              const error = new Error(chunk.error.message);
-              const part: StreamPart = { type: 'error', error };
-              parts.push(part);
-              yield part;
-              metricStatus = 'error';
-              resolveText!(finalText);
-              resolveUsage!(usage); resolveResponseModel!(lastResponseModelId); resolveServiceTier!(lastServiceTier);
-              resolveToolCalls!(allToolCalls);
-              resolveFinishReason!('error');
-              return;
-            }
-
             if (chunk.isFinal && opts.cacheDiagnostics) {
               sawFinalProviderChunk = true;
               // Chain the id for the NEXT step's comparison; keep the
@@ -882,6 +869,23 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
                   cacheCreationTokens: (chunk.usage as { cacheCreationInputTokens?: number }).cacheCreationInputTokens,
                 },
               });
+            }
+
+            // After the usage above: a provider that ends a step with an
+            // error can still report what the step billed (a failed
+            // /v1/responses response carries its usage), and the result,
+            // the usage ledger and the observer read `usage`.
+            if (chunk.error) {
+              const error = new Error(chunk.error.message);
+              const part: StreamPart = { type: 'error', error };
+              parts.push(part);
+              yield part;
+              metricStatus = 'error';
+              resolveText!(finalText);
+              resolveUsage!(usage); resolveResponseModel!(lastResponseModelId); resolveServiceTier!(lastServiceTier);
+              resolveToolCalls!(allToolCalls);
+              resolveFinishReason!('error');
+              return;
             }
           }
         } finally {

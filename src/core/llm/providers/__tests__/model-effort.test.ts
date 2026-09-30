@@ -136,6 +136,17 @@ describe('mapEffortToOpenAiResponsesEffort (model-aware /v1/responses effort)', 
     expect(mapEffortToOpenAiReasoningEffortForModel('max', 'gpt-5.6-luna')).toBe('xhigh');
   });
 
+  it('allow-lists gpt-6-sol, gpt-6-luna (probed 2026-09-30) and gpt-6.1-sol (2026-09-29 changelog) for xhigh and max', () => {
+    for (const model of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol']) {
+      expect(modelAcceptsXhighResponsesEffort(model)).toBe(true);
+      expect(modelAcceptsMaxResponsesEffort(model)).toBe(true);
+      expect(mapEffortToOpenAiResponsesEffort(model, 'max')).toBe('max');
+      expect(mapEffortToOpenAiResponsesEffort(model, 'xhigh')).toBe('xhigh');
+      // Chat Completions keeps its xhigh ceiling.
+      expect(mapEffortToOpenAiReasoningEffortForModel('max', model)).toBe('xhigh');
+    }
+  });
+
   it('keeps unprobed gpt-6 siblings off both allow-lists (exact-id discipline)', () => {
     expect(modelAcceptsMaxResponsesEffort('gpt-6-astra-pro')).toBe(false);
     expect(modelAcceptsMaxResponsesEffort('gpt-6-nova')).toBe(false);

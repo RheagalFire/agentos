@@ -6,8 +6,8 @@
  * from a mocked GET /v1/models, so they exercise the real
  * refreshAvailableModels filter and mapApiToModelInfo path. The mapper gives
  * GPT-5, GPT-6 and o-series models a context window and the capabilities this
- * provider can serve: tool_use except on GPT-6, vision except on o3-mini, and
- * chat only for Responses-only models. The refresh filter admits the priced,
+ * provider can serve: tool_use, vision except on o3-mini, and chat only for
+ * Responses-only models. The refresh filter admits the priced,
  * reachable o-series ids, which neither start with `gpt-` nor contain
  * `embedding`.
  */
@@ -101,10 +101,12 @@ describe('OpenAI model catalog mapping', () => {
 
   it('advertises tool_use only where OpenAIProvider can serve tool calls', async () => {
     const toolCapable = (await provider.listAvailableModels({ capability: 'tool_use' })).map(m => m.modelId);
-    expect(toolCapable).toEqual(expect.arrayContaining(['gpt-5.6-sol', 'gpt-5.5', 'o3', 'o4-mini', 'gpt-4o']));
-    // GPT-6 tool calls need the Responses API, which this provider uses only
-    // for non-streamed calls that set an effort, and o3-pro is Responses-only.
-    for (const id of ['gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'o3-pro']) {
+    // Every GPT-6 tool call, streamed or not, goes to /v1/responses.
+    expect(toolCapable).toEqual(expect.arrayContaining([
+      'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.5', 'o3', 'o4-mini', 'gpt-4o',
+    ]));
+    // Responses-only models list as chat only.
+    for (const id of ['o3-pro', 'gpt-5-pro']) {
       expect(toolCapable).not.toContain(id);
     }
   });
@@ -206,7 +208,7 @@ describe('OpenAI model catalog mapping', () => {
 describe('openAiReasoningCapabilities', () => {
   it('limits capabilities to what the provider can serve', () => {
     expect(openAiReasoningCapabilities('gpt-5.6-sol')).toEqual(['chat', 'json_mode', 'tool_use', 'vision_input']);
-    expect(openAiReasoningCapabilities('gpt-6-astra')).toEqual(['chat', 'json_mode', 'vision_input']);
+    expect(openAiReasoningCapabilities('gpt-6-astra')).toEqual(['chat', 'json_mode', 'tool_use', 'vision_input']);
     expect(openAiReasoningCapabilities('o3-mini')).toEqual(['chat', 'json_mode', 'tool_use']);
     expect(openAiReasoningCapabilities('o1-mini')).toEqual(['chat']);
     for (const id of ['gpt-5-pro', 'gpt-5.5-pro', 'o3-pro', 'o3-pro-2025-06-10', 'gpt-5.3-codex', 'gpt-5.1-codex-max', 'gpt-5.6-cyber']) {
