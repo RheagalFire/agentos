@@ -47,6 +47,7 @@ import { resolveAnthropicEffort } from '../model-effort.js';
 import { computeRetryBackoffMs } from './retry-backoff.js';
 import { recordCacheUsage } from './cacheLeakDetector.js';
 import { resolveCacheCapabilities } from '../model-cache-capabilities.js';
+import { redactUrlSecrets } from '../url-secrets';
 
 // Re-export so callers that already reach for Anthropic model-capability
 // predicates (modelSupportsTemperature lives here too) find this one next to
@@ -2930,8 +2931,14 @@ export class AnthropicProvider implements IProvider {
             'REQUEST_TIMEOUT',
           );
         } else {
+          // fetch names the URL (credentials included) when it rejects one,
+          // and quotes a header value it rejects, which carries the key.
           lastError = new AnthropicProviderError(
-            error instanceof Error ? error.message : 'Network or unknown error',
+            redactUrlSecrets(
+              error instanceof Error ? error.message : 'Network or unknown error',
+              this.config.baseURL,
+              [apiKey],
+            ),
             'NETWORK_ERROR',
           );
         }
@@ -3043,8 +3050,14 @@ export class AnthropicProvider implements IProvider {
     } catch (error: unknown) {
       clearTimeout(timeoutId);
       if (error instanceof AnthropicProviderError) throw error;
+      // Masked like makeApiRequest's network failures: fetch's rejection
+      // can name a credential-bearing base URL or quote the key header.
       throw new AnthropicProviderError(
-        error instanceof Error ? error.message : 'Failed to connect to Anthropic stream.',
+        redactUrlSecrets(
+          error instanceof Error ? error.message : 'Failed to connect to Anthropic stream.',
+          this.config.baseURL,
+          [apiKey],
+        ),
         'STREAM_CONNECTION_FAILED',
       );
     }
