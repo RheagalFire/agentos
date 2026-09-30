@@ -48,6 +48,8 @@ const ENV_KEY_MAP: Record<string, string> = {
   xai: 'XAI_API_KEY',
   stability: 'STABILITY_API_KEY',
   replicate: 'REPLICATE_API_TOKEN',
+  fal: 'FAL_API_KEY',
+  bfl: 'BFL_API_KEY',
 };
 
 const ENV_URL_MAP: Record<string, string> = {
@@ -362,11 +364,12 @@ export function resolveModelOption(opts: ModelOption, task: TaskType = 'text'): 
 }
 
 /**
- * Chat model families, optionally behind a gateway prefix such as `openai/`
- * or `meta-llama/`.
+ * Chat model families, optionally behind a provider prefix such as `openai:`
+ * and a gateway prefix such as `openai/` or `meta-llama/`
+ * (`openrouter:openai/gpt-4o`).
  */
 const CHAT_MODEL_FAMILY =
-  /^(?:[\w.-]+\/)?(?:gpt-|chatgpt|o\d|claude|gemini|gemma|llama|mistral|mixtral|codestral|ministral|magistral|grok|deepseek|qwen|command|phi-|sonar|kimi|glm)/i;
+  /^(?:[\w.-]+:)?(?:[\w.-]+\/)?(?:gpt-|chatgpt|o\d|claude|gemini|gemma|llama|mistral|mixtral|codestral|ministral|magistral|grok|deepseek|qwen|command|phi-|sonar|kimi|glm)/i;
 
 /** Names that mark a non-chat model inside a chat family (gpt-image-1, gemini-embedding-2). */
 const NON_CHAT_MODEL_MARKER = /embed|image|dall-e|imagen|tts|whisper|transcri|audio|realtime|moderation/i;

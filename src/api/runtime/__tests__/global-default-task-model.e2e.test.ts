@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { embedText } from '../../embedText.js';
 import { editImage } from '../../editImage.js';
+import { generateImage } from '../../generateImage.js';
 import { clearDefaultProvider, setDefaultProvider } from '../global-default.js';
 
 type Json = Record<string, any>;
@@ -59,6 +60,7 @@ beforeEach(() => {
 afterEach(() => {
   clearDefaultProvider();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const key of BASE_URL_VARS) {
     if (savedBaseUrls[key] === undefined) delete process.env[key];
     else process.env[key] = savedBaseUrls[key];
@@ -76,6 +78,15 @@ describe('global default model and non-text tasks', () => {
     expect(String(url)).toBe('https://api.openai.com/v1/embeddings');
     expect(postedBody().model).toBe('text-embedding-3-small');
     expect(result.embeddings).toEqual([[0.1, 0.2]]);
+  });
+
+  it('embedText treats a provider-qualified chat default as the chat model it names', async () => {
+    setDefaultProvider({ provider: 'openai', model: 'openai:gpt-4o', apiKey: 'sk-global-qualified' });
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(openAiEmbedding('text-embedding-3-small'));
+
+    await embedText({ input: 'hello' });
+
+    expect(postedBody().model).toBe('text-embedding-3-small');
   });
 
   it('embedText keeps an embedding model named by the global default', async () => {
@@ -166,5 +177,117 @@ describe('global default model and non-text tasks', () => {
     expect(String(url)).toContain('/images/edits');
     expect(result.provider).toBe('openai');
     expect(result.model).toBe('gpt-image-1');
+  });
+
+  describe('generateImage without a provider or model', () => {
+    const IMAGE_KEYS = [
+      'REPLICATE_API_TOKEN',
+      'FAL_API_KEY',
+      'BFL_API_KEY',
+      'OPENAI_API_KEY',
+      'STABILITY_API_KEY',
+      'OPENROUTER_API_KEY',
+      'STABLE_DIFFUSION_LOCAL_BASE_URL',
+    ];
+    const generated = () => jsonResponse({ created: 100, data: [{ b64_json: 'aW1hZ2U=' }] });
+
+    beforeEach(() => {
+      for (const key of IMAGE_KEYS) vi.stubEnv(key, '');
+    });
+
+    it('uses the global default provider and its key when no image key is in the environment', async () => {
+      setDefaultProvider({ provider: 'openai', model: 'gpt-4o', apiKey: 'sk-global-generate' });
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(generated());
+
+      const result = await generateImage({ prompt: 'A red panda on a rooftop.' });
+
+      const [url, init] = vi.mocked(globalThis.fetch).mock.calls[0];
+      expect(String(url)).toBe('https://api.openai.com/v1/images/generations');
+      expect((init as { headers: Record<string, string> }).headers.Authorization).toBe('Bearer sk-global-generate');
+      expect(result.provider).toBe('openai');
+      expect(result.model).toBe('gpt-image-1');
+    });
+
+    it.each(['openai/gpt-4o', 'openrouter:openai/gpt-4o'])(
+      'passes over a default whose provider has no image model for it (%s)',
+      async (model) => {
+      // OpenRouter serves no default image model, so its chat default cannot
+      // make images; the provider found in the environment does.
+      vi.stubEnv('OPENAI_API_KEY', 'sk-env-images');
+      setDefaultProvider({ provider: 'openrouter', model, apiKey: 'sk-or-chat' });
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(generated());
+
+      const result = await generateImage({ prompt: 'A red panda on a rooftop.' });
+
+      const [url, init] = vi.mocked(globalThis.fetch).mock.calls[0];
+      expect(String(url)).toBe('https://api.openai.com/v1/images/generations');
+      expect((init as { headers: Record<string, string> }).headers.Authorization).toBe('Bearer sk-env-images');
+      expect(result.provider).toBe('openai');
+      },
+    );
+
+    it('passes over a Fal default with no key for the provider in the environment', async () => {
+      vi.stubEnv('OPENAI_API_KEY', 'sk-env-images');
+      setDefaultProvider({ provider: 'fal' });
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(generated());
+
+      const result = await generateImage({ prompt: 'A red panda on a rooftop.' });
+
+      const [url] = vi.mocked(globalThis.fetch).mock.calls[0];
+      expect(String(url)).toBe('https://api.openai.com/v1/images/generations');
+      expect(result.provider).toBe('openai');
+    });
+
+    it('uses a Fal default whose key is only in the environment, ahead of the other providers', async () => {
+      vi.stubEnv('FAL_API_KEY', 'fal-env-key');
+      vi.stubEnv('REPLICATE_API_TOKEN', 'r8-env-token');
+      setDefaultProvider({ provider: 'fal' });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.endsWith('/status')) return jsonResponse({ status: 'COMPLETED' });
+        if (url.includes('/requests/')) {
+          return jsonResponse({ images: [{ url: 'https://fal.test/panda.png', content_type: 'image/png' }] });
+        }
+        return jsonResponse({ request_id: 'req-panda' });
+      });
+
+      const result = await generateImage({ prompt: 'A red panda on a rooftop.' });
+
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(String(url)).toBe('https://queue.fal.run/fal-ai/flux/dev');
+      expect((init as { headers: Record<string, string> }).headers.Authorization).toBe('Key fal-env-key');
+      expect(result.provider).toBe('fal');
+      expect(result.images[0]?.url).toBe('https://fal.test/panda.png');
+    });
+
+    it('keeps the default\'s model for an inline custom endpoint', async () => {
+      setDefaultProvider({ provider: 'openai', model: 'gpt-4o', apiKey: 'sk-global-gateway' });
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(generated());
+
+      const result = await generateImage({ prompt: 'A red panda on a rooftop.', baseUrl: 'http://img.test/v1' });
+
+      const [url] = vi.mocked(globalThis.fetch).mock.calls[0];
+      expect(String(url)).toBe('http://img.test/v1/images/generations');
+      expect(result.model).toBe('gpt-4o');
+    });
+
+    it('passes over a default whose provider has no key anywhere', async () => {
+      setDefaultProvider({ provider: 'openai', model: 'dall-e-3' });
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+      await expect(generateImage({ prompt: 'A red panda on a rooftop.' })).rejects.toThrow(
+        /No image provider configured/,
+      );
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('keeps an image model named by the global default', async () => {
+      setDefaultProvider({ provider: 'openai', model: 'dall-e-3', apiKey: 'sk-global-dalle3' });
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(generated());
+
+      const result = await generateImage({ prompt: 'A red panda on a rooftop.' });
+
+      expect(result.model).toBe('dall-e-3');
+    });
   });
 });
