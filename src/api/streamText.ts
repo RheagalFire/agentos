@@ -843,6 +843,7 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
                 name: toolCall.name!,
                 arguments: toolCall.rawArguments || JSON.stringify(toolCall.arguments ?? {}),
               },
+              ...(toolCall.thoughtSignature ? { thoughtSignature: toolCall.thoughtSignature } : {}),
             })),
           {
             text: stepText,

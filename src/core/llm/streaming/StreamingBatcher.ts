@@ -52,6 +52,8 @@ interface AccumulatedToolBuffer {
   raw: string;
   name?: string;
   id?: string;
+  /** Gemini thought signature carried on the call's deltas, if any. */
+  thoughtSignature?: string;
 }
 
 interface AccumulatorState {
@@ -72,6 +74,7 @@ function accumulate(state: AccumulatorState, chunk: ModelCompletionResponse) {
       if (d.function?.arguments_delta) buf.raw += d.function.arguments_delta;
       if (d.function?.name) buf.name = d.function.name;
       if (d.id) buf.id = d.id;
+      if (d.thoughtSignature) buf.thoughtSignature = d.thoughtSignature;
       state.toolBuffers[key] = buf;
     }
   }
@@ -94,6 +97,7 @@ function buildBatch(state: AccumulatorState, batchSequence: number, isFinalOverr
         name: data.name,
         arguments_delta: data.raw, // merged arguments
       },
+      ...(data.thoughtSignature ? { thoughtSignature: data.thoughtSignature } : {}),
     };
   });
 

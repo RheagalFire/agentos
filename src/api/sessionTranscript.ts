@@ -14,6 +14,12 @@ export interface TranscriptToolCall {
   id: string;
   type: 'function';
   function: { name: string; arguments: string };
+  /**
+   * Gemini thought signature for this call, recorded with the call so a
+   * checkpoint and `reseed` keep it. Gemini 3 requires the signature back when
+   * the call is replayed to it.
+   */
+  thoughtSignature?: string;
 }
 
 /** Opaque provider thinking payload; replayed verbatim, never edited. */

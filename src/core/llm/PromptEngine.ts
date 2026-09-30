@@ -1006,6 +1006,7 @@ export class PromptEngine implements IPromptEngine {
         name: call.name,
         arguments: this.serializeToolArguments(call.arguments),
       },
+      ...(call.thoughtSignature ? { thoughtSignature: call.thoughtSignature } : {}),
     }));
   }
 

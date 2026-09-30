@@ -86,6 +86,11 @@ export interface ToolCallRequest {
   id: string;
   name: string;
   arguments: Record<string, any>;
+  /**
+   * Gemini thought signature for this call, kept so the next Gemini 3 turn can
+   * replay it. See `ChatMessage.tool_calls[].thoughtSignature`.
+   */
+  thoughtSignature?: string;
 }
 
 /**

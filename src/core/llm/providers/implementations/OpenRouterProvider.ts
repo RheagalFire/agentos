@@ -477,7 +477,12 @@ export class OpenRouterProvider implements IProvider {
     return messages.map(msg => {
       const mappedMsg: Partial<ChatMessage> = { role: msg.role, content: msg.content };
       if (msg.name) mappedMsg.name = msg.name;
-      if (msg.tool_calls) mappedMsg.tool_calls = msg.tool_calls;
+      // Only the standard tool-call fields go on the wire. A tool call can
+      // carry provider-specific extras, such as Gemini's thoughtSignature,
+      // that the upstream Chat Completions schema does not define.
+      if (msg.tool_calls) {
+        mappedMsg.tool_calls = msg.tool_calls.map(({ id, type, function: fn }) => ({ id, type, function: fn }));
+      }
       if (msg.tool_call_id) mappedMsg.tool_call_id = msg.tool_call_id;
       return mappedMsg;
     });

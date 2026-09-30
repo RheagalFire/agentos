@@ -95,6 +95,13 @@ interface GeminiPart {
   functionCall?: { name: string; args: Record<string, unknown> };
   /** Function response — sent by the caller after executing a tool call. */
   functionResponse?: { name: string; response: Record<string, unknown> };
+  /** True on a thought-summary part, which Gemini returns only with `includeThoughts`. */
+  thought?: boolean;
+  /**
+   * Opaque signature Gemini attaches to the first function call of a step.
+   * Gemini 3 requires it back, verbatim, on the replayed call.
+   */
+  thoughtSignature?: string;
 }
 
 /** A single message in the Gemini contents array. */
@@ -108,6 +115,45 @@ interface GeminiContent {
 /** System instruction — a top-level field separate from the contents array. */
 interface GeminiSystemInstruction {
   parts: Array<{ text: string }>;
+}
+
+/**
+ * Most requests `models/{model}:batchEmbedContents` accepts in one call. The
+ * API returns HTTP 400 "at most 100 requests can be in one batch" above this
+ * (probed 2026-09-29 on gemini-embedding-001).
+ */
+const GEMINI_EMBED_BATCH_LIMIT = 100;
+
+/** Response body of `models/{model}:batchEmbedContents`. */
+interface GeminiBatchEmbedResponse {
+  embeddings: Array<{ values: number[] }>;
+  /** The call's prompt tokens: gemini-embedding-2 reports them, gemini-embedding-001 omits them. */
+  usageMetadata?: { promptTokenCount?: number };
+}
+
+/**
+ * Placeholder signature Google documents for replaying a function call whose
+ * real signature is unavailable, such as a call made by another provider in a
+ * fallback chain. Gemini 3 returns HTTP 400 for a replayed call with no
+ * signature and accepts this value, and Gemini 2.5 accepts it too (probed
+ * 2026-09-29).
+ */
+const GEMINI_SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
+
+/**
+ * Masks the secrets a request URL can carry in an error message: the `key=`
+ * query value (requests authenticate with the key in the URL) and any
+ * `user:password@` credentials in the base URL. A fetch that rejects its URL,
+ * for example a relative, scheme-less or credential-bearing base URL, names
+ * the whole URL in its error.
+ *
+ * @param message Error message that may contain the request URL.
+ * @returns The message with both kinds of secret replaced by `[redacted]`.
+ */
+function redactUrlSecrets(message: string): string {
+  return message
+    .replace(/([?&]key=)[^&\s"')]+/g, '$1[redacted]')
+    .replace(/(\/\/)[^/\s@"')]+@/g, '$1[redacted]@');
 }
 
 /** Generation configuration parameters. */
@@ -124,11 +170,27 @@ interface GeminiGenerationConfig {
 
 /**
  * Thinking controls. The 3.x generation takes a `thinkingLevel`; the 2.5
- * family takes a `thinkingBudget` and rejects a level.
+ * family takes a `thinkingBudget` and rejects a level. They nest under
+ * `generationConfig`; at the payload root Gemini rejects them.
  */
 interface GeminiThinkingConfig {
+  /**
+   * Gemini 3 thinking depth, such as `'low'` or `'high'`. Gemini 2.5 rejects
+   * this field with HTTP 400 "Thinking level is not supported for this model"
+   * (probed 2026-09-29).
+   */
   thinkingLevel?: string;
+  /**
+   * Thinking token budget. `-1` hands Gemini dynamic control and a positive
+   * value caps the budget. `0` disables thinking where the model allows it:
+   * Gemini 2.5 Flash accepts it, and Gemini 3.1 Pro rejects it with HTTP 400
+   * "This model only works in thinking mode" (probed 2026-09-29).
+   */
   thinkingBudget?: number;
+  /**
+   * Return thought summaries. They arrive as parts marked `thought: true`,
+   * which GeminiProvider keeps out of the answer text.
+   */
   includeThoughts?: boolean;
 }
 
@@ -187,6 +249,7 @@ const GEMINI_LONG_CONTEXT_PRICING: Readonly<
 > = {
   'gemini-3.1-pro-preview': { abovePromptTokens: 200_000, input: 4.00, output: 18.00 },
   'gemini-pro-latest': { abovePromptTokens: 200_000, input: 4.00, output: 18.00 },
+  'gemini-2.5-pro': { abovePromptTokens: 200_000, input: 2.50, output: 15.00 },
 };
 
 /** A single function declaration for tool calling. */
@@ -254,8 +317,25 @@ interface GeminiAPIError {
 // Known model catalog
 // ---------------------------------------------------------------------------
 
-/** Static catalog of well-known Gemini models and their metadata. */
+/**
+ * Static catalog of well-known Gemini models and their metadata.
+ *
+ * Ids and token limits come from a live GET /v1beta/models probe and rates from
+ * ai.google.dev/gemini-api/docs/pricing, both on 2026-09-29. `getModelInfo` is
+ * an exact-id lookup over this array, so a model missing here resolves to
+ * undefined and its calls carry no context limit and no price.
+ *
+ * Tiers advance independently. Flash has reached 3.8 while Pro is at
+ * 3.1-preview, the only Pro id served. `gemini-3-pro-preview` appears in
+ * Google's doc index and is absent from the live listing.
+ *
+ * Rates are the standard tier. Prompts over 200K tokens on 3.1 Pro and 2.5
+ * Pro bill at the tier in GEMINI_LONG_CONTEXT_PRICING, and Gemini 3.6 / 3.7 /
+ * 3.8 Flash list at promotional rates through 2026-12-31 and meter at the
+ * post-promotion rate.
+ */
 const GEMINI_MODELS: ModelInfo[] = [
+  // --- Pro ---
   {
     modelId: 'gemini-3.1-pro-preview',
     providerId: 'gemini',
@@ -270,6 +350,110 @@ const GEMINI_MODELS: ModelInfo[] = [
     supportsStreaming: true,
     status: 'active',
   },
+
+  // --- Flash. 3.6, 3.7 and 3.8 list at $0.75 / $3.75 through 2026-12-31 and
+  // $1.50 / $7.50 from 2027-01-01. They meter at $1.50 / $7.50, as
+  // claude-sonnet-5 meters at its sticker rate in the Anthropic catalog, so
+  // cost rollups stay conservative and stay right after the promotion. ---
+  {
+    modelId: 'gemini-3.8-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.8 Flash',
+    description: 'Newest Flash model. Fast and low-cost, with reasoning and multimodal input.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 7.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3.7-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.7 Flash',
+    description: 'Flash model with reasoning and multimodal input.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 7.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3.6-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.6 Flash',
+    description: 'Flash model with reasoning and multimodal input.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 7.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3.5-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.5 Flash',
+    description: 'Flash model with reasoning and multimodal input, at standard pricing.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 9.00,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3-flash-preview',
+    providerId: 'gemini',
+    displayName: 'Gemini 3 Flash Preview',
+    description: 'First Gemini 3 Flash preview.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.50,
+    pricePer1MTokensOutput: 3.00,
+    supportsStreaming: true,
+    status: 'active',
+  },
+
+  // --- Flash-Lite ---
+  {
+    modelId: 'gemini-3.5-flash-lite',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.5 Flash-Lite',
+    description: 'Lowest-cost Gemini 3.5 tier, for high-volume and latency-sensitive work.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.30,
+    pricePer1MTokensOutput: 2.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-3.1-flash-lite',
+    providerId: 'gemini',
+    displayName: 'Gemini 3.1 Flash-Lite',
+    description: 'Lowest-cost Gemini 3.1 tier. Google lists a shutdown date of 2027-05-07.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.25,
+    pricePer1MTokensOutput: 1.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+
+  // --- Floating aliases. Google can repoint these without changing the id, so
+  // a price here can go stale unnoticed. They are listed because an unlisted id
+  // resolves to undefined and meters at zero. generateContent reported these
+  // targets on 2026-09-29 (response modelVersion): pro-latest to 3.1 Pro,
+  // flash-latest to 3.8 Flash, flash-lite-latest to 3.5 Flash-Lite. ---
   {
     modelId: 'gemini-pro-latest',
     providerId: 'gemini',
@@ -285,23 +469,38 @@ const GEMINI_MODELS: ModelInfo[] = [
     status: 'active',
   },
   {
-    modelId: 'gemini-2.5-flash',
+    modelId: 'gemini-flash-latest',
     providerId: 'gemini',
-    displayName: 'Gemini 2.5 Flash',
-    description: 'Fast, cost-effective model with strong reasoning and multimodal capabilities.',
+    displayName: 'Gemini Flash (latest)',
+    description: 'Floating alias for the current Gemini Flash tier.',
     capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
     contextWindowSize: 1048576,
     outputTokenLimit: 65536,
-    pricePer1MTokensInput: 0.15,
-    pricePer1MTokensOutput: 0.60,
+    pricePer1MTokensInput: 1.50,
+    pricePer1MTokensOutput: 7.50,
     supportsStreaming: true,
     status: 'active',
   },
   {
+    modelId: 'gemini-flash-lite-latest',
+    providerId: 'gemini',
+    displayName: 'Gemini Flash-Lite (latest)',
+    description: 'Floating alias for the current Gemini Flash-Lite tier.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.30,
+    pricePer1MTokensOutput: 2.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+
+  // --- Gemini 2.5 ---
+  {
     modelId: 'gemini-2.5-pro',
     providerId: 'gemini',
     displayName: 'Gemini 2.5 Pro',
-    description: 'Most capable Gemini model for complex reasoning and analysis.',
+    description: 'Previous-generation Pro model.',
     capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
     contextWindowSize: 1048576,
     outputTokenLimit: 65536,
@@ -311,30 +510,94 @@ const GEMINI_MODELS: ModelInfo[] = [
     status: 'active',
   },
   {
+    modelId: 'gemini-2.5-flash',
+    providerId: 'gemini',
+    displayName: 'Gemini 2.5 Flash',
+    description: 'Previous-generation Flash model with reasoning and multimodal input.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.30,
+    pricePer1MTokensOutput: 2.50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-2.5-flash-lite',
+    providerId: 'gemini',
+    displayName: 'Gemini 2.5 Flash-Lite',
+    description: 'Cheapest Gemini model served.',
+    capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
+    contextWindowSize: 1048576,
+    outputTokenLimit: 65536,
+    pricePer1MTokensInput: 0.10,
+    pricePer1MTokensOutput: 0.40,
+    supportsStreaming: true,
+    status: 'active',
+  },
+
+  // --- Embeddings. Both ids accept embedContent and batchEmbedContents and
+  // return 3072-dimension vectors (probed 2026-09-29). Google's pricing page
+  // lists gemini-embedding-2 at $0.20 per 1M text tokens and carries no price
+  // for gemini-embedding-001, so that row leaves its price unset: an unset
+  // price reads as unknown to a caller, where 0 would read as free. ---
+  {
+    modelId: 'gemini-embedding-2',
+    providerId: 'gemini',
+    displayName: 'Gemini Embedding 2',
+    description: 'Multimodal embedding model mapping text, images, video, audio and PDFs into one vector space.',
+    capabilities: ['embeddings'],
+    contextWindowSize: 8192,
+    inputTokenLimit: 8192,
+    embeddingDimension: 3072,
+    pricePer1MTokensInput: 0.20,
+    pricePer1MTokensTotal: 0.20,
+    supportsStreaming: false,
+    status: 'active',
+  },
+  {
+    modelId: 'gemini-embedding-001',
+    providerId: 'gemini',
+    displayName: 'Gemini Embedding 001',
+    description: 'Text embedding model. An index built with it needs it for queries too, since vectors from different embedding models are not comparable.',
+    capabilities: ['embeddings'],
+    contextWindowSize: 2048,
+    inputTokenLimit: 2048,
+    embeddingDimension: 3072,
+    supportsStreaming: false,
+    status: 'active',
+  },
+
+  // --- Retired by Google. generateContent returns HTTP 404 for both ids
+  // ("This model models/gemini-2.0-flash is no longer available" for 2.0
+  // Flash), probed 2026-09-29 with a gemini-2.5-flash-lite control returning
+  // 200. The rows stay as `deprecated` so getModelInfo still answers for a
+  // caller holding either id. ---
+  {
     modelId: 'gemini-2.0-flash',
     providerId: 'gemini',
-    displayName: 'Gemini 2.0 Flash',
-    description: 'Previous-generation fast model with strong performance.',
+    displayName: 'Gemini 2.0 Flash (retired)',
+    description: 'Retired by Google and no longer served. Google names gemini-3.8-flash as its replacement.',
     capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
     contextWindowSize: 1048576,
     outputTokenLimit: 8192,
     pricePer1MTokensInput: 0.10,
     pricePer1MTokensOutput: 0.40,
     supportsStreaming: true,
-    status: 'active',
+    status: 'deprecated',
   },
   {
     modelId: 'gemini-1.5-pro',
     providerId: 'gemini',
-    displayName: 'Gemini 1.5 Pro',
-    description: 'Stable model with 2M context window for long-document tasks.',
+    displayName: 'Gemini 1.5 Pro (retired)',
+    description: 'Retired by Google and no longer served. Use gemini-3.1-pro-preview.',
     capabilities: ['chat', 'tool_use', 'vision_input', 'json_mode'],
     contextWindowSize: 2097152,
     outputTokenLimit: 8192,
     pricePer1MTokensInput: 1.25,
     pricePer1MTokensOutput: 5.00,
     supportsStreaming: true,
-    status: 'active',
+    status: 'deprecated',
   },
 ];
 
@@ -539,7 +802,10 @@ export class GeminiProvider implements IProvider {
     let lastFinishReason: string | null = null;
     let lastUsage: GeminiUsageMetadata | undefined;
     /** Map from part index -> tool call accumulator */
-    const toolCallAccum: Map<number, { name: string; args: Record<string, unknown> }> = new Map();
+    const toolCallAccum: Map<
+      number,
+      { name: string; args: Record<string, unknown>; thoughtSignature?: string }
+    > = new Map();
     let toolCallIndex = 0;
 
     const abortHandler = () => { /* consumer checks abortSignal each iteration */ };
@@ -593,6 +859,8 @@ export class GeminiProvider implements IProvider {
 
         const parts = candidate.content?.parts ?? [];
         for (const part of parts) {
+          // A thought summary is the model's reasoning; it stays out of the answer.
+          if (part.thought) continue;
           if (part.text !== undefined) {
             // Text delta
             accumulatedContent += part.text;
@@ -615,6 +883,7 @@ export class GeminiProvider implements IProvider {
             toolCallAccum.set(idx, {
               name: part.functionCall.name,
               args: part.functionCall.args,
+              thoughtSignature: part.thoughtSignature,
             });
 
             yield {
@@ -636,6 +905,7 @@ export class GeminiProvider implements IProvider {
                   // Gemini delivers complete args, so emit them as a single delta
                   arguments_delta: JSON.stringify(part.functionCall.args),
                 },
+                ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
               }],
             };
           }
@@ -707,10 +977,20 @@ export class GeminiProvider implements IProvider {
   /**
    * Generates embeddings using Gemini's embedding models.
    *
-   * Uses the `models/{model}:embedContent` endpoint. Currently Gemini
-   * supports embedding one text at a time, so we batch sequentially.
+   * Sends the texts through `models/{model}:batchEmbedContents` in chunks of
+   * at most {@link GEMINI_EMBED_BATCH_LIMIT}, one request per chunk, and
+   * returns the vectors in input order. gemini-embedding-001 and
+   * gemini-embedding-2 both accept batchEmbedContents (probed 2026-09-29),
+   * although neither lists it in `supportedGenerationMethods`.
+   * `options.dimensions` is sent as `outputDimensionality`, which both models
+   * honor (768 and 1536 probed 2026-09-29); without it they return 3072.
+   * Usage sums each call's `usageMetadata.promptTokenCount`, which
+   * gemini-embedding-2 reports and gemini-embedding-001 omits, so the older
+   * model's calls count zero tokens (probed 2026-09-30). When a later batch
+   * fails, the thrown error carries the earlier batches' usage as
+   * `partialUsage`, since those calls were billed.
    *
-   * @param {string} modelId - Embedding model (e.g., "text-embedding-004").
+   * @param {string} modelId - Embedding model (e.g., "gemini-embedding-001").
    * @param {string[]} texts - Input texts to embed.
    * @param {ProviderEmbeddingOptions} [options] - Optional embedding parameters.
    * @returns {Promise<ProviderEmbeddingResponse>} Embedding vectors.
@@ -723,29 +1003,45 @@ export class GeminiProvider implements IProvider {
   ): Promise<ProviderEmbeddingResponse> {
     this.ensureInitialized();
 
-    // Gemini's batch embedding endpoint
     const endpoint = `/models/${modelId}:batchEmbedContents`;
-    const requests = texts.map(text => ({
-      model: `models/${modelId}`,
-      content: { parts: [{ text }] },
-    }));
-
-    const apiResponse = await this.makeApiRequest<{
-      embeddings: Array<{ values: number[] }>;
-    }>(endpoint, { requests });
+    const pricePer1M = GEMINI_MODELS.find(m => m.modelId === modelId)?.pricePer1MTokensInput;
+    const usageFor = (tokens: number): ProviderEmbeddingResponse['usage'] => ({
+      prompt_tokens: tokens,
+      total_tokens: tokens,
+      ...(pricePer1M !== undefined && tokens > 0 ? { costUSD: (tokens / 1_000_000) * pricePer1M } : {}),
+    });
+    const vectors: number[][] = [];
+    let promptTokens = 0;
+    for (let start = 0; start < texts.length; start += GEMINI_EMBED_BATCH_LIMIT) {
+      const requests = texts.slice(start, start + GEMINI_EMBED_BATCH_LIMIT).map(text => ({
+        model: `models/${modelId}`,
+        content: { parts: [{ text }] },
+        ...(options?.dimensions ? { outputDimensionality: options.dimensions } : {}),
+      }));
+      let apiResponse: GeminiBatchEmbedResponse;
+      try {
+        apiResponse = await this.makeApiRequest<GeminiBatchEmbedResponse>(endpoint, { requests });
+      } catch (error: unknown) {
+        // The batches before this one were billed; keep their usage on the
+        // error so the caller can still record it.
+        if (start > 0 && error instanceof GeminiProviderError) {
+          error.partialUsage = usageFor(promptTokens);
+        }
+        throw error;
+      }
+      for (const emb of apiResponse.embeddings) vectors.push(emb.values);
+      promptTokens += apiResponse.usageMetadata?.promptTokenCount ?? 0;
+    }
 
     return {
       object: 'list',
-      data: apiResponse.embeddings.map((emb, index) => ({
+      data: vectors.map((embedding, index) => ({
         object: 'embedding' as const,
-        embedding: emb.values,
+        embedding,
         index,
       })),
       model: modelId,
-      usage: {
-        prompt_tokens: 0, // Gemini does not report embedding token counts
-        total_tokens: 0,
-      },
+      usage: usageFor(promptTokens),
     };
   }
 
@@ -932,7 +1228,9 @@ export class GeminiProvider implements IProvider {
     // otherwise the provider-neutral `effort` becomes the model's thinking
     // level when the model is known to take that level. Thinking shares the
     // maxOutputTokens cap: room for it on a rescue hop comes from
-    // FallbackProviderEntry.maxTokensHeadroom, not from this provider.
+    // FallbackProviderEntry.maxTokensHeadroom, not from this provider. The
+    // shared `thinking` option is Anthropic's on-switch and is not translated:
+    // on a fallback hop it would turn "thinking on" into a thinking-token cap.
     const customThinking = options.customModelParams?.thinkingConfig;
     if (customThinking && typeof customThinking === 'object') {
       generationConfig.thinkingConfig = customThinking as GeminiThinkingConfig;
@@ -992,9 +1290,14 @@ export class GeminiProvider implements IProvider {
           parts.push({ text: msg.content });
         }
 
-        // Convert tool_calls to functionCall parts
+        // Convert tool_calls to functionCall parts. Each call's thought
+        // signature is replayed verbatim. A turn with no signature at all (a
+        // call made by another provider, or history that dropped it) gets the
+        // documented placeholder on its first call, which is where Gemini puts
+        // its own; without one Gemini 3 rejects the request with HTTP 400.
         if (msg.tool_calls?.length) {
-          for (const tc of msg.tool_calls) {
+          const turnHasSignature = msg.tool_calls.some(tc => tc.thoughtSignature);
+          msg.tool_calls.forEach((tc, i) => {
             let parsedArgs: Record<string, unknown>;
             try {
               parsedArgs = typeof tc.function.arguments === 'string'
@@ -1003,10 +1306,16 @@ export class GeminiProvider implements IProvider {
             } catch {
               parsedArgs = {};
             }
-            parts.push({
+            const part: GeminiPart = {
               functionCall: { name: tc.function.name, args: parsedArgs },
-            });
-          }
+            };
+            if (tc.thoughtSignature) {
+              part.thoughtSignature = tc.thoughtSignature;
+            } else if (!turnHasSignature && i === 0) {
+              part.thoughtSignature = GEMINI_SKIP_THOUGHT_SIGNATURE;
+            }
+            parts.push(part);
+          });
         }
 
         // Ensure at least one part — Gemini requires non-empty parts
@@ -1122,8 +1431,10 @@ export class GeminiProvider implements IProvider {
     const parts = candidate?.content?.parts ?? [];
 
     // Collect text from all text parts
+    // Thought-summary parts (present only with includeThoughts) are the
+    // model's reasoning and stay out of the answer.
     const textParts = parts
-      .filter(p => p.text !== undefined)
+      .filter(p => p.text !== undefined && !p.thought)
       .map(p => p.text!);
     const fullText = textParts.join('');
 
@@ -1137,6 +1448,7 @@ export class GeminiProvider implements IProvider {
           name: p.functionCall!.name,
           arguments: JSON.stringify(p.functionCall!.args ?? {}),
         },
+        ...(p.thoughtSignature ? { thoughtSignature: p.thoughtSignature } : {}),
       }));
 
     const hasToolCalls = toolCalls.length > 0;
@@ -1243,7 +1555,7 @@ export class GeminiProvider implements IProvider {
    * @private
    */
   private assembleToolCalls(
-    accum: Map<number, { name: string; args: Record<string, unknown> }>,
+    accum: Map<number, { name: string; args: Record<string, unknown>; thoughtSignature?: string }>,
   ): NonNullable<ChatMessage['tool_calls']> {
     if (accum.size === 0) return [];
     return Array.from(accum.entries()).map(([idx, tc]) => ({
@@ -1253,6 +1565,7 @@ export class GeminiProvider implements IProvider {
         name: tc.name,
         arguments: JSON.stringify(tc.args ?? {}),
       },
+      ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
     }));
   }
 
@@ -1426,7 +1739,7 @@ export class GeminiProvider implements IProvider {
           );
         } else {
           lastError = new GeminiProviderError(
-            error instanceof Error ? error.message : 'Network or unknown error',
+            error instanceof Error ? redactUrlSecrets(error.message) : 'Network or unknown error',
             'NETWORK_ERROR',
           );
         }
@@ -1505,7 +1818,7 @@ export class GeminiProvider implements IProvider {
       clearTimeout(timeoutId);
       if (error instanceof GeminiProviderError) throw error;
       throw new GeminiProviderError(
-        error instanceof Error ? error.message : 'Failed to connect to Gemini stream.',
+        error instanceof Error ? redactUrlSecrets(error.message) : 'Failed to connect to Gemini stream.',
         'STREAM_CONNECTION_FAILED',
       );
     }

@@ -86,6 +86,13 @@ export interface ChatMessage {
       name: string;
       arguments: string;
     };
+    /**
+     * Gemini thought signature for this call. Gemini 3 rejects a replayed
+     * function call without one (HTTP 400), so GeminiProvider captures it from
+     * the response and sends it back on the next turn. Other providers ignore
+     * it.
+     */
+    thoughtSignature?: string;
   }>;
   /**
    * Anthropic extended-thinking blocks emitted on this assistant turn.
@@ -409,6 +416,8 @@ export interface ModelCompletionResponse {
       /** Partial argument JSON fragment (streamed). Concatenate & then parse when final. */
       arguments_delta?: string;
     };
+    /** Gemini thought signature for this call; see ChatMessage tool_calls. */
+    thoughtSignature?: string;
   }>;
   /** Indicates terminal chunk in a stream. MUST be true on last emission (success or error). */
   isFinal?: boolean;

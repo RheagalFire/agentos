@@ -57,7 +57,9 @@ export const PROVIDER_DEFAULTS: Record<string, ProviderDefaults> = {
   },
   gemini: {
     text: 'gemini-2.5-flash',
-    cheap: 'gemini-2.0-flash',
+    // gemini-2.0-flash returns HTTP 404 "no longer available" (probed
+    // 2026-09-29). gemini-2.5-flash-lite is the cheapest Gemini model served.
+    cheap: 'gemini-2.5-flash-lite',
   },
   'claude-code-cli': {
     text: 'claude-sonnet-4-6',
@@ -65,7 +67,9 @@ export const PROVIDER_DEFAULTS: Record<string, ProviderDefaults> = {
   },
   'gemini-cli': {
     text: 'gemini-2.5-flash',
-    cheap: 'gemini-2.0-flash-lite',
+    // gemini-2.0-flash-lite fails in the CLI with ModelNotFoundError (probed
+    // 2026-09-29), while gemini-2.5-flash-lite is served as requested.
+    cheap: 'gemini-2.5-flash-lite',
   },
   stability: {
     image: 'stable-diffusion-xl-1024-v1-0',

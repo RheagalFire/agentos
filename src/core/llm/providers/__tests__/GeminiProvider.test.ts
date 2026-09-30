@@ -661,8 +661,8 @@ describe('GeminiProvider', () => {
         { role: 'user', content: 'Hi' },
       ], {});
 
-      // gemini-2.5-flash: $0.15/1M input + $0.60/1M output
-      expect(result.usage!.costUSD).toBeCloseTo(0.75, 2);
+      // gemini-2.5-flash: $0.30/1M input + $2.50/1M output
+      expect(result.usage!.costUSD).toBeCloseTo(2.8, 2);
     });
   });
 

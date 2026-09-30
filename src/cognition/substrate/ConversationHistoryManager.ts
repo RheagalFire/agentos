@@ -200,6 +200,7 @@ export class ConversationHistoryManager {
           id: tc.id,
           name: tc.function.name,
           arguments: this.parseToolCallArguments(tc.function.arguments),
+          ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
         }));
     }
 
@@ -251,6 +252,7 @@ export class ConversationHistoryManager {
               name: toolCall.name,
               arguments: JSON.stringify(toolCall.arguments ?? {}),
             },
+            ...(toolCall.thoughtSignature ? { thoughtSignature: toolCall.thoughtSignature } : {}),
           }))
         : undefined,
     };

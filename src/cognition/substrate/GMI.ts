@@ -910,6 +910,7 @@ export class GMI implements IGMI {
                 arguments: typeof tc.function.arguments === 'string'
                     ? JSON.parse(tc.function.arguments)
                     : tc.function.arguments,
+                ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
             }));
             aggregatedToolCalls.push(...currentIterationToolCallRequests); // Aggregate for final output
             yield this.createOutputChunk(
@@ -951,7 +952,8 @@ export class GMI implements IGMI {
             ? currentIterationToolCallRequests.map(tc => ({
                 id: tc.id,
                 type: 'function' as const,
-                function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+                function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+                ...(tc.thoughtSignature ? { thoughtSignature: tc.thoughtSignature } : {}),
               }))
             : undefined,
           ...(currentIterationThinkingBlocks.length > 0 && { thinkingBlocks: currentIterationThinkingBlocks }),
