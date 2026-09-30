@@ -119,6 +119,9 @@ export class MetapromptExecutor {
   /** Number of batches and self-reflection cycles that are queued or running. */
   private inFlight = 0;
 
+  /** Metaprompt ids already reported as unable to fire, so each is reported once. */
+  private readonly invalidTriggerWarnings = new Set<string>();
+
   /** Self-reflection interval (turns between reflections). */
   public selfReflectionIntervalTurns: number;
 
@@ -143,7 +146,8 @@ export class MetapromptExecutor {
    *
    * Iterates through the persona's metaprompt definitions, evaluating each
    * trigger type:
-   * - `turn_interval`: increments a counter and fires when the interval is reached.
+   * - `turn_interval`: counts user turns and fires on every `intervalTurns`-th
+   *   one, so an interval of N fires on user turns N, 2N, 3N and so on.
    * - `event_based`: fires if the event type is in the pending events set.
    * - `manual`: fires if a flag was set in working memory.
    *
@@ -154,13 +158,20 @@ export class MetapromptExecutor {
    * and never reach the turn.
    *
    * @param turnId - The current turn identifier (for tracing).
+   * @param options - `countTurn` says whether this turn counts toward
+   *   `turn_interval` triggers. Pass `false` for turns that are not user
+   *   messages, such as tool continuations and system turns. Defaults to `true`.
    */
-  public async checkAndTriggerMetaprompts(turnId: string): Promise<void> {
+  public async checkAndTriggerMetaprompts(
+    turnId: string,
+    options: { countTurn?: boolean } = {},
+  ): Promise<void> {
     const persona = this.config.getPersona();
     if (!persona.metaPrompts || persona.metaPrompts.length === 0) {
       return;
     }
 
+    const countTurn = options.countTurn !== false;
     const triggeredMetaPrompts: MetaPromptDefinition[] = [];
     const pendingEvents = this.config.getPendingEvents();
 
@@ -168,12 +179,8 @@ export class MetapromptExecutor {
       if (!metaPrompt.trigger) continue;
 
       if (metaPrompt.trigger.type === 'turn_interval') {
-        const counter = await this.getMetapromptTurnCounter(metaPrompt.id);
-        if (counter >= metaPrompt.trigger.intervalTurns) {
+        if (countTurn && (await this.advanceTurnInterval(metaPrompt, metaPrompt.trigger.intervalTurns))) {
           triggeredMetaPrompts.push(metaPrompt);
-          await this.resetMetapromptTurnCounter(metaPrompt.id);
-        } else {
-          await this.incrementMetapromptTurnCounter(metaPrompt.id);
         }
       } else if (metaPrompt.trigger.type === 'event_based') {
         const eventName = metaPrompt.trigger.eventName;
@@ -305,9 +312,7 @@ export class MetapromptExecutor {
    */
   public async incrementMetapromptTurnCounter(metapromptId: string): Promise<void> {
     const current = await this.getMetapromptTurnCounter(metapromptId);
-    const newValue = current + 1;
-    this.metaPromptTriggerCounters.set(metapromptId, newValue);
-    await this.config.workingMemory.set(`metaprompt_turn_counter_${metapromptId}`, newValue);
+    await this.setMetapromptTurnCounter(metapromptId, current + 1);
   }
 
   /**
@@ -316,8 +321,77 @@ export class MetapromptExecutor {
    * @param metapromptId - The metaprompt identifier.
    */
   public async resetMetapromptTurnCounter(metapromptId: string): Promise<void> {
-    this.metaPromptTriggerCounters.set(metapromptId, 0);
-    await this.config.workingMemory.set(`metaprompt_turn_counter_${metapromptId}`, 0);
+    await this.setMetapromptTurnCounter(metapromptId, 0);
+  }
+
+  /**
+   * Sets the turn counter for a specific metaprompt, in memory and in working
+   * memory, where it survives across GMI instances.
+   *
+   * @param metapromptId - The metaprompt identifier.
+   * @param value - The number of counted user turns since the metaprompt last fired.
+   */
+  public async setMetapromptTurnCounter(metapromptId: string, value: number): Promise<void> {
+    this.metaPromptTriggerCounters.set(metapromptId, value);
+    await this.config.workingMemory.set(`metaprompt_turn_counter_${metapromptId}`, value);
+  }
+
+  /**
+   * Counts one user turn toward a `turn_interval` metaprompt and reports
+   * whether the metaprompt fires on it.
+   *
+   * The counter holds the user turns counted since the metaprompt last fired.
+   * It is incremented first, so an interval of N fires on user turns N, 2N,
+   * 3N and so on, and it resets to zero when the metaprompt fires. A counter
+   * already above the interval fires on the next counted turn.
+   *
+   * Persona JSON is not type-checked, so the interval is validated here: a
+   * value that is not a finite number of at least 1 never fires and is
+   * reported once through `warnInvalidTrigger`.
+   *
+   * @param metaPrompt - The metaprompt whose counter advances.
+   * @param intervalTurns - The trigger's `intervalTurns`, as read from the persona.
+   * @returns `true` when the metaprompt fires on this turn.
+   */
+  private async advanceTurnInterval(
+    metaPrompt: MetaPromptDefinition,
+    intervalTurns: unknown,
+  ): Promise<boolean> {
+    if (typeof intervalTurns !== 'number' || !Number.isFinite(intervalTurns) || intervalTurns < 1) {
+      this.warnInvalidTrigger(
+        metaPrompt,
+        `intervalTurns must be a number >= 1 (got ${String(intervalTurns)})`,
+      );
+      return false;
+    }
+
+    const counted = (await this.getMetapromptTurnCounter(metaPrompt.id)) + 1;
+    if (counted >= Math.floor(intervalTurns)) {
+      await this.resetMetapromptTurnCounter(metaPrompt.id);
+      return true;
+    }
+    await this.setMetapromptTurnCounter(metaPrompt.id, counted);
+    return false;
+  }
+
+  /**
+   * Reports a metaprompt whose trigger can never fire. Each metaprompt id is
+   * reported once per executor, with one WARNING trace entry and one console
+   * warning, so a misconfigured persona does not flood the trace every turn.
+   *
+   * @param metaPrompt - The metaprompt that will not run.
+   * @param reason - Why its trigger cannot fire.
+   */
+  private warnInvalidTrigger(metaPrompt: MetaPromptDefinition, reason: string): void {
+    if (this.invalidTriggerWarnings.has(metaPrompt.id)) return;
+    this.invalidTriggerWarnings.add(metaPrompt.id);
+
+    const message = `Metaprompt '${metaPrompt.id}' will not run: ${reason}.`;
+    console.warn(`GMI (ID: ${this.config.getGmiId()}): ${message}`);
+    this.config.addTraceEntry('WARNING', message, {
+      metapromptId: metaPrompt.id,
+      trigger: metaPrompt.trigger,
+    });
   }
 
   /**

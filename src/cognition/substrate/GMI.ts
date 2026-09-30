@@ -1168,8 +1168,14 @@ export class GMI implements IGMI {
         aggregatedResponseText
       );
 
-      // Check and trigger all metaprompts (turn_interval, event_based, manual)
-      await this.metapromptExecutor.checkAndTriggerMetaprompts(turnId);
+      // Check and trigger all metaprompts (turn_interval, event_based, manual).
+      // Only user messages count toward turn_interval triggers: tool
+      // continuations, system messages and tool responses do not.
+      const isUserTurn =
+        turnInput.metadata?.isToolContinuation !== true &&
+        (turnInput.type === GMIInteractionType.TEXT ||
+          turnInput.type === GMIInteractionType.MULTIMODAL_CONTENT);
+      await this.metapromptExecutor.checkAndTriggerMetaprompts(turnId, { countTurn: isUserTurn });
 
       // Prepare the final GMIOutput for the generator's return value
       const finalTurnOutput: GMIOutput = {

@@ -123,14 +123,14 @@ The template uses `{{variable}}` placeholders that the executor substitutes with
 
 ## Three trigger types
 
-[`MetapromptExecutor.checkAndTriggerMetaprompts(turnId)`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/MetapromptExecutor.ts) runs once per turn during prompt assembly. For each metaprompt in the persona's merged list, it evaluates the trigger contract and queues any that fire:
+[`MetapromptExecutor.checkAndTriggerMetaprompts(turnId, { countTurn })`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/MetapromptExecutor.ts) runs once at the end of every turn, after the response has streamed. `countTurn` is `true` only for user messages. For each metaprompt in the persona's merged list, it evaluates the trigger contract and queues any that fire:
 
 ```mermaid
 flowchart TD
   start([User message arrives]) --> assemble[PromptEngine.assemble]
   assemble --> check{checkAndTriggerMetaprompts}
 
-  check -- counter ≥ intervalTurns --> interval[turn_interval fires]
+  check -- "user-turn count reaches intervalTurns" --> interval[turn_interval fires]
   check -- pendingEvents.has eventName --> event[event_based fires]
   check -- workingMemory flag set --> manual[manual fires]
 
@@ -172,7 +172,7 @@ The metaprompts that fire on one turn form one batch, and the metaprompts in a b
 { trigger: { type: 'turn_interval', intervalTurns: 5 } }
 ```
 
-The executor keeps a per-metaprompt counter at `workingMemory.set('metaprompt_turn_counter_<id>', N)`. Each turn, every `turn_interval` metaprompt either increments its counter or, if `counter >= intervalTurns`, fires and resets the counter to zero. Counters are scoped per metaprompt ID, so two different `turn_interval` definitions on the same persona run on independent cadences.
+The executor keeps a per-metaprompt counter at `workingMemory.set('metaprompt_turn_counter_<id>', N)`. Each user turn (a `TEXT` or `MULTIMODAL_CONTENT` input) increments the counter of every `turn_interval` metaprompt; when a counter reaches `intervalTurns`, that metaprompt fires and its counter resets to zero. With `intervalTurns: 5` it fires on user turns 5, 10, 15 and so on. Tool continuations, system messages and tool-response turns do not count. An `intervalTurns` that is not a number of at least 1 never fires, and the executor records one `WARNING` trace entry for it. Counters are scoped per metaprompt ID, so two different `turn_interval` definitions on the same persona run on independent cadences.
 
 The canonical `turn_interval` metaprompt is `gmi_self_trait_adjustment`. Its handler ([`handleTraitAdjustment`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/MetapromptExecutor.ts)) gathers the last ten conversation messages, the last twenty reasoning-trace entries, the current mood, user context, and task context, then submits all of them as evidence to the metaprompt's template. The expected JSON response shape is the same shape `applyMetapromptUpdates` consumes:
 
@@ -509,7 +509,7 @@ Most adaptive surfaces add zero extra LLM cost. Only two paths add LLM calls bey
 | **`ContextualPromptElement[]` (every turn)** | Never. Same local assembly pass. | $0 |
 | **`sentimentTracking.method: 'lexicon_based'` (every turn when enabled)** | Never. VADER-style lexical scan in code, ~10-50ms. | $0 |
 | **`sentimentTracking.method: 'llm'` (every turn when enabled)** | Every user turn. | One small LLM call (~200 in / ~100 out). |
-| **`turn_interval` metaprompt fires** | Once every `intervalTurns` turns. | One LLM call (~1500 in / ≤512 out at temperature 0.3). |
+| **`turn_interval` metaprompt fires** | Once every `intervalTurns` user turns. | One LLM call (~1500 in / ≤512 out at temperature 0.3). |
 | **`event_based` metaprompt fires** | Only when the SentimentTracker emits the matching event (requires `consecutiveTurnsForTrigger` consecutive matches). | One LLM call per event. |
 | **`manual` metaprompt fires** | Only when the host writes the trigger flag. | One LLM call. |
 | **[`AdaptPersonalityTool`](https://github.com/framerslab/agentos/blob/master/src/cognition/emergent/AdaptPersonalityTool.ts) invocation** | Only when the LLM decides to call it. Tool body is local (clamping and budget enforcement); no separate LLM call. | $0 (folded into the regular completion's tool-call round). |

@@ -279,6 +279,28 @@ async function arm(harness: Harness, metapromptId: string = MANUAL_REFLECTION.id
   await harness.workingMemory.set(`manual_trigger_${metapromptId}`, true);
 }
 
+/** A `turn_interval` metaprompt, served by the executor's generic handler. */
+function intervalMetaprompt(intervalTurns: number): MetaPromptDefinition {
+  return {
+    id: 'cadence_probe',
+    promptTemplate: 'Review {{recent_conversation}} and reply with JSON.',
+    trigger: { type: 'turn_interval', intervalTurns },
+    modelId: MODEL_ID,
+    providerId: PROVIDER_ID,
+  };
+}
+
+/** Ids of the turns whose metaprompt check fired, in order. */
+function triggeredTurnIds(gmi: GMI): string[] {
+  return traceOf(gmi, ReasoningEntryType.SELF_REFLECTION_TRIGGERED).map((entry) =>
+    String(entry.details?.turnId),
+  );
+}
+
+function warningsMentioning(gmi: GMI, text: string): ReasoningTraceEntry[] {
+  return traceOf(gmi, ReasoningEntryType.WARNING).filter((entry) => entry.message.includes(text));
+}
+
 describe('GMI metaprompt lifecycle', () => {
   it('a finished metaprompt batch leaves the GMI ready for the next turn', async () => {
     const h = await createHarness(createPersona([MANUAL_REFLECTION]));
@@ -436,4 +458,76 @@ describe('GMI shutdown with metaprompt work in flight', () => {
     expect(closeSpy).toHaveBeenCalledTimes(1);
     expect(h.gmi.getCurrentState()).toBe(GMIPrimeState.SHUTDOWN);
   });
+});
+
+describe('turn_interval cadence', () => {
+  it.each([
+    { intervalTurns: 1, turns: 3, fired: ['turn-1', 'turn-2', 'turn-3'] },
+    { intervalTurns: 3, turns: 6, fired: ['turn-3', 'turn-6'] },
+  ])(
+    'intervalTurns $intervalTurns fires on every Nth user turn',
+    async ({ intervalTurns, turns, fired }) => {
+      const h = await createHarness(createPersona([intervalMetaprompt(intervalTurns)]), 'not json');
+      for (let turn = 1; turn <= turns; turn += 1) {
+        await runTurn(h.gmi, `turn-${turn}`);
+      }
+      expect(triggeredTurnIds(h.gmi)).toEqual(fired);
+    },
+  );
+
+  const nonUserTurns: Array<[string, (gmi: GMI) => Promise<unknown>]> = [
+    [
+      'a tool continuation',
+      (gmi) =>
+        gmi.handleToolResults(
+          [{ toolCallId: 'external-1', toolName: 'lookup', output: { ok: true } }],
+          'user-1',
+        ),
+    ],
+    [
+      'a system message turn',
+      (gmi) =>
+        runTurn(gmi, 'system-1', { type: GMIInteractionType.SYSTEM_MESSAGE, content: 'Session resumed.' }),
+    ],
+    [
+      'a tool response turn',
+      (gmi) =>
+        runTurn(gmi, 'tool-response-1', {
+          type: GMIInteractionType.TOOL_RESPONSE,
+          content: [{ toolCallId: 'external-2', toolName: 'lookup', output: { ok: true } }],
+        }),
+    ],
+  ];
+
+  it.each(nonUserTurns)(
+    '%s neither counts toward nor fires a turn_interval metaprompt',
+    async (_label, runNonUserTurn) => {
+      const h = await createHarness(createPersona([intervalMetaprompt(2)]), 'not json');
+
+      await runTurn(h.gmi, 'turn-1');
+      await runNonUserTurn(h.gmi);
+      for (const turnId of ['turn-2', 'turn-3', 'turn-4']) {
+        await runTurn(h.gmi, turnId);
+      }
+
+      expect(triggeredTurnIds(h.gmi)).toEqual(['turn-2', 'turn-4']);
+    },
+  );
+
+  it.each([[0], [Number.NaN], [undefined]])(
+    'intervalTurns %s never fires and is reported once',
+    async (intervalTurns) => {
+      const h = await createHarness(
+        createPersona([intervalMetaprompt(intervalTurns as number)]),
+        'not json',
+      );
+
+      await runTurn(h.gmi, 'turn-1');
+      await runTurn(h.gmi, 'turn-2');
+
+      expect(triggeredTurnIds(h.gmi)).toEqual([]);
+      expect(h.generateCompletion).not.toHaveBeenCalled();
+      expect(warningsMentioning(h.gmi, 'intervalTurns')).toHaveLength(1);
+    },
+  );
 });
