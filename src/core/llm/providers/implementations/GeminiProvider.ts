@@ -785,6 +785,7 @@ export class GeminiProvider implements IProvider {
 
     // Accumulators for building the complete response
     let accumulatedContent = '';
+    let accumulatedReasoning = '';
     let lastFinishReason: string | null = null;
     let lastUsage: GeminiUsageMetadata | undefined;
     /** Map from part index -> tool call accumulator */
@@ -845,8 +846,22 @@ export class GeminiProvider implements IProvider {
 
         const parts = candidate.content?.parts ?? [];
         for (const part of parts) {
-          // A thought summary is the model's reasoning; it stays out of the answer.
-          if (part.thought) continue;
+          // A thought summary is the model's reasoning: it streams as
+          // reasoning text, apart from the answer.
+          if (part.thought) {
+            if (typeof part.text === 'string' && part.text) {
+              accumulatedReasoning += part.text;
+              yield {
+                id: responseId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                modelId,
+                choices: [{ index: 0, message: { role: 'assistant', content: null }, finishReason: null }],
+                reasoningTextDelta: part.text,
+              };
+            }
+            continue;
+          }
           if (part.text !== undefined) {
             // Text delta
             accumulatedContent += part.text;
@@ -925,6 +940,7 @@ export class GeminiProvider implements IProvider {
             role: 'assistant',
             content: accumulatedContent || null,
             ...(hasToolCalls && { tool_calls: toolCalls }),
+            ...(accumulatedReasoning && { reasoningText: accumulatedReasoning }),
           },
           finishReason: this.mapFinishReason(lastFinishReason),
         }],
@@ -1448,6 +1464,11 @@ export class GeminiProvider implements IProvider {
       .filter(p => p.text !== undefined && !p.thought)
       .map(p => p.text!);
     const fullText = textParts.join('');
+    // They are returned apart, as the turn's reasoning summary.
+    const reasoningText = parts
+      .filter(p => p.thought && typeof p.text === 'string' && p.text)
+      .map(p => p.text!)
+      .join('');
 
     // Collect function calls and convert to OpenAI-style tool_calls
     const toolCalls = parts
@@ -1484,6 +1505,7 @@ export class GeminiProvider implements IProvider {
         role: 'assistant',
         content: fullText || null,
         ...(hasToolCalls && { tool_calls: toolCalls }),
+        ...(reasoningText && { reasoningText }),
       },
       finishReason,
     };

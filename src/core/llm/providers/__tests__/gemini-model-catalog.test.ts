@@ -259,6 +259,70 @@ describe('Gemini thinking output', () => {
     expect(finalContent).toBe('Final answer');
   });
 
+  it('returns thought summaries on the message, apart from the answer', async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({
+      candidates: [{
+        content: { role: 'model', parts: [{ text: '**Planning the reply**', thought: true }, { text: 'Final answer' }] },
+        finishReason: 'STOP',
+      }],
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+    }));
+
+    const res = await provider.generateCompletion('gemini-3.8-flash', [{ role: 'user', content: 'hi' }], {
+      customModelParams: { thinkingConfig: { includeThoughts: true } },
+    });
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).generationConfig.thinkingConfig).toMatchObject({ includeThoughts: true });
+    expect(res.choices[0].message.content).toBe('Final answer');
+    expect(res.choices[0].message.reasoningText).toBe('**Planning the reply**');
+  });
+
+  it('streams thought summaries as reasoning deltas and keeps them on the final message', async () => {
+    fetchMock.mockResolvedValueOnce(sseResponse([
+      { candidates: [{ content: { role: 'model', parts: [{ text: '**Planning**', thought: true }] } }] },
+      {
+        candidates: [{ content: { role: 'model', parts: [{ text: 'Final answer' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 },
+      },
+    ]));
+    const reasoning: string[] = [];
+    const text: string[] = [];
+    let finalMessage: ChatMessage | undefined;
+    for await (const chunk of provider.generateCompletionStream('gemini-3.8-flash', [{ role: 'user', content: 'hi' }], {})) {
+      expect(chunk.reasoningTextDelta && chunk.responseTextDelta).toBeFalsy();
+      if (chunk.reasoningTextDelta) reasoning.push(chunk.reasoningTextDelta);
+      if (chunk.responseTextDelta) text.push(chunk.responseTextDelta);
+      if (chunk.isFinal) finalMessage = chunk.choices[0]?.message;
+    }
+
+    expect(reasoning.join('')).toBe('**Planning**');
+    expect(text.join('')).toBe('Final answer');
+    expect(finalMessage).toMatchObject({ content: 'Final answer', reasoningText: '**Planning**' });
+  });
+
+  it('omits reasoningText when no thought parts arrive', async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'Plain answer' }] }, finishReason: 'STOP' }],
+    }));
+
+    const res = await provider.generateCompletion('gemini-3.8-flash', [{ role: 'user', content: 'hi' }], {});
+
+    expect(res.choices[0].message).not.toHaveProperty('reasoningText');
+  });
+
+  it('never sends reasoningText back', async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({
+      candidates: [{ content: { role: 'model', parts: [{ text: 'Sure.' }] }, finishReason: 'STOP' }],
+    }));
+
+    await provider.generateCompletion('gemini-3.8-flash', [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'Hello.', reasoningText: 'SECRET-REASONING-SUMMARY' },
+      { role: 'user', content: 'again' },
+    ], {});
+
+    expect(fetchMock.mock.calls[0][1].body).not.toContain('SECRET-REASONING-SUMMARY');
+  });
 });
 
 describe('Gemini thought signatures', () => {

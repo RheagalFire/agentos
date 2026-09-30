@@ -103,6 +103,14 @@ export interface ChatMessage {
    * unchanged).
    */
   thinkingBlocks?: ThinkingBlock[];
+  /**
+   * The model's reasoning summary for this assistant turn, as plain text,
+   * when the provider returns one (Gemini returns thought summaries only with
+   * `customModelParams.thinkingConfig.includeThoughts`). Output only: no
+   * provider sends it back. It is separate from `thinkingBlocks`, which carry
+   * Anthropic's signed blocks for replay.
+   */
+  reasoningText?: string;
 }
 
 // ... (rest of IProvider.ts remains the same as provided by user initially)
@@ -403,6 +411,11 @@ export interface ModelCompletionResponse {
   };
   /** Incremental append‑only text delta for streaming; NOT cumulative. Undefined on non‑streaming final response. */
   responseTextDelta?: string;
+  /**
+   * Incremental append-only reasoning-summary text for streaming (see
+   * `ChatMessage.reasoningText`). Never part of `responseTextDelta`.
+   */
+  reasoningTextDelta?: string;
   /** Array of incremental tool/function call argument deltas building up tool invocation payloads. */
   toolCallsDeltas?: Array<{
     /** Choice index if multiple parallel choices produce tool calls. */
