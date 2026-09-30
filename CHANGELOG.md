@@ -1,3 +1,31 @@
+## <small>0.10.24 (2026-09-30)</small>
+
+* test: type the Anthropic wire test's header reader and the root toJSON cache-key case ([f21281278fe766231325e11915b37d503ff7cde2](https://github.com/framerslab/agentos/commit/f21281278fe766231325e11915b37d503ff7cde2))
+* fix(agent): leave a failed or empty stream out of session history ([a7f9585e72ca9419531ff93ad1431624f0c4a280](https://github.com/framerslab/agentos/commit/a7f9585e72ca9419531ff93ad1431624f0c4a280))
+* fix(anthropic): catalog rows for Sonnet 5.5 and Opus 4.5, standard Sonnet 5 price, per-model cache reads and 1h writes, cache floors ([c815292a02a61cf8f41b264a58817a21f5be6fd2](https://github.com/framerslab/agentos/commit/c815292a02a61cf8f41b264a58817a21f5be6fd2))
+* fix(anthropic): keep base-URL credentials and the API key out of request errors ([8a783f77860fc454a19ad01087e2f68802d53517](https://github.com/framerslab/agentos/commit/8a783f77860fc454a19ad01087e2f68802d53517))
+* fix(anthropic): per-model thinking-off wire shape and effort ladder ([810c805987d90f7a6cbb1c478f30a8df93a0f59d](https://github.com/framerslab/agentos/commit/810c805987d90f7a6cbb1c478f30a8df93a0f59d))
+* fix(anthropic): surface refusals as content-policy errors and never run tools from a refused turn ([21e7a25e96d83b2601a18c858883e8d413e29c18](https://github.com/framerslab/agentos/commit/21e7a25e96d83b2601a18c858883e8d413e29c18))
+* fix(api): generateImage uses the global default provider ([8431f788030da1a77c8de06fbe8881bff0e6bcf4](https://github.com/framerslab/agentos/commit/8431f788030da1a77c8de06fbe8881bff0e6bcf4))
+* fix(api): meter a failed attempt's billed usage, and a fallback leg's only once ([94445a98fc292b1ea4afe3a0cb2e58aff5b68cd5](https://github.com/framerslab/agentos/commit/94445a98fc292b1ea4afe3a0cb2e58aff5b68cd5))
+* fix(cognition): a failed GMI turn no longer blocks the session ([ba92634a4a4971161dfa4ef4260a2544c245d1e3](https://github.com/framerslab/agentos/commit/ba92634a4a4971161dfa4ef4260a2544c245d1e3))
+* fix(cognition): bound metaprompt runs, stop the queue at shutdown, drop stale event work ([55a5627aa3b3743c693654feb18b8e86bf544667](https://github.com/framerslab/agentos/commit/55a5627aa3b3743c693654feb18b8e86bf544667))
+* fix(cognition): build GMI prompts in the openai_chat shape every provider accepts ([28084b6d2bb492ac30754a5d5e1102267a966891](https://github.com/framerslab/agentos/commit/28084b6d2bb492ac30754a5d5e1102267a966891))
+* fix(cognition): classify user feedback by its rating label and store corrections in memory ([a5839c0b9bf4a26ecb4a7be5585feec3645521e3](https://github.com/framerslab/agentos/commit/a5839c0b9bf4a26ecb4a7be5585feec3645521e3))
+* fix(cognition): resolve metaprompt models through the provider registry ([762e2fa5b56d3504a1994fe5ba1d5a13bdbcb5d4](https://github.com/framerslab/agentos/commit/762e2fa5b56d3504a1994fe5ba1d5a13bdbcb5d4))
+* fix(cognition): run metaprompts one batch at a time without touching GMI lifecycle state ([3919a9714c7a17929bad46cb59438197f37a05a3](https://github.com/framerslab/agentos/commit/3919a9714c7a17929bad46cb59438197f37a05a3))
+* fix(cognition): self-improvement hooks act on the calling session's GMI ([56d3bcf331e7511b0c8c0889a8a7526d5508f4b6](https://github.com/framerslab/agentos/commit/56d3bcf331e7511b0c8c0889a8a7526d5508f4b6))
+* fix(cognition): turn_interval metaprompts fire every N user turns ([b52c4df108c499a7a530162754961349bc34d5a4](https://github.com/framerslab/agentos/commit/b52c4df108c499a7a530162754961349bc34d5a4))
+* fix(gemini-cli): default to gemini-3.5-flash, the model the CLI serves ([506cb02af6f6d010023c0ec2818996e8217396d6](https://github.com/framerslab/agentos/commit/506cb02af6f6d010023c0ec2818996e8217396d6))
+* fix(gemini): return thought summaries as reasoning text instead of dropping them ([d1f582684ce80fb570f6856f04f7f3b29e5d351c](https://github.com/framerslab/agentos/commit/d1f582684ce80fb570f6856f04f7f3b29e5d351c))
+* fix(gemini): send the API key in a header and rest a pooled key after a 429 ([4ca2fff74687655711d172d6ae51f5a8f198419c](https://github.com/framerslab/agentos/commit/4ca2fff74687655711d172d6ae51f5a8f198419c))
+* fix(openai): bill prompts over 272K input tokens at the long-context rates ([3581c8de999a7d762a380200bfdcf737cd3f5d88](https://github.com/framerslab/agentos/commit/3581c8de999a7d762a380200bfdcf737cd3f5d88))
+* fix(openai): price gpt-6.1-sol ([115421a5d78cd2290e9c9628ca5364e8db7ee4be](https://github.com/framerslab/agentos/commit/115421a5d78cd2290e9c9628ca5364e8db7ee4be))
+* fix(personas): load SOUL.md Honesty-Humility under the runtime honesty key ([938196d29d68c81880e94f2b8e9231bd3fcf1f14](https://github.com/framerslab/agentos/commit/938196d29d68c81880e94f2b8e9231bd3fcf1f14))
+* fix(personas): make the shipped voice assistant persona's metaprompts runnable ([d53ea649bbaa6deed866824ec896df2e38cbd323](https://github.com/framerslab/agentos/commit/d53ea649bbaa6deed866824ec896df2e38cbd323))
+* fix(prompt-engine): key cached prompts on everything that shapes them ([cd5fad9c2f77b42240f4453e3ae92a78eb55bbdd](https://github.com/framerslab/agentos/commit/cd5fad9c2f77b42240f4453e3ae92a78eb55bbdd))
+* fix(providers): keep base-URL credentials out of embedText and OpenAI network errors ([7f4dc7c4d155902e6207152558bf42091ec90e34](https://github.com/framerslab/agentos/commit/7f4dc7c4d155902e6207152558bf42091ec90e34))
+
 ## <small>0.10.23 (2026-09-30)</small>
 
 * fix(agent): replay tool calls, tool results and thinking from session history ([426867dadea39209386b51d3b2d145cc2c5a41bd](https://github.com/framerslab/agentos/commit/426867dadea39209386b51d3b2d145cc2c5a41bd))
