@@ -15,6 +15,7 @@ vi.stubGlobal('fetch', fetchMock);
 import { generateText, isContentPolicyRefusal } from '../../generateText.js';
 import { generateObject } from '../../generateObject.js';
 import { streamText, type StreamPart } from '../../streamText.js';
+import { agent } from '../../agent.js';
 import { globalLLMProviderHealth } from '../../../core/safety/LLMProviderHealthRegistry.js';
 
 type Json = Record<string, any>;
@@ -323,6 +324,50 @@ describe('Claude refusals through the public API', () => {
     expect(await result.finishReason).toBe('error');
     // The refused text already reached the consumer, so no fallback request.
     expect(postedBodies().map((body) => body.model)).toEqual(['claude-opus-5-5']);
+  });
+});
+
+describe('Claude refusals in a session', () => {
+  it('records a streamed turn before the stream\'s text settles', async () => {
+    route({ 'claude-opus-5-5': [textTurn('claude-opus-5-5', 'Hello.')] });
+    const session = agent({
+      provider: 'anthropic',
+      model: 'claude-opus-5-5',
+      memory: false,
+      fallbackProviders: [],
+    }).session('stream-order');
+
+    const result = session.stream('Hi.');
+    void collect(result.fullStream);
+    await result.text;
+
+    expect(session.messages().map((m) => m.role)).toEqual(['user', 'assistant']);
+  });
+
+  it('leaves a refused stream out of the history, so the next request stays valid', async () => {
+    route({
+      'claude-opus-5-5': [
+        refusalTurn('claude-opus-5-5', 'Here is how you'),
+        textTurn('claude-opus-5-5', 'Happy to help with that.'),
+      ],
+    });
+    const session = agent({
+      provider: 'anthropic',
+      model: 'claude-opus-5-5',
+      memory: false,
+      fallbackProviders: [],
+    }).session('refused-stream');
+
+    const parts = await collect(session.stream('First question.').fullStream);
+    expect(parts[parts.length - 1]?.type).toBe('error');
+    // History is updated once the stream's promises settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(session.messages()).toEqual([]);
+
+    await session.send('Second question.');
+    const messages = postedBodies()[1].messages as Json[];
+    expect(messages.filter((m) => m.role === 'assistant')).toEqual([]);
+    expect(session.messages().map((m) => m.role)).toEqual(['user', 'assistant']);
   });
 });
 

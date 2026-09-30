@@ -1106,20 +1106,33 @@ export function agent(opts: AgentOptions): Agent {
             // append the minimal user/assistant text pair, epoch-guarded so a
             // reseed during the stream discards the stale append.
             const epochAtStreamStart = historyBuffer.epoch();
-            void result.text
-              .then((replyText) => {
-                historyBuffer.appendSendDelta(
-                  [
-                    { role: 'user', content: input } as SessionTranscriptMessage,
-                    { role: 'assistant', content: replyText },
-                  ],
-                  undefined,
-                  epochAtStreamStart,
-                );
-              })
-              .catch(() => {
-                /* history update failed, non-critical */
-              });
+            const recorded = Promise.all([result.text, result.finishReason]).then(([replyText, finishReason]) => {
+              // A stream that ended in an error (a refusal, a dropped
+              // connection) is left out, as send() leaves out a call that
+              // throws. An empty reply is not recorded as a turn: Anthropic
+              // rejects a request whose history has an empty assistant
+              // message.
+              if (finishReason === 'error') return;
+              historyBuffer.appendSendDelta(
+                [
+                  { role: 'user', content: input } as SessionTranscriptMessage,
+                  ...(replyText
+                    ? [{ role: 'assistant', content: replyText } as SessionTranscriptMessage]
+                    : []),
+                ],
+                undefined,
+                epochAtStreamStart,
+              );
+            });
+            // The text settles once the turn is recorded, so a caller that
+            // awaits it and sends again finds the turn in the history. A
+            // failed history update is not the caller's error.
+            const text = recorded.then(
+              () => result.text,
+              () => result.text,
+            );
+            void text.catch(() => undefined);
+            return { ...result, text };
           }
           return result;
         },
