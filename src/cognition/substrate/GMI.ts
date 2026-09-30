@@ -99,6 +99,15 @@ export class GMI implements IGMI {
   private reasoningTrace: ReasoningTrace;
   private conversationHistoryManager!: ConversationHistoryManager;
 
+  /**
+   * Turn ownership. Each processTurnStream call takes the next number and
+   * owns the lifecycle state until a newer turn starts; a turn that no longer
+   * owns it (a failed turn whose generator is drained after the next turn
+   * began) leaves the state and the trace's turn id to the newer turn.
+   */
+  private turnSequence = 0;
+  private stateOwnerTurn = 0;
+
   // (Self-reflection state is owned by MetapromptExecutor)
 
   // Cognitive Memory Bridge
@@ -406,6 +415,40 @@ export class GMI implements IGMI {
     return organizationId || undefined;
   }
 
+  /**
+   * Error results for the calls of a tool round that produced none: the call
+   * that was running when the round failed and the calls not yet started.
+   * Recording them leaves a history in which every tool call the assistant
+   * message declared has an answer, which the next request needs (providers
+   * reject an unanswered tool call, and a later turn replays this history).
+   *
+   * @param requests - Every call the round's assistant message declared, in order.
+   * @param finishedCount - How many of them already produced a result.
+   * @param inFlight - The call that was running when the round failed, if any.
+   * @param error - Why the round stopped.
+   * @returns One error result per unanswered call.
+   */
+  private resultsForUnfinishedToolCalls(
+    requests: ToolCallRequest[],
+    finishedCount: number,
+    inFlight: ToolCallRequest | undefined,
+    error: unknown,
+  ): ToolCallResult[] {
+    const reason = error instanceof Error ? error.message : String(error);
+    return requests.slice(finishedCount).map((request) => ({
+      toolCallId: request.id,
+      toolName: request.name,
+      output: undefined,
+      isError: true,
+      errorDetails: {
+        message:
+          request === inFlight
+            ? `Tool '${request.name}' failed: ${reason}`
+            : `Tool '${request.name}' was not run because the tool round stopped: ${reason}`,
+      },
+    }));
+  }
+
   private buildToolSessionData(turnInput: GMITurnInput): Record<string, any> | undefined {
     const sessionId = typeof turnInput.sessionId === 'string' ? turnInput.sessionId.trim() : '';
     const conversationId = this.getConversationIdForTurn(turnInput);
@@ -426,17 +469,17 @@ export class GMI implements IGMI {
   }
 
   /**
-   * Ensures the GMI is initialized and in a READY state.
+   * Ensures the GMI is initialized and idle: READY, or ERRORED after a failed
+   * turn. ERRORED only records that the last turn failed; the instance still
+   * works, so it does not block the next turn or the memory callbacks.
    * @private
    */
   private ensureReady(additionallyAllowedStates: GMIPrimeState[] = []): void {
     if (!this.isInitialized) {
         throw new GMIError(`GMI (ID: ${this.gmiId}) is not initialized.`, GMIErrorCode.NOT_INITIALIZED);
     }
-    if (
-      this.state !== GMIPrimeState.READY &&
-      !additionallyAllowedStates.includes(this.state)
-    ) {
+    const isIdle = this.state === GMIPrimeState.READY || this.state === GMIPrimeState.ERRORED;
+    if (!isIdle && !additionallyAllowedStates.includes(this.state)) {
 
       throw new GMIError(
         `GMI (ID: ${this.gmiId}) is not in READY state. Current state: ${this.state}.`,
@@ -641,7 +684,14 @@ export class GMI implements IGMI {
         ? [GMIPrimeState.PROCESSING, GMIPrimeState.AWAITING_TOOL_RESULT]
         : [];
     this.ensureReady(continuationAllowedStates);
+    if (this.state === GMIPrimeState.ERRORED) {
+      this.addTraceEntry(ReasoningEntryType.WARNING, 'Previous turn failed; starting a new turn.');
+    }
     this.state = GMIPrimeState.PROCESSING;
+    const turnNumber = ++this.turnSequence;
+    this.stateOwnerTurn = turnNumber;
+    // False once a newer turn has started; lifecycle writes below check it.
+    const ownsState = (): boolean => this.stateOwnerTurn === turnNumber;
     const turnId = turnInput.interactionId || `turn-${uuidv4()}`;
     // Store turnId on reasoningTrace for current turn
     if (this.reasoningTrace) {
@@ -1056,38 +1106,56 @@ export class GMI implements IGMI {
         turnMessages.push(assistantMessage);
 
         if (currentIterationToolCallRequests.length > 0) {
-          this.state = GMIPrimeState.AWAITING_TOOL_RESULT;
+          if (ownsState()) this.state = GMIPrimeState.AWAITING_TOOL_RESULT;
           const toolExecutionResults: ToolCallResult[] = [];
-          for (const toolCallReq of currentIterationToolCallRequests) {
-            const requestDetails: ToolExecutionRequestDetails = {
-              toolCallRequest: toolCallReq,
-              gmiId: this.gmiId, personaId: this.activePersona.id,
-              personaCapabilities: this.activePersona.allowedCapabilities || [],
-              userContext: this.currentUserContext, correlationId: turnId,
-              sessionData: this.buildToolSessionData(turnInput),
-            };
-            this.addTraceEntry(ReasoningEntryType.TOOL_EXECUTION_START, `Orchestrating tool: ${toolCallReq.name}`, { reqId: toolCallReq.id });
-            const result = await this.toolOrchestrator.processToolCall(requestDetails);
-            toolExecutionResults.push(result);
-            this.addTraceEntry(ReasoningEntryType.TOOL_EXECUTION_RESULT, `Tool '${toolCallReq.name}' result. Success: ${!result.isError}`, { result });
-            if (result.isError && plannedToolFailureMode === 'fail_closed') {
-              throw new GMIError(
-                `Tool '${toolCallReq.name}' failed and execution policy is fail_closed.`,
-                GMIErrorCode.TOOL_ERROR,
-                {
-                  toolCallId: toolCallReq.id,
-                  toolName: toolCallReq.name,
-                  errorDetails: result.errorDetails,
-                },
-              );
+          // The call awaiting its result; cleared once processToolCall returns.
+          let callInFlight: ToolCallRequest | undefined;
+          let toolRoundFailure: { error: unknown } | undefined;
+          try {
+            for (const toolCallReq of currentIterationToolCallRequests) {
+              const requestDetails: ToolExecutionRequestDetails = {
+                toolCallRequest: toolCallReq,
+                gmiId: this.gmiId, personaId: this.activePersona.id,
+                personaCapabilities: this.activePersona.allowedCapabilities || [],
+                userContext: this.currentUserContext, correlationId: turnId,
+                sessionData: this.buildToolSessionData(turnInput),
+              };
+              this.addTraceEntry(ReasoningEntryType.TOOL_EXECUTION_START, `Orchestrating tool: ${toolCallReq.name}`, { reqId: toolCallReq.id });
+              callInFlight = toolCallReq;
+              const result = await this.toolOrchestrator.processToolCall(requestDetails);
+              callInFlight = undefined;
+              toolExecutionResults.push(result);
+              this.addTraceEntry(ReasoningEntryType.TOOL_EXECUTION_RESULT, `Tool '${toolCallReq.name}' result. Success: ${!result.isError}`, { result });
+              if (result.isError && plannedToolFailureMode === 'fail_closed') {
+                throw new GMIError(
+                  `Tool '${toolCallReq.name}' failed and execution policy is fail_closed.`,
+                  GMIErrorCode.TOOL_ERROR,
+                  {
+                    toolCallId: toolCallReq.id,
+                    toolName: toolCallReq.name,
+                    errorDetails: result.errorDetails,
+                  },
+                );
+              }
             }
+          } catch (error) {
+            toolRoundFailure = { error };
+            toolExecutionResults.push(...this.resultsForUnfinishedToolCalls(
+              currentIterationToolCallRequests,
+              toolExecutionResults.length,
+              callInFlight,
+              error,
+            ));
           }
+          // Recorded on success and failure alike, so the history this turn
+          // leaves answers every call its assistant message declared.
           for (const tcResult of toolExecutionResults) {
             turnMessages.push(this.conversationHistoryManager.updateWithToolResult(tcResult));
           }
+          if (toolRoundFailure) throw toolRoundFailure.error;
           currentIterationTextResponse = ""; // Reset for next iteration if any
           currentIterationToolCallRequests = []; // Reset
-          this.state = GMIPrimeState.PROCESSING;
+          if (ownsState()) this.state = GMIPrimeState.PROCESSING;
           continue main_processing_loop;
         }
         break main_processing_loop; // Break if no tool calls
@@ -1118,7 +1186,7 @@ export class GMI implements IGMI {
     } catch (error: any) {
 
       const gmiError = createGMIErrorFromError(error, GMIErrorCode.GMI_PROCESSING_ERROR, { turnId }, `Error in GMI turn '${turnId}'.`);
-      this.state = GMIPrimeState.ERRORED;
+      if (ownsState()) this.state = GMIPrimeState.ERRORED;
       lastErrorForOutput = { code: gmiError.code, message: gmiError.message, details: gmiError.details };
       this.addTraceEntry(ReasoningEntryType.ERROR, `GMI processing error: ${gmiError.message}`, gmiError.toPlainObject());
       console.error(`GMI (ID: ${this.gmiId}) error in turn '${turnId}':`, gmiError);
@@ -1132,13 +1200,21 @@ export class GMI implements IGMI {
         usage: aggregatedUsage, // Could be partial
       };
     } finally {
-      if (this.state !== GMIPrimeState.ERRORED && this.state !== GMIPrimeState.AWAITING_TOOL_RESULT) {
+      // A newer turn may already own the lifecycle state (this generator was
+      // drained after a failure, once the next turn had started); leave the
+      // state and the trace's turn id to that turn.
+      if (
+        ownsState() &&
+        this.state !== GMIPrimeState.ERRORED &&
+        this.state !== GMIPrimeState.AWAITING_TOOL_RESULT
+      ) {
         this.state = GMIPrimeState.READY;
       }
       // This final chunk is part of the stream, not the return value of the generator
       yield this.createOutputChunk(turnInput.interactionId, GMIOutputChunkType.FINAL_RESPONSE_MARKER, 'Turn processing sequence complete.', { isFinal: true });
       this.addTraceEntry(ReasoningEntryType.INTERACTION_END, `Turn '${turnId}' finished. GMI State: ${this.state}.`);
-      if (this.reasoningTrace) this.reasoningTrace.turnId = undefined;
+      // Checked after the yield: a newer turn can start while this one waits there.
+      if (ownsState() && this.reasoningTrace) this.reasoningTrace.turnId = undefined;
     }
   }
 
