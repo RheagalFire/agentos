@@ -274,6 +274,14 @@ export class AIModelProviderManager {
     return this.getDefaultProvider();
   }
 
+  /**
+   * Lists every model the initialized providers serve: one row per
+   * (providerId, modelId), in provider registration order. Two providers can
+   * serve the same model id (gemini and gemini-cli, anthropic and
+   * claude-code-cli), and routing names the provider, so each keeps its row.
+   * A bare-id `find` still lands on the first-registered provider, matching
+   * {@link getProviderForModel}.
+   */
   public async listAllAvailableModels(): Promise<ModelInfo[]> {
     this.ensureInitialized(); // Corrected: using ensureInitialized
     if (this.allModelsCache) {
@@ -303,13 +311,18 @@ export class AIModelProviderManager {
       }
     });
 
-    const uniqueModelsMap = new Map<string, ModelInfo>();
+    // Unique per (provider, model): keying on the model id alone dropped the
+    // second provider's row, so a ModelRouter rule or default naming that
+    // provider matched nothing.
+    const seen = new Set<string>();
+    const uniqueModels: ModelInfo[] = [];
     for (const model of allModels) {
-      if (!uniqueModelsMap.has(model.modelId)) {
-        uniqueModelsMap.set(model.modelId, model);
-      }
+      const key = `${model.providerId}\u0000${model.modelId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniqueModels.push(model);
     }
-    this.allModelsCache = Array.from(uniqueModelsMap.values());
+    this.allModelsCache = uniqueModels;
     return [...this.allModelsCache];
   }
 
