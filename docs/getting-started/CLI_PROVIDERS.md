@@ -35,7 +35,7 @@ The generalized subprocess bridge lives at `packages/agentos/src/sandbox/subproc
 | Provider ID | Binary | Auth | Default Model | Status |
 |---|---|---|---|---|
 | `claude-code-cli` | `claude` | Anthropic Max subscription | `claude-sonnet-4-6` | **Confirmed — officially supported by Anthropic** |
-| `gemini-cli` | `gemini` | Google account login | `gemini-2.5-flash` | **Use at your own risk — see ToS warning below** |
+| `gemini-cli` | `gemini` | Google account login | `gemini-3.5-flash` | **Use at your own risk — see ToS warning below** |
 
 ## Terms of Service Compliance
 
@@ -93,7 +93,7 @@ AgentOS includes a complete [`OpenAIOAuthFlow`](https://github.com/framerslab/ag
 - **Tool calling**: XML prompt-based with `<tool_call>` markers (no `--json-schema` support)
 - **Streaming**: `--output-format stream-json`
 - **Key flags**: `-p` (headless), `-m` (model selection)
-- **Models**: gemini-3.1-pro-preview, gemini-2.5-pro, gemini-2.5-flash (default), gemini-3.5-flash-lite, gemini-2.5-flash-lite
+- **Models**: gemini-3.5-flash (default), gemini-3.1-pro-preview, gemini-3.5-flash-lite, gemini-2.5-flash-lite. The CLI answers gemini-2.5-flash with gemini-3.5-flash and returns 404 for gemini-2.5-pro.
 - **Cost**: $0 per token (Google account — free tier: 60 req/min, 1000 req/day; higher with AI Pro/Ultra)
 - **Auto-detection**: Checks if `gemini` is on PATH (after `claude-code-cli`, before Ollama)
 

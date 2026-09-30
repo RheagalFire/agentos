@@ -20,7 +20,7 @@ describe('PROVIDER_DEFAULTS', () => {
 
   it('includes CLI providers with text defaults', () => {
     expect(PROVIDER_DEFAULTS['claude-code-cli']?.text).toBe('claude-sonnet-4-6');
-    expect(PROVIDER_DEFAULTS['gemini-cli']?.text).toBe('gemini-2.5-flash');
+    expect(PROVIDER_DEFAULTS['gemini-cli']?.text).toBe('gemini-3.5-flash');
   });
 
   it('has image model for image providers', () => {
@@ -123,6 +123,13 @@ describe('autoDetectProvider', () => {
 });
 
 describe('resolveModelOption', () => {
+  it('resolves provider-only for Gemini CLI to the model the CLI serves', () => {
+    expect(resolveModelOption({ provider: 'gemini-cli' }, 'text')).toEqual({
+      providerId: 'gemini-cli',
+      modelId: 'gemini-3.5-flash',
+    });
+  });
+
   it('resolves provider-only to default text model', () => {
     const result = resolveModelOption({ provider: 'openai' }, 'text');
     expect(result).toEqual({ providerId: 'openai', modelId: 'gpt-4o' });

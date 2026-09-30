@@ -60,7 +60,7 @@ AgentOS abstracts LLM access behind a unified [`IProvider`](https://github.com/f
 | **OpenRouter** | `OPENROUTER_API_KEY` | `openai/gpt-4o` | Yes | Yes | Yes* | Yes* | Varies |
 | **Ollama** | `OLLAMA_BASE_URL` | `llama3.2` | Yes | Partial | Model-dep. | Yes | Free |
 | **Claude Code CLI** | _(PATH detection)_ | `claude-sonnet-4-6` | Yes | Yes | Yes | No | Free* |
-| **Gemini CLI** | _(PATH detection)_ | `gemini-2.5-flash` | Yes | Partial** | Yes | No | Free* |
+| **Gemini CLI** | _(PATH detection)_ | `gemini-3.5-flash` | Yes | Partial** | Yes | No | Free* |
 
 *CLI providers use your existing subscription — $0 per token.
 **Gemini CLI tool calling uses XML prompt-based parsing (less reliable than native API tool calling).

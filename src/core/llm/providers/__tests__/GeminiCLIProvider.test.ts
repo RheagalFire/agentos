@@ -14,6 +14,7 @@ vi.mock('../implementations/GeminiCLIBridge', () => ({
 }));
 
 import { GeminiCLIProvider } from '../implementations/GeminiCLIProvider';
+import { PROVIDER_DEFAULTS } from '../../../../api/runtime/provider-defaults.js';
 import type { ChatMessage, ModelCompletionOptions } from '../IProvider';
 
 describe('GeminiCLIProvider', () => {
@@ -159,10 +160,11 @@ describe('GeminiCLIProvider', () => {
       await provider.initialize({});
     });
 
-    it('returns 7 Gemini models', async () => {
+    it('returns 8 Gemini models', async () => {
       const models = await provider.listAvailableModels();
-      expect(models).toHaveLength(7);
+      expect(models).toHaveLength(8);
       const ids = models.map(m => m.modelId);
+      expect(ids).toContain('gemini-3.5-flash');
       expect(ids).toContain('gemini-2.5-pro');
       expect(ids).toContain('gemini-2.5-flash');
       expect(ids).toContain('gemini-3.1-pro-preview');
@@ -171,6 +173,25 @@ describe('GeminiCLIProvider', () => {
       expect(ids).toContain('gemini-2.0-flash');
       expect(ids).toContain('gemini-2.0-flash-lite');
       expect(models.every(m => m.pricePer1MTokensInput === 0)).toBe(true);
+    });
+
+    it('marks one default, and the provider and high-level defaults agree', async () => {
+      const models = await provider.listAvailableModels();
+      const defaults = models.filter(m => m.isDefaultModel).map(m => m.modelId);
+
+      expect(defaults).toEqual(['gemini-3.5-flash']);
+      expect(defaults).toEqual([provider.defaultModelId]);
+      expect(defaults).toEqual([PROVIDER_DEFAULTS['gemini-cli'].text]);
+    });
+
+    it('marks the ids the CLI does not serve as requested deprecated', async () => {
+      // Probed 2026-09-30: 2.5 Flash is answered by 3.5 Flash, 2.5 Pro gets a 404.
+      const models = await provider.listAvailableModels();
+      for (const id of ['gemini-2.5-flash', 'gemini-2.5-pro']) {
+        const row = models.find(m => m.modelId === id);
+        expect(row?.status).toBe('deprecated');
+        expect(row?.isDefaultModel).toBe(false);
+      }
     });
 
     it('marks the retired Gemini 2.0 models deprecated', async () => {

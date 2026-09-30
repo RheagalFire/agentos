@@ -833,7 +833,7 @@ const STRONG_MODELS: Record<string, string> = {
   xai: 'grok-2',
   ollama: 'llama3.2',
   'claude-code-cli': 'claude-sonnet-4-6',
-  'gemini-cli': 'gemini-2.5-flash',
+  'gemini-cli': 'gemini-3.5-flash',
 };
 
 export const DEFAULT_QUERY_ROUTER_CONFIG = {

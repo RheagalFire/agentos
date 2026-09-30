@@ -66,9 +66,12 @@ export const PROVIDER_DEFAULTS: Record<string, ProviderDefaults> = {
     cheap: 'claude-haiku-4-5-20251001',
   },
   'gemini-cli': {
-    text: 'gemini-2.5-flash',
+    // The CLI answers gemini-2.5-flash with gemini-3.5-flash (probed
+    // 2026-09-30), so the default names the model that runs.
+    text: 'gemini-3.5-flash',
     // gemini-2.0-flash-lite fails in the CLI with ModelNotFoundError (probed
-    // 2026-09-29), while gemini-2.5-flash-lite is served as requested.
+    // 2026-09-29), while gemini-2.5-flash-lite is served as requested
+    // (re-probed 2026-09-30).
     cheap: 'gemini-2.5-flash-lite',
   },
   stability: {
