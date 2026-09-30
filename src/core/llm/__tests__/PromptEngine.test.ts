@@ -587,20 +587,16 @@ describe('PromptEngine prompt cache', () => {
   });
 
   it('serializes the components at the root, as the prompt copy does', async () => {
-    const keyFor = async (userInput: string) =>
-      (
-        await engine.constructPrompt(
-          {
-            systemPrompts: [{ content: 'Base instructions' }],
-            userInput,
-            toJSON(key: string) {
-              return key === '' ? { systemPrompts: this.systemPrompts, userInput: this.userInput } : {};
-            },
-          } as never,
-          baseModelInfo,
-          baseExecutionContext,
-        )
-      ).cacheKey;
+    const keyFor = async (userInput: string) => {
+      const components = {
+        systemPrompts: [{ content: 'Base instructions' }],
+        userInput,
+        toJSON(key: string) {
+          return key === '' ? { systemPrompts: this.systemPrompts, userInput: this.userInput } : {};
+        },
+      };
+      return (await engine.constructPrompt(components as never, baseModelInfo, baseExecutionContext)).cacheKey;
+    };
 
     expect(await keyFor('first question')).not.toBe(await keyFor('second question'));
   });

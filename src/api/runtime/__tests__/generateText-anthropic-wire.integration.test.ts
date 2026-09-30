@@ -371,13 +371,11 @@ describe('Claude refusals in a session', () => {
   });
 });
 
-/** Request headers of every request, in call order. */
+/** Request headers of every request, in call order (the provider sends a plain object). */
 function postedHeaders(): Array<Record<string, string>> {
-  return fetchMock.mock.calls.map(([, init]) => {
-    const headers = (init as { headers?: unknown } | undefined)?.headers;
-    if (headers instanceof Headers) return Object.fromEntries(headers.entries());
-    return (headers ?? {}) as Record<string, string>;
-  });
+  return fetchMock.mock.calls.map(
+    ([, init]) => (init as { headers?: Record<string, string> } | undefined)?.headers ?? {},
+  );
 }
 
 describe('Claude thinking off and effort through the public API', () => {
