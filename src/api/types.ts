@@ -1264,6 +1264,9 @@ export interface BaseAgentConfig {
   /**
    * HEXACO-inspired personality trait overrides (0–1 scale).
    * Encoded as a human-readable trait string appended to the system prompt.
+   * The SOUL.md spellings `honestyHumility` / `honesty_humility` and
+   * `opennessToExperience` are accepted for `honesty` and `openness`; when
+   * both spellings are given, the canonical key wins.
    */
   personality?: Partial<{
     honesty: number;
@@ -1272,6 +1275,9 @@ export interface BaseAgentConfig {
     agreeableness: number;
     conscientiousness: number;
     openness: number;
+    honestyHumility: number;
+    honesty_humility: number;
+    opennessToExperience: number;
   }>;
   /**
    * Tools available to the agent on every call.

@@ -30,6 +30,10 @@ import type { HostLLMPolicy } from './runtime/hostPolicy.js';
 import type { IModelRouter } from '../core/llm/routing/IModelRouter.js';
 import type { SkillEntry } from '../cognition/skills/types.js';
 import { loadSoulSync, parseSoul } from '../cognition/substrate/personas/SoulLoader.js';
+import {
+  normalizeHexacoTraits,
+  type HexacoTraitKey,
+} from '../cognition/substrate/personas/hexaco.js';
 import { CitationVerifier } from '../cognition/rag/citation/CitationVerifier.js';
 import type { VerifyCitationsConfig } from './types.js';
 import type {
@@ -483,12 +487,15 @@ async function loadRecordedAgentOSUsage(
  * Each trait produces a directive when it deviates from the neutral midpoint (0.5).
  * High values (>0.65) and low values (<0.35) produce distinct behavioral instructions.
  * Moderate values (0.35-0.65) are omitted to avoid over-constraining the model.
+ * Trait keys are normalized first, so the SOUL.md spelling `honestyHumility`
+ * reads as `honesty`.
  */
 function buildPersonalityDescription(
   traits: Partial<Record<string, number>>
 ): string | null {
   const lines: string[] = [];
-  const v = (key: string) => typeof traits[key] === 'number' ? traits[key]! : 0.5;
+  const normalized = normalizeHexacoTraits(traits);
+  const v = (key: HexacoTraitKey) => normalized[key] ?? 0.5;
 
   const h = v('honesty');
   const e = v('emotionality');
