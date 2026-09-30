@@ -91,8 +91,11 @@ export const PROVIDER_DEFAULTS: Record<string, ProviderDefaults> = {
     cheap: 'gemma2-9b-it',
   },
   together: {
-    text: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo',
-    cheap: 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo',
+    // The Llama 3.1 Turbo ids left Together serverless in 2026-02/03. The
+    // cheap slot stays on a non-reasoning model: the cheaper served picks
+    // reason by default and can spend a small maxTokens budget on the trace.
+    text: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+    cheap: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
   },
   mistral: {
     text: 'mistral-large-latest',

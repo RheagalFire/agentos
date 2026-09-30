@@ -26,8 +26,8 @@ const DEFAULTS: Record<string, { text: string; cheap: string }> = {
   openrouter: { text: 'openai/gpt-4o', cheap: 'openai/gpt-4o-mini' },
   groq: { text: 'llama-3.3-70b-versatile', cheap: 'gemma2-9b-it' },
   together: {
-    text: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo',
-    cheap: 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo',
+    text: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+    cheap: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
   },
   mistral: { text: 'mistral-large-latest', cheap: 'mistral-small-latest' },
   xai: { text: 'grok-2', cheap: 'grok-2-mini' },

@@ -813,7 +813,7 @@ const CHEAP_MODELS: Record<string, string> = {
   // gemini-2.0-flash and gemini-2.0-flash-lite are retired (probed 2026-09-29).
   gemini: 'gemini-2.5-flash-lite',
   groq: 'gemma2-9b-it',
-  together: 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo',
+  together: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
   mistral: 'mistral-small-latest',
   xai: 'grok-2-mini',
   ollama: 'llama3.2',
@@ -828,7 +828,7 @@ const STRONG_MODELS: Record<string, string> = {
   openrouter: 'openai/gpt-4o',
   gemini: 'gemini-2.5-flash',
   groq: 'llama-3.3-70b-versatile',
-  together: 'meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo',
+  together: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
   mistral: 'mistral-large-latest',
   xai: 'grok-2',
   ollama: 'llama3.2',

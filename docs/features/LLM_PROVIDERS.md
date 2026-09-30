@@ -54,7 +54,7 @@ AgentOS abstracts LLM access behind a unified [`IProvider`](https://github.com/f
 | **Anthropic** | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | Yes | Yes | Yes | No | $$$ |
 | **Gemini** | `GEMINI_API_KEY` | `gemini-2.5-flash` | Yes | Yes | Yes | Yes | $$ |
 | **Groq** | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Yes | Yes | No | No | $ |
-| **Together** | `TOGETHER_API_KEY` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` | Yes | Yes | No | Yes | $ |
+| **Together** | `TOGETHER_API_KEY` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` | Yes | Yes | No | No | $ |
 | **Mistral** | `MISTRAL_API_KEY` | `mistral-large-latest` | Yes | Yes | No | Yes | $$ |
 | **xAI** | `XAI_API_KEY` | `grok-2` | Yes | Yes | Yes | No | $$ |
 | **OpenRouter** | `OPENROUTER_API_KEY` | `openai/gpt-4o` | Yes | Yes | Yes* | Yes* | Varies |
@@ -346,8 +346,10 @@ export TOGETHER_API_KEY=...
 | Model | Context | Vision | Tool Calling | Notes |
 |-------|---------|--------|-------------|-------|
 | `meta-llama/Llama-3.3-70B-Instruct-Turbo` | 128K | No | Yes | Default |
-| `meta-llama/Llama-3.1-405B-Instruct-Turbo` | 128K | No | Yes | Largest open model |
-| `mistralai/Mixtral-8x22B-Instruct-v0.1` | 64K | No | Yes | Mixtral |
+| `openai/gpt-oss-120b` | 128K | No | Yes | Always reasons |
+| `zai-org/GLM-5.3-Flash` | 1M | No | Yes | Thinking on by default |
+
+Together serverless offers no embedding models.
 
 ### Mistral AI
 
@@ -510,7 +512,6 @@ exercised paths.
 |----------|--------|-----------|------------|
 | OpenAI | `text-embedding-3-small`, `text-embedding-3-large` | 256–3072 | 2048 |
 | Gemini | `gemini-embedding-001`, `gemini-embedding-2` | 3072 | 100 |
-| Together | `togethercomputer/m2-bert-80M-*` | 768 | 512 |
 | Mistral | `mistral-embed` | 1024 | 512 |
 | Ollama | `nomic-embed-text`, `mxbai-embed-large` | 768–1024 | 512 |
 
