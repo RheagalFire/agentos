@@ -341,6 +341,78 @@ export function modelRequiresMaxCompletionTokens(modelId: string): boolean {
 }
 
 /**
+ * Context-window size for the GPT-5, GPT-6 and o-series reasoning families.
+ *
+ * From the first-party model pages and GET /v1/models, 2026-09-23 to 29. The
+ * family prefix alone does not decide the size: `gpt-5.4` is a 1.05M model
+ * while its `-mini` and `-nano` siblings are 400K.
+ *
+ *   - 1,050,000: the GPT-6 family, the GPT-5.6 family except `gpt-5.6-cyber`,
+ *     `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4` and `gpt-5.4-pro` (max input
+ *     922,000 on GPT-6).
+ *   - 400,000: `gpt-5.6-cyber`, `gpt-5.4-mini` / `-nano`, `gpt-5.3-codex`,
+ *     `gpt-5.2*`, `gpt-5.1*`, `gpt-5`, and `gpt-5-mini` / `-nano` / `-pro`.
+ *   - 200,000: the o-series other than `o1-mini` and `o1-preview`.
+ *   - 128,000: `o1-mini`, `o1-preview` and the `gpt-5*-chat-latest` snapshots.
+ *
+ * @param modelId Provider-side model identifier (e.g. `'gpt-6-sol'`).
+ * @returns Context window in tokens.
+ */
+export function openAiReasoningContextWindow(modelId: string): number {
+  const id = modelId.toLowerCase();
+  if (/^o1-(mini|preview)/.test(id)) return 128000;
+  if (/^o\d/.test(id)) return 200000;
+  if (/^gpt-5(\.\d+)?-chat-latest$/.test(id)) return 128000;
+  if (/^gpt-5\.6-cyber/.test(id)) return 400000;
+  if (/^gpt-6/.test(id)) return 1050000;
+  if (/^gpt-5\.[56]/.test(id)) return 1050000;
+  // gpt-5.4 and gpt-5.4-pro, bare or dated, are 1.05M; -mini and -nano are 400K.
+  if (/^gpt-5\.4(-pro)?(-\d{4}-\d{2}-\d{2})?$/.test(id)) return 1050000;
+  return 400000;
+}
+
+/**
+ * Whether OpenAI serves `modelId` only through the Responses API. OpenAI lists
+ * the `-pro` tiers, the codex models, `gpt-5.6-cyber` and the deep-research
+ * models as Responses-only. OpenAIProvider sends a request to /v1/responses
+ * only when it is a non-streamed GPT-5 or GPT-6 call carrying function tools
+ * and an effort, and to /v1/chat/completions otherwise, where these ids fail.
+ *
+ * @param modelId Provider-side model identifier.
+ * @returns `true` when the model has no Chat Completions endpoint.
+ */
+export function isOpenAIResponsesOnlyModel(modelId: string): boolean {
+  return /-pro(-\d{4}-\d{2}-\d{2})?$|codex|^gpt-5\.6-cyber|deep-research/i.test(modelId);
+}
+
+/**
+ * ModelInfo capabilities for a GPT-5, GPT-6 or o-series id, limited to what
+ * OpenAIProvider can serve.
+ *
+ *   - Responses-only models ({@link isOpenAIResponsesOnlyModel}) list as
+ *     `chat` only. This provider reaches them only on its narrow Responses
+ *     path, and the refresh leaves the Responses-only o-series ids out.
+ *   - GPT-6 omits `tool_use`. OpenAI requires the Responses API for GPT-6
+ *     Astra tool calls and `reasoning_effort: "none"` for Sol and Luna tool
+ *     calls on Chat Completions, and this provider routes a tool call to
+ *     Responses only when it carries an effort and is not streamed.
+ *   - `o1-mini` and `o1-preview` have no function calling or structured
+ *     outputs. They and `o3-mini` take text only, and every other id takes
+ *     images (per model input modalities, checked 2026-09-29).
+ *
+ * @param modelId Provider-side model identifier (e.g. `'gpt-6-sol'`).
+ * @returns Capability strings for ModelInfo.
+ */
+export function openAiReasoningCapabilities(modelId: string): string[] {
+  const id = modelId.toLowerCase();
+  if (isOpenAIResponsesOnlyModel(id) || /^o1-(mini|preview)/.test(id)) return ['chat'];
+  const caps = ['chat', 'json_mode'];
+  if (!/^gpt-6/.test(id)) caps.push('tool_use');
+  if (!/^o3-mini/.test(id)) caps.push('vision_input');
+  return caps;
+}
+
+/**
  * Whether `modelId` is an OpenAI reasoning model — the o1/o3/o4 series or the
  * GPT-5 / GPT-6 families. These models reject custom sampling params
  * (`temperature`, `top_p`) with HTTP 400 in addition to requiring
@@ -519,24 +591,37 @@ export class OpenAIProvider implements IProvider {
   // on 2026-04-16. Values are standard (non-batch, non-regional) rates.
   // Input: cost for prompt tokens. Output: cost for completion tokens.
   // For embedding models, 'input' is total tokens.
+  // Rates are flat per model. OpenAI bills prompts above 272,000 input tokens
+  // on the 1.05M-context models at 2x input and 1.5x output for the whole
+  // request, which this table does not model, so long-context spend reads low.
   private readonly modelPricing: Record<string, { input: number; output: number }> = {
-    // GPT-6 family (current flagship, Sep 2026 — $10 / $50 per 1M tokens;
-    // verified against developers.openai.com/api/docs/models/gpt-6-astra on
-    // 2026-09-10. `gpt-6-astra` is the only GPT-6 id on /v1/models at that
-    // date — "GPT-6 Pro" is a ChatGPT plan tier, not an API model.)
+    // GPT-6 family (current flagship, Sep 2026). Astra $10/$50, Sol $2/$10,
+    // Luna $0.10/$0.50 per 1M, from developers.openai.com/api/docs/models on
+    // 2026-09-23; all three ids are on the first-party GET /v1/models listing.
+    // A model with no row here gets costUSD undefined from calculateCost, so
+    // its calls go unmetered. "GPT-6 Pro" is a ChatGPT plan tier, and the
+    // first-party pro tier is `reasoning.mode: 'pro'` on Sol, so neither has an
+    // id here.
     'gpt-6-astra': { input: 0.01, output: 0.05 },
+    'gpt-6-sol': { input: 0.002, output: 0.01 },
+    'gpt-6-luna': { input: 0.0001, output: 0.0005 },
     // GPT-5.5 family (previous flagship, Jun 2026 — $5 / $30 per 1M tokens, a 2x
     // increase over gpt-5.4; verified against OpenAI's published pricing 2026-06-27)
     'gpt-5.5': { input: 0.005, output: 0.03 },
     'gpt-5.5-pro': { input: 0.03, output: 0.18 },
-    // GPT-5.6 family (flagship variants, Aug 2026 — verified against the live
-    // OpenRouter listing 2026-08-06: sol is the frontier tier at the gpt-5.5
-    // price class, terra mid-tier, luna mini-class; the bare `gpt-5.6` alias
-    // serves the flagship tier).
-    'gpt-5.6': { input: 0.005, output: 0.03 },
-    'gpt-5.6-sol': { input: 0.005, output: 0.03 },
-    'gpt-5.6-terra': { input: 0.001, output: 0.006 },
-    'gpt-5.6-luna': { input: 0.0001, output: 0.0006 },
+    // GPT-5.6 family (Aug 2026), per the first-party model pages on
+    // 2026-09-23: Sol $4/$20 (promotional through at least 2026-11-21),
+    // Terra $2/$12 and Luna $0.20/$1.20 per 1M. OpenRouter's listing carries
+    // OpenRouter's resale rates, which differ, so first-party providers are
+    // priced from first-party pages. The bare `gpt-5.6` alias routes to Sol and
+    // is priced with it. It is absent from the 2026-09-23 /v1/models listing,
+    // but aliases are often unlisted and this repo records a direct HTTP 200 on
+    // it from 2026-08-06 (see RESPONSES_MAX_EFFORT_MODELS), so it stays until an
+    // inference probe shows it gone.
+    'gpt-5.6': { input: 0.004, output: 0.02 },
+    'gpt-5.6-sol': { input: 0.004, output: 0.02 },
+    'gpt-5.6-terra': { input: 0.002, output: 0.012 },
+    'gpt-5.6-luna': { input: 0.0002, output: 0.0012 },
     // GPT-5.4 family (previous flagship and siblings, Mar 2026)
     'gpt-5.4': { input: 0.0025, output: 0.015 },
     'gpt-5.4-mini': { input: 0.00075, output: 0.0045 },
@@ -558,6 +643,9 @@ export class OpenAIProvider implements IProvider {
     'gpt-4.1-nano': { input: 0.0001, output: 0.0004 },
     // GPT-4o family (legacy, repriced to current list at $2.50/$10 per 1M)
     'gpt-4o': { input: 0.0025, output: 0.010 },
+    // The first GPT-4o snapshot kept its $5 / $15 launch price. Without this
+    // row the dated-snapshot fallback would price it at the gpt-4o alias rate.
+    'gpt-4o-2024-05-13': { input: 0.005, output: 0.015 },
     'gpt-4o-mini': { input: 0.00015, output: 0.0006 },
     // Deprecated but still potentially referenced
     'gpt-4-turbo': { input: 0.01, output: 0.03 },
@@ -569,8 +657,10 @@ export class OpenAIProvider implements IProvider {
     'gpt-3.5-turbo-16k': { input: 0.001, output: 0.002 },
     // o-series reasoning models
     'o3': { input: 0.002, output: 0.008 },
+    'o3-mini': { input: 0.0011, output: 0.0044 },
+    'o3-pro': { input: 0.020, output: 0.080 },
     'o3-pro-2025-06-10': { input: 0.020, output: 0.080 },
-    'o4-mini': { input: 0.001, output: 0.004 },
+    'o4-mini': { input: 0.0011, output: 0.0044 },
     'o1': { input: 0.015, output: 0.060 },
     'o1-pro': { input: 0.150, output: 0.600 },
     // Embedding models (per 1K tokens, input only)
@@ -645,7 +735,16 @@ export class OpenAIProvider implements IProvider {
     this.availableModelsCache.clear();
     response.data.forEach((apiModel: OpenAIAPITypes.ModelAPIObject) => {
       // Basic filtering for generally usable models, can be expanded.
-      if (apiModel.id.startsWith('gpt-') || apiModel.id.includes('embedding')) {
+      // The o-series ids neither start with `gpt-` nor contain `embedding`,
+      // so they are admitted on their own terms: priced in `modelPricing`
+      // (dated snapshots resolve to their base row) and reachable on Chat
+      // Completions. That admits `o1`, `o3`, `o3-mini` and `o4-mini`, and
+      // leaves out the Responses-only `o1-pro` / `o3-pro` and the unpriced
+      // `o1-mini` / `o1-preview`, which would fail when called or list as free.
+      const admitOSeries = /^o\d/.test(apiModel.id)
+        && !isOpenAIResponsesOnlyModel(apiModel.id)
+        && this.resolvePricing(apiModel.id) !== undefined;
+      if (apiModel.id.startsWith('gpt-') || admitOSeries || apiModel.id.includes('embedding')) {
         const modelInfo = this.mapApiToModelInfo(apiModel);
         this.availableModelsCache.set(modelInfo.modelId, modelInfo);
       }
@@ -665,8 +764,19 @@ export class OpenAIProvider implements IProvider {
     let _supportsVision = false;
     let isEmbeddingModel = false;
 
-    // Infer capabilities and context window from model ID (common OpenAI patterns)
-    if (apiModel.id.startsWith('gpt-4o')) {
+    // Infer capabilities and context window from model ID (common OpenAI patterns).
+    //
+    // The GPT-5, GPT-6 and o-series branch comes first. Without it these
+    // families fall through to the trailing `else`, which publishes them as
+    // `capabilities: ['chat']` with no context window, and
+    // `listAvailableModels({ capability: 'tool_use' })` then omits every
+    // current OpenAI model while still returning gpt-4o.
+    if (/^(gpt-5|gpt-6|o\d)/i.test(apiModel.id)) {
+        capabilities.push(...openAiReasoningCapabilities(apiModel.id));
+        contextWindowSize = openAiReasoningContextWindow(apiModel.id);
+        _supportsTools = capabilities.includes('tool_use');
+        _supportsVision = capabilities.includes('vision_input');
+    } else if (apiModel.id.startsWith('gpt-4o')) {
         capabilities.push('chat', 'vision_input', 'tool_use', 'json_mode');
         contextWindowSize = 128000; _supportsTools = true; _supportsVision = true;
     } else if (apiModel.id.startsWith('gpt-4-turbo')) {
@@ -698,7 +808,12 @@ export class OpenAIProvider implements IProvider {
         capabilities.push('chat'); // Assume chat at least
     }
 
-    const pricing = this.modelPricing[apiModel.id] || { input: 0, output: 0 };
+    const pricing = this.resolvePricing(apiModel.id) || { input: 0, output: 0 };
+    // modelPricing holds USD per 1K tokens and ModelInfo carries USD per 1M,
+    // so every rate is scaled by 1000 here. Cost metering reads modelPricing
+    // directly and is unaffected; this conversion is what callers of
+    // listAvailableModels() and getModelInfo() see.
+    const per1M = (per1K: number) => Math.round(per1K * 1000 * 1e6) / 1e6;
 
     return {
       modelId: apiModel.id,
@@ -707,9 +822,9 @@ export class OpenAIProvider implements IProvider {
       description: `OpenAI model: ${apiModel.id}`,
       capabilities,
       contextWindowSize,
-      pricePer1MTokensInput: pricing.input,
-      pricePer1MTokensOutput: pricing.output,
-      pricePer1MTokensTotal: isEmbeddingModel ? pricing.input : undefined,
+      pricePer1MTokensInput: per1M(pricing.input),
+      pricePer1MTokensOutput: per1M(pricing.output),
+      pricePer1MTokensTotal: isEmbeddingModel ? per1M(pricing.input) : undefined,
       supportsStreaming: capabilities.includes('chat'), // Generally, chat models support streaming
       // OpenAI specific details can be added to metadata
       embeddingDimension: apiModel.id.includes('embedding-3-large') ? 3072 :
@@ -986,7 +1101,10 @@ export class OpenAIProvider implements IProvider {
           role: m.role,
           content: m.content, // OpenAI allows null content for assistant tool_calls message
           name: m.name,
-          tool_calls: m.tool_calls,
+          // Only the standard tool-call fields go on the wire. A tool call can
+          // carry provider-specific extras, such as Gemini's thoughtSignature,
+          // that the Chat Completions schema does not define.
+          tool_calls: m.tool_calls?.map(({ id, type, function: fn }) => ({ id, type, function: fn })),
           tool_call_id: m.tool_call_id,
       })),
       stream: stream,
@@ -1588,6 +1706,22 @@ export class OpenAIProvider implements IProvider {
   }
 
   /**
+   * Price-table row for a model id. OpenAI responses name the dated snapshot
+   * that served the call (`gpt-4.1-2025-04-14` for a `gpt-4.1` request), and
+   * usage is costed from that response id, so an exact miss retries with a
+   * trailing `-YYYY-MM-DD` removed. An exact row still wins, which keeps
+   * snapshots priced apart from their alias (`gpt-4o-2024-05-13`,
+   * `o3-pro-2025-06-10`).
+   *
+   * @param modelId Model id as requested or as echoed by the API.
+   * @returns USD per 1K tokens, or undefined when no row matches.
+   */
+  private resolvePricing(modelId: string | undefined): { input: number; output: number } | undefined {
+    if (!modelId) return undefined;
+    return this.modelPricing[modelId] ?? this.modelPricing[modelId.replace(/-\d{4}-\d{2}-\d{2}$/, '')];
+  }
+
+  /**
    * Calculates the estimated cost of an API call.
    * @private
    */
@@ -1597,7 +1731,7 @@ export class OpenAIProvider implements IProvider {
     modelId: string,
     isEmbedding: boolean = false
   ): number | undefined {
-    const pricing = this.modelPricing[modelId];
+    const pricing = this.resolvePricing(modelId);
     if (!pricing) return undefined; // Pricing info not available
 
     if (isEmbedding) {
