@@ -63,6 +63,7 @@ import { ConversationHistoryManager } from './ConversationHistoryManager';
 import { CognitiveMemoryBridge } from './CognitiveMemoryBridge';
 import { SentimentTracker } from './SentimentTracker';
 import { MetapromptExecutor } from './MetapromptExecutor';
+import { feedbackTraceMessage, type NormalizedUserFeedback } from './userFeedback';
 
 const DEFAULT_MAX_CONVERSATION_HISTORY_TURNS = 20;
 const DEFAULT_SELF_REFLECTION_INTERVAL_TURNS = 5;
@@ -362,6 +363,46 @@ export class GMI implements IGMI {
   /** @inheritdoc */
   public getCognitiveMemoryManager(): ICognitiveMemoryManager | undefined {
     return this.cognitiveMemory;
+  }
+
+  /**
+   * Records user feedback on this instance. Adds a reasoning-trace entry
+   * (WARNING for negative feedback, DEBUG otherwise) and, when cognitive memory
+   * is configured, encodes the feedback as an episodic memory of the user. A
+   * correction is also encoded as a semantic memory so later turns can recall
+   * it. Memory failures are traced by the bridge and never thrown.
+   *
+   * @param feedback - Normalized feedback plus the id of the user who sent it.
+   */
+  public async recordUserFeedback(feedback: NormalizedUserFeedback & { userId: string }): Promise<void> {
+    const { userId, polarity, score, text, correctedContent, targetMessageId, tags } = feedback;
+    this.addTraceEntry(
+      polarity === 'negative' ? ReasoningEntryType.WARNING : ReasoningEntryType.DEBUG,
+      feedbackTraceMessage(polarity),
+      { userId, polarity, score, text, correctedContent, targetMessageId, tags },
+    );
+
+    // An empty user id falls back to the bridge's default scope (the current user).
+    const scopeId = typeof userId === 'string' && userId.trim() ? userId.trim() : undefined;
+    const scoreLabel = score !== undefined ? `, score ${score}` : '';
+    await this.memoryBridge?.encode(`User feedback (${polarity}${scoreLabel})${text ? `: ${text}` : ''}`, {
+      type: 'episodic',
+      sourceType: 'user_statement',
+      role: 'user',
+      scopeId,
+      tags: ['user_feedback', `feedback_${polarity}`, ...(tags ?? [])],
+    });
+
+    if (correctedContent) {
+      const target = targetMessageId ? ` for message ${targetMessageId}` : '';
+      await this.memoryBridge?.encode(`User correction${target}: ${correctedContent}`, {
+        type: 'semantic',
+        sourceType: 'user_statement',
+        role: 'user',
+        scopeId,
+        tags: ['user_feedback', 'user_correction'],
+      });
+    }
   }
 
   /**

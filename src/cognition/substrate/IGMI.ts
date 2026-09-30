@@ -11,6 +11,7 @@ import { IWorkingMemory } from './memory/IWorkingMemory';
 import { IPromptEngine } from '../../core/llm/IPromptEngine';
 import { IRetrievalAugmentor } from '../rag/IRetrievalAugmentor';
 import type { ConversationMessage } from '../../core/conversation/ConversationMessage';
+import type { NormalizedUserFeedback } from './userFeedback';
 // Assuming AIModelProviderManager is correctly exported from this path
 import { AIModelProviderManager } from '../../core/llm/providers/AIModelProviderManager';
 import { IUtilityAI } from '../nlp/ai_utilities/IUtilityAI';
@@ -564,6 +565,15 @@ export interface IGMI {
     },
   ): void;
 
+  /**
+   * Records user feedback on this instance's session: a reasoning-trace entry
+   * and, when cognitive memory is configured, memories scoped to the user.
+   * GMIManager calls it with feedback normalized by `normalizeUserFeedback`.
+   * Optional so that custom IGMI implementations keep compiling.
+   *
+   * @param feedback - Normalized feedback plus the id of the user who sent it.
+   */
+  recordUserFeedback?(feedback: NormalizedUserFeedback & { userId: string }): Promise<void>;
 
   getReasoningTrace(): Readonly<ReasoningTrace>;
   getWorkingMemorySnapshot(): Promise<Record<string, any>>;
