@@ -18,7 +18,10 @@ import {
   buildPolicyAwareFallbackChain,
   createPlan,
   fallbackHopOverrides,
+  addModelUsage,
+  hasBillableUsage,
   isRetryableError,
+  usageOfError,
   resolveChainOfThought,
   type GenerateTextOptions,
   type GenerationHookContext,
@@ -45,6 +48,47 @@ async function recordAgentOSUsageLazy(
 ): Promise<boolean> {
   const { recordAgentOSUsage } = await import('./runtime/usageLedger.js');
   return recordAgentOSUsage(input);
+}
+
+/** Adds one {@link TokenUsage} to another; optional counters add when present. */
+function addTokenUsage(target: TokenUsage, add: TokenUsage): void {
+  target.promptTokens += add.promptTokens;
+  target.completionTokens += add.completionTokens;
+  target.totalTokens += add.totalTokens;
+  if (add.costUSD !== undefined) target.costUSD = (target.costUSD ?? 0) + add.costUSD;
+  if (add.cacheReadTokens !== undefined) target.cacheReadTokens = (target.cacheReadTokens ?? 0) + add.cacheReadTokens;
+  if (add.cacheCreationTokens !== undefined) {
+    target.cacheCreationTokens = (target.cacheCreationTokens ?? 0) + add.cacheCreationTokens;
+  }
+  if (add.inclusiveInputTokens !== undefined) {
+    target.inclusiveInputTokens = (target.inclusiveInputTokens ?? 0) + add.inclusiveInputTokens;
+  }
+}
+
+/**
+ * The part of a provider's cumulative usage report (`ModelUsage`) not yet
+ * counted, as {@link TokenUsage}: each counter less what `counted` already
+ * holds, never below zero.
+ */
+function usageBeyond(report: unknown, counted: TokenUsage): TokenUsage | undefined {
+  if (!report || typeof report !== 'object') return undefined;
+  const total: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+  addModelUsage(total, report);
+  const less = (x: number | undefined, y: number | undefined): number | undefined =>
+    x === undefined ? undefined : Math.max(0, x - (y ?? 0));
+  return {
+    promptTokens: less(total.promptTokens, counted.promptTokens) ?? 0,
+    completionTokens: less(total.completionTokens, counted.completionTokens) ?? 0,
+    totalTokens: less(total.totalTokens, counted.totalTokens) ?? 0,
+    ...(total.costUSD !== undefined ? { costUSD: less(total.costUSD, counted.costUSD) } : {}),
+    ...(total.cacheReadTokens !== undefined ? { cacheReadTokens: less(total.cacheReadTokens, counted.cacheReadTokens) } : {}),
+    ...(total.cacheCreationTokens !== undefined
+      ? { cacheCreationTokens: less(total.cacheCreationTokens, counted.cacheCreationTokens) }
+      : {}),
+    ...(total.inclusiveInputTokens !== undefined
+      ? { inclusiveInputTokens: less(total.inclusiveInputTokens, counted.inclusiveInputTokens) }
+      : {}),
+  };
 }
 
 /**
@@ -320,6 +364,9 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
     const startedAt = Date.now();
     const rootSpan = startAgentOSSpan('agentos.api.stream_text');
     const usage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+    // Usage the current step's final chunks reported so far, so a refusal
+    // that reports the step's cumulative usage is not counted twice.
+    let stepUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
     let finalText = '';
     let metricStatus: 'ok' | 'error' = 'ok';
     // True when a provider-fallback leg served this stream. The recursive
@@ -330,6 +377,9 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
     // duplicate re-billed the leg's folded usage under the dead primary as
     // unstamped primary traffic (the 2026-07-20..26 misattribution shape).
     let fallbackServedStream = false;
+    // What the failed attempt consumed before a fallback leg took over. The
+    // leg meters itself, so this is what the outer stream meters then.
+    let attemptUsage: TokenUsage | undefined;
     let recordedProviderId: string | undefined;
     let recordedModelId: string | undefined;
     // Raw provider finish reason of the most recent step's final chunk.
@@ -592,10 +642,12 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
                 : {}),
             } as any);
             // Aggregate the COMPLETE normalized usage from every shim
-            // roundtrip (spec batch-1 review fold). totalTokens still flows
-            // via loopResult below — NOT accumulated here, or it would
-            // double count.
+            // roundtrip (spec batch-1 review fold) as each call returns, so
+            // a stream that fails on a later round still reports what its
+            // earlier rounds consumed. The loop's own {totalTokens} sum is
+            // left unused, or it would count twice.
             if (r.usage) {
+              if (typeof r.usage.totalTokens === 'number') usage.totalTokens += r.usage.totalTokens;
               if (typeof r.usage.promptTokens === 'number') usage.promptTokens += r.usage.promptTokens;
               if (typeof r.usage.completionTokens === 'number') usage.completionTokens += r.usage.completionTokens;
               if (typeof r.usage.costUSD === 'number') usage.costUSD = (usage.costUSD ?? 0) + r.usage.costUSD;
@@ -618,7 +670,6 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
             };
           },
         });
-        usage.totalTokens = (usage.totalTokens ?? 0) + loopResult.totalTokens;
         finalText = loopResult.text;
         const shimToolCalls: ToolCallRecord[] = loopResult.toolCalls.map((c) => ({
           name: c.name,
@@ -642,6 +693,7 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
       let streamedAnyText = false;
       try {
       for (let step = 0; step < maxSteps; step++) {
+        stepUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
         // --- onBeforeGeneration hook ---
         let effectiveMessages = messages;
         if (opts.onBeforeGeneration) {
@@ -778,6 +830,7 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
             }
 
             if (chunk.isFinal && chunk.usage) {
+              addModelUsage(stepUsage, chunk.usage);
               usage.promptTokens += chunk.usage.promptTokens ?? 0;
               usage.completionTokens += chunk.usage.completionTokens ?? 0;
               usage.totalTokens += chunk.usage.totalTokens ?? 0;
@@ -1106,6 +1159,13 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
       }
     } catch (err: any) {
       const error = err instanceof Error ? err: new Error(String(err));
+      // A step the provider ended with usage attached (a refused turn) was
+      // billed; the thrown error replaced the final chunk that reports it.
+      // That usage is the request's running total, so what the step's
+      // earlier final chunks already reported is left out.
+      const unreported = usageBeyond(usageOfError(err), stepUsage);
+      if (unreported) addTokenUsage(usage, unreported);
+      attemptUsage = { ...usage };
 
       // Record the failure on the provider-health registry. Synthetic
       // circuit-open errors are skipped because they're already a
@@ -1351,7 +1411,8 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
         await recordAgentOSUsageLazy({
           providerId: recordedProviderId,
           modelId: recordedModelId,
-          usage,
+          // A fallback leg recorded its own usage; this row is the attempt's.
+          usage: fallbackServedStream && attemptUsage ? attemptUsage : usage,
           options: {
             ...opts.usageLedger,
             source: opts.usageLedger?.source ?? 'streamText',
@@ -1364,7 +1425,7 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
         durationMs: Date.now() - startedAt,
         status: metricStatus,
         ...(firstPartAt !== undefined ? { ttfbMs: firstPartAt - startedAt } : {}),
-        usage: toTurnMetricUsage(usage),
+        usage: toTurnMetricUsage(fallbackServedStream && attemptUsage ? attemptUsage : usage),
       });
       // 2026-05-29 — fire the global LLM usage observer with the
       // finalized stream usage. Same hook generateText fires; hosts
@@ -1374,17 +1435,26 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
       // registered.
       // One usage event per served answer:
       // - fallback-served: the recursive leg already fired a correctly
-      //   attributed event — never fire the outer aggregate. (Primary-side
-      //   partial usage is not lost by this: providers report usage on the
-      //   final chunk, so a thrown-over primary has accrued none.)
+      //   attributed event — never fire the outer aggregate. The failed
+      //   attempt gets its own event only when it was billed: providers
+      //   report usage on the final chunk, so a thrown-over primary has
+      //   usually accrued none, but a refusal carries its usage on the error.
       // - error terminals: fire ONLY when the stream accrued real billable
       //   usage (tokens metered before a later failure) — suppressing those
       //   left real spend unmetered; zero-usage failures stay silent.
-      const accruedBillableUsage =
-        usage.promptTokens > 0 ||
-        usage.completionTokens > 0 ||
-        (usage.cacheReadTokens ?? 0) > 0 ||
-        (usage.cacheCreationTokens ?? 0) > 0;
+      const accruedBillableUsage = hasBillableUsage(usage);
+      if (fallbackServedStream && attemptUsage && hasBillableUsage(attemptUsage)) {
+        fireLlmUsageObserver({
+          provider: recordedProviderId ?? '',
+          model: recordedModelId ?? '',
+          usage: attemptUsage,
+          source: opts.source,
+          ...(opts.__fallbackDepth ? { fallbackDepth: opts.__fallbackDepth } : {}),
+          finishReason: 'error',
+          surface: 'streamText',
+          durationMs: Date.now() - startedAt,
+        });
+      }
       if (!fallbackServedStream && (metricStatus !== 'error' || accruedBillableUsage)) {
         fireLlmUsageObserver({
           provider: recordedProviderId ?? '',

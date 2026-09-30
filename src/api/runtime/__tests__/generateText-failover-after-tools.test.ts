@@ -29,6 +29,7 @@ vi.mock('../../model.js', () => ({
 }));
 
 import { generateText } from '../../generateText.js';
+import { setGlobalLlmObserver, type LlmUsageEvent } from '../../observers.js';
 import { globalLLMProviderHealth } from '../../../core/safety/LLMProviderHealthRegistry.js';
 
 const sendEmail = {
@@ -235,6 +236,37 @@ describe('generateText failover after a tool ran', () => {
 
     const legOptions = (hoisted.generateCompletion.mock.calls[2] as unknown[])[2] as { thinking?: unknown };
     expect(legOptions.thinking).toBe(false);
+  });
+
+  it('reports the tokens a prompt-shim round consumed when a later call fails', async () => {
+    const events: LlmUsageEvent[] = [];
+    setGlobalLlmObserver((event) => {
+      events.push(event);
+    });
+    try {
+      hoisted.generateCompletion
+        .mockResolvedValueOnce(
+          textStep('gpt-4.1', '<tool_call>{"name":"send_email","arguments":{"to":"sam@example.com"}}</tool_call>'),
+        )
+        .mockRejectedValueOnce(timeout());
+
+      await expect(
+        generateText({
+          provider: 'openai',
+          model: 'gpt-4.1',
+          prompt: 'Email Sam.',
+          tools: [sendEmail] as never,
+          toolMode: 'prompt',
+          maxSteps: 5,
+          fallbackProviders: [],
+        }),
+      ).rejects.toMatchObject({ code: 'REQUEST_TIMEOUT' });
+
+      // The completed round's 10 tokens, metered once as the failed attempt.
+      expect(events.map((e) => [e.finishReason, e.usage.totalTokens])).toEqual([['error', 10]]);
+    } finally {
+      setGlobalLlmObserver(null);
+    }
   });
 
   it('surfaces the error instead of failing over once a prompt-shim tool ran', async () => {

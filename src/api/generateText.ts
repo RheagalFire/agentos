@@ -1188,6 +1188,73 @@ function markToolsRan(error: unknown): unknown {
   return target;
 }
 
+/**
+ * Adds a provider's usage report (`ModelUsage`) to a call's running
+ * {@link TokenUsage}, as each completed step is added.
+ *
+ * @internal Shared with streamText.
+ */
+export function addModelUsage(target: TokenUsage, usage: unknown): void {
+  if (!usage || typeof usage !== 'object') return;
+  const u = usage as Record<string, unknown>;
+  const num = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  target.promptTokens += num(u.promptTokens) ?? 0;
+  target.completionTokens += num(u.completionTokens) ?? 0;
+  target.totalTokens += num(u.totalTokens) ?? 0;
+  const cost = num(u.costUSD);
+  if (cost !== undefined) target.costUSD = (target.costUSD ?? 0) + cost;
+  const cacheRead = num(u.cacheReadInputTokens);
+  if (cacheRead !== undefined) target.cacheReadTokens = (target.cacheReadTokens ?? 0) + cacheRead;
+  const cacheWrite = num(u.cacheCreationInputTokens);
+  if (cacheWrite !== undefined) target.cacheCreationTokens = (target.cacheCreationTokens ?? 0) + cacheWrite;
+  const inclusive = num(u.inclusiveInputTokens);
+  if (inclusive !== undefined) target.inclusiveInputTokens = (target.inclusiveInputTokens ?? 0) + inclusive;
+}
+
+/**
+ * The usage a provider error reports for the request it ended, such as the
+ * billed tokens of a refused turn (`details.usage`).
+ *
+ * @internal Shared with streamText.
+ */
+export function usageOfError(error: unknown): unknown {
+  return (error as { details?: { usage?: unknown } } | null | undefined)?.details?.usage;
+}
+
+/**
+ * Whether a usage report shows billable consumption.
+ *
+ * @internal Shared with streamText.
+ */
+export function hasBillableUsage(usage: TokenUsage): boolean {
+  return (
+    usage.promptTokens > 0 ||
+    usage.completionTokens > 0 ||
+    (usage.cacheReadTokens ?? 0) > 0 ||
+    (usage.cacheCreationTokens ?? 0) > 0
+  );
+}
+
+/** The sum of two usage reports; an optional counter stays absent when neither has it. */
+function sumTokenUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
+  const optional = (x: number | undefined, y: number | undefined): number | undefined =>
+    x === undefined && y === undefined ? undefined : (x ?? 0) + (y ?? 0);
+  const costUSD = optional(a.costUSD, b.costUSD);
+  const inclusiveInputTokens = optional(a.inclusiveInputTokens, b.inclusiveInputTokens);
+  const cacheReadTokens = optional(a.cacheReadTokens, b.cacheReadTokens);
+  const cacheCreationTokens = optional(a.cacheCreationTokens, b.cacheCreationTokens);
+  return {
+    promptTokens: a.promptTokens + b.promptTokens,
+    completionTokens: a.completionTokens + b.completionTokens,
+    totalTokens: a.totalTokens + b.totalTokens,
+    ...(costUSD !== undefined ? { costUSD } : {}),
+    ...(inclusiveInputTokens !== undefined ? { inclusiveInputTokens } : {}),
+    ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+    ...(cacheCreationTokens !== undefined ? { cacheCreationTokens } : {}),
+  };
+}
+
 /** Whether `error` was marked by {@link markToolsRan}. */
 function toolsRanBefore(error: unknown): boolean {
   return (
@@ -1603,6 +1670,10 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
   // What this attempt did that a failover must not repeat. Written inside
   // the span callback and read by the fallback walk below, so it lives on an
   // object rather than in narrowed locals.
+  // What this attempt consumed, planning and completed steps included. It
+  // lives outside the span callback so a failed attempt still reports the
+  // tokens it was billed for.
+  const attemptUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
   const toolProgress: {
     // Native tool rounds this attempt completed. A failover continues the
     // conversation from them instead of restarting the call, which would
@@ -1786,7 +1857,7 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
          : undefined;
 
       const allToolCalls: ToolCallRecord[] = [];
-      const totalUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+      const totalUsage = attemptUsage;
       // Provider-reported model id of the final step (spec batch-1 C1);
       // additive — the public `model` field keeps the resolved requested id.
       let lastResponseModelId: string | undefined;
@@ -1901,12 +1972,12 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
               ...(opts.requestTimeout !== undefined ? { requestTimeout: opts.requestTimeout } : {}),
             } as any);
             // Aggregate the COMPLETE normalized usage from every shim
-            // roundtrip (spec batch-1 review fold): the thin {totalTokens}
-            // loop contract stays for the GMI helper (totalTokens flows via
-            // loopResult below — NOT accumulated here, or it would double
-            // count), while all richer counters land on totalUsage and the
-            // final response identity is captured for telemetry.
+            // roundtrip (spec batch-1 review fold) as each call returns, so
+            // an attempt that fails on a later round still reports what its
+            // earlier rounds consumed. The loop's own {totalTokens} sum is
+            // left unused, or it would count twice.
             if (r.usage) {
+              if (typeof r.usage.totalTokens === 'number') totalUsage.totalTokens += r.usage.totalTokens;
               if (typeof r.usage.promptTokens === 'number') totalUsage.promptTokens += r.usage.promptTokens;
               if (typeof r.usage.completionTokens === 'number') totalUsage.completionTokens += r.usage.completionTokens;
               if (typeof r.usage.costUSD === 'number') totalUsage.costUSD = (totalUsage.costUSD ?? 0) + r.usage.costUSD;
@@ -1929,10 +2000,7 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
             };
           },
         });
-        const shimUsage: TokenUsage = {
-          ...totalUsage,
-          totalTokens: (totalUsage.totalTokens ?? 0) + loopResult.totalTokens,
-        };
+        const shimUsage: TokenUsage = { ...totalUsage };
         metricUsage = shimUsage;
         // Dual-emit the same root-span attribute pairs as the native
         // terminals below — the shim early-return is a first-class chat
@@ -2486,8 +2554,25 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
     if (metricProviderId && !(error instanceof LLMProviderCircuitOpenError)) {
       globalLLMProviderHealth.recordFailure(metricProviderId, error);
     }
-    // Capture the failed primary for the fallback trail before the loop below
-    // reassigns metricProviderId / metricModelId to the winning fallback.
+    // The failed attempt is billed for its completed steps and for a step
+    // the provider ended with usage attached (a refused turn). It is metered
+    // here, once: this call's ledger row and a usage event of its own; a
+    // fallback leg meters itself.
+    addModelUsage(attemptUsage, usageOfError(error));
+    metricUsage = attemptUsage;
+    if (hasBillableUsage(attemptUsage)) {
+      fireLlmUsageObserver({
+        provider: metricProviderId ?? 'unknown',
+        model: metricModelId ?? 'unknown',
+        usage: { ...attemptUsage },
+        source: opts.source,
+        ...(opts.__fallbackDepth ? { fallbackDepth: opts.__fallbackDepth } : {}),
+        finishReason: 'error',
+        surface: 'generateText',
+        durationMs: Date.now() - rootStartedAt,
+      });
+    }
+    // The failed primary heads the fallback trail.
     const primaryProviderId = metricProviderId;
     const primaryModelId = metricModelId;
     const fallbackHops: FallbackSignal['hops'] = [
@@ -2641,9 +2726,6 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
             attempt,
           });
           metricStatus = 'ok';
-          metricUsage = fallbackResult.usage;
-          metricProviderId = fallbackResult.provider;
-          metricModelId = fallbackResult.model;
           fallbackHops.push(
             ...(fallbackResult.fallback?.hops ?? [
               { provider: fallbackResult.provider, model: fallbackResult.model, ok: true },
@@ -2651,6 +2733,8 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
           );
           return {
             ...fallbackResult,
+            // The call's usage covers the failed attempt and the leg.
+            usage: sumTokenUsage(attemptUsage, fallbackResult.usage),
             ...(toolProgress.completedToolRounds
               ? { toolCalls: [...toolProgress.completedToolRounds.toolCalls, ...fallbackResult.toolCalls] }
               : {}),
