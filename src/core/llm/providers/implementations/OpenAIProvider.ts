@@ -372,6 +372,49 @@ export function openAiReasoningContextWindow(modelId: string): number {
 }
 
 /**
+ * Prompt size, in input tokens, above which OpenAI bills a call on a
+ * long-context model at the long-context rates. The pricing page splits its
+ * flagship table into "<=272K" and ">272K" input tokens, and the comparison is
+ * strict: a prompt of exactly 272,000 tokens bills at the standard rates. The
+ * count includes cached tokens, and output size never triggers the tier.
+ */
+export const OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS = 272_000;
+
+/**
+ * Factor OpenAI applies to the input rate of a long-context call. The cached
+ * input and cache write rates double as well.
+ */
+export const OPENAI_LONG_CONTEXT_INPUT_MULTIPLIER = 2;
+
+/** Factor OpenAI applies to the output rate of a long-context call. */
+export const OPENAI_LONG_CONTEXT_OUTPUT_MULTIPLIER = 1.5;
+
+/**
+ * Whether OpenAI bills `modelId` at the long-context rates when a prompt
+ * exceeds {@link OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS} input tokens. Such a
+ * call bills its whole input at {@link OPENAI_LONG_CONTEXT_INPUT_MULTIPLIER}
+ * times the input rate and its whole output at
+ * {@link OPENAI_LONG_CONTEXT_OUTPUT_MULTIPLIER} times the output rate.
+ *
+ * OpenAI states the rule for its models with a 1.05M context window, so this
+ * reuses {@link openAiReasoningContextWindow}. That covers the GPT-6 family,
+ * the GPT-5.6 family except `gpt-5.6-cyber`, `gpt-5.5`, `gpt-5.5-pro`,
+ * `gpt-5.4` and `gpt-5.4-pro`, bare or dated. Everything else bills flat at
+ * every prompt size: the GPT-5 models with a smaller window (`gpt-5.6-cyber`,
+ * which the pricing page lists without a long-context rate, `gpt-5.4-mini` /
+ * `-nano`, `gpt-5.3` and older, and the chat-latest snapshots), the o-series,
+ * and the pre-GPT-5 models, `gpt-4.1` included despite its 1M window. Checked
+ * against developers.openai.com/api/docs/pricing and the model pages on
+ * 2026-09-30.
+ *
+ * @param modelId Model id as requested or as echoed by the API.
+ * @returns `true` when a prompt above the threshold bills at the long-context rates.
+ */
+export function openAiHasLongContextPricing(modelId: string): boolean {
+  return isOpenAIReasoningModel(modelId) && openAiReasoningContextWindow(modelId) === 1050000;
+}
+
+/**
  * Whether OpenAI serves `modelId` only through the Responses API. OpenAI lists
  * the `-pro` tiers, the codex models, `gpt-5.6-cyber` and the deep-research
  * models as Responses-only. OpenAIProvider sends a request to /v1/responses
@@ -591,9 +634,11 @@ export class OpenAIProvider implements IProvider {
   // on 2026-04-16. Values are standard (non-batch, non-regional) rates.
   // Input: cost for prompt tokens. Output: cost for completion tokens.
   // For embedding models, 'input' is total tokens.
-  // Rates are flat per model. OpenAI bills prompts above 272,000 input tokens
-  // on the 1.05M-context models at 2x input and 1.5x output for the whole
-  // request, which this table does not model, so long-context spend reads low.
+  // A prompt of more than 272,000 input tokens on a 1.05M-context model bills
+  // the whole call at 2x input and 1.5x output
+  // (developers.openai.com/api/docs/pricing, 2026-09-30). Rows hold the rates
+  // below that threshold, and calculateCost applies the tier from
+  // openAiHasLongContextPricing.
   private readonly modelPricing: Record<string, { input: number; output: number }> = {
     // GPT-6 family (current flagship, Sep 2026). Astra $10/$50, Sol $2/$10,
     // Luna $0.10/$0.50 per 1M, from developers.openai.com/api/docs/models on
@@ -1722,7 +1767,20 @@ export class OpenAIProvider implements IProvider {
   }
 
   /**
-   * Calculates the estimated cost of an API call.
+   * Estimated USD cost of one API call, from the per-1K rates in
+   * `modelPricing`. When the model has long-context pricing
+   * ({@link openAiHasLongContextPricing}) and the prompt exceeds
+   * {@link OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS} input tokens, the whole call
+   * bills at the long-context rates: every input token at 2x and every output
+   * token at 1.5x.
+   *
+   * @param promptTokens Input tokens, cached tokens included. OpenAI compares
+   *   this same count against the long-context threshold.
+   * @param completionTokens Output tokens, reasoning tokens included.
+   * @param modelId Model id as echoed by the API; a dated snapshot without its
+   *   own row resolves to its base row.
+   * @param isEmbedding Prices `promptTokens` alone at the embedding rate.
+   * @returns Cost in USD, or undefined when the model has no price row.
    * @private
    */
   private calculateCost(
@@ -1737,9 +1795,13 @@ export class OpenAIProvider implements IProvider {
     if (isEmbedding) {
       return (promptTokens / 1000) * pricing.input;
     }
-    const inputCost = (promptTokens / 1000) * pricing.input;
-    const outputCost = (completionTokens / 1000) * pricing.output;
-    return inputCost + outputCost;
+    // A long prompt moves the output onto the higher rate too, because
+    // OpenAI prices the full request at the long-context tier.
+    const isLong =
+      promptTokens > OPENAI_LONG_CONTEXT_THRESHOLD_TOKENS && openAiHasLongContextPricing(modelId);
+    const inputRate = isLong ? pricing.input * OPENAI_LONG_CONTEXT_INPUT_MULTIPLIER : pricing.input;
+    const outputRate = isLong ? pricing.output * OPENAI_LONG_CONTEXT_OUTPUT_MULTIPLIER : pricing.output;
+    return (promptTokens / 1000) * inputRate + (completionTokens / 1000) * outputRate;
   }
 
   /**
