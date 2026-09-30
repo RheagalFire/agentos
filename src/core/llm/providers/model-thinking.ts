@@ -28,10 +28,13 @@
  * `thinking` parameter.
  *
  * Allow-by-explicit-family: only the reasoning-default Opus 4.7 / 4.8
- * line, Sonnet 5, and Fable 5 (and their dated variants like
+ * line, Opus 5, Sonnet 5, and Fable 5 (and their dated variants like
  * `claude-opus-4-8-20260501`) accept it; every other Claude model ignores
- * or rejects it. Future reasoning-first siblings get added to the regex as
- * Anthropic releases them, in lockstep with `modelSupportsTemperature`.
+ * or rejects it. Opus 5.5, Sonnet 5.5 and Fable 5.1 match the `opus-5`,
+ * `sonnet-5` and `fable-5` alternatives on purpose, because `\b` matches at
+ * the hyphen before their trailing version digit. Future reasoning-first
+ * siblings get added to the regex as Anthropic releases them, in lockstep
+ * with `modelSupportsTemperature`.
  *
  * @param modelId Anthropic-side model id.
  * @returns `true` when Anthropic accepts a `thinking` block for this model.

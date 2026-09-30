@@ -132,11 +132,13 @@ export interface AnthropicProviderConfig {
  * Whether the given Claude model id accepts the `temperature` parameter.
  *
  * Anthropic deprecated `temperature` on reasoning-default models. Opus 4.7,
- * Opus 4.8, Opus 5, Opus 5.5, Sonnet 5, Fable 5 and Fable 5.1 reject requests
- * that include it with HTTP 400 "`temperature` is deprecated for this model."
- * Opus 5, Opus 5.5 and Fable 5.1 were live-probed on 2026-09-29. Opus 5.5 and
- * Fable 5.1 match the existing `opus-5` and `fable-5` alternatives because
- * `\b` matches at the hyphen before their trailing version digit.
+ * Opus 4.8, Opus 5, Opus 5.5, Sonnet 5, Sonnet 5.5, Fable 5 and Fable 5.1
+ * reject requests that include it with HTTP 400 "`temperature` is deprecated
+ * for this model." Opus 5, Opus 5.5 and Fable 5.1 were live-probed on
+ * 2026-09-29 and Sonnet 5.5 on 2026-09-30. Opus 5.5, Sonnet 5.5 and Fable 5.1
+ * match the existing `opus-5`, `sonnet-5` and `fable-5` alternatives on
+ * purpose, because `\b` matches at the hyphen before their trailing version
+ * digit.
  * Every earlier Claude model (Opus ≤ 4.6, Sonnet 4.6 and earlier, Haiku) still accepts it.
  * The same family also rejects `top_p` / `top_k`, so {@link buildRequestPayload}
  * gates `top_p` on this predicate too.
@@ -154,8 +156,8 @@ export interface AnthropicProviderConfig {
  */
 export function modelSupportsTemperature(modelId: string): boolean {
   // Reasoning-default models that reject `temperature` (and `top_p` / `top_k`):
-  // Claude Opus 4.7 / 4.8 / 5 / 5.5, Sonnet 5, Fable 5 / 5.1, and any dated
-  // variant. Future reasoning-first siblings get added here as Anthropic
+  // Claude Opus 4.7 / 4.8 / 5 / 5.5, Sonnet 5 / 5.5, Fable 5 / 5.1, and any
+  // dated variant. Future reasoning-first siblings get added here as Anthropic
   // releases them, in lockstep with modelSupportsThinking.
   return !/^claude-(opus-4-(7|8)|opus-5|sonnet-5|fable-5)\b/i.test(modelId);
 }
@@ -187,6 +189,18 @@ interface AnthropicContentBlock {
   source?: { type: 'base64'; media_type: string; data: string };
 }
 
+/**
+ * Prompt-cache writes on one response, split by cache TTL: the
+ * `usage.cache_creation` object of the Messages API. The two counts add up to
+ * `cache_creation_input_tokens`.
+ */
+export interface AnthropicCacheCreationBreakdown {
+  /** Tokens written with the default 5-minute TTL. */
+  ephemeral_5m_input_tokens?: number;
+  /** Tokens written with the 1-hour TTL (`cache_control.ttl: '1h'`). */
+  ephemeral_1h_input_tokens?: number;
+}
+
 /** The Anthropic Messages API response shape. */
 interface AnthropicMessagesResponse {
   id: string;
@@ -201,6 +215,11 @@ interface AnthropicMessagesResponse {
     output_tokens: number;
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
+    /**
+     * Split of `cache_creation_input_tokens` by cache TTL. 5-minute writes
+     * bill at 1.25x the input price and 1-hour writes at 2x.
+     */
+    cache_creation?: AnthropicCacheCreationBreakdown | null;
   };
   /**
    * Cache-diagnostics verdict (beta `cache-diagnosis-2026-04-07`). Returned
@@ -320,17 +339,22 @@ type AnthropicStreamEvent =
 /**
  * Static catalog of well-known Anthropic models and their metadata.
  *
- * Pricing verified against anthropic.com/pricing on 2026-04-16 (USD per 1M tokens).
- * Update when Anthropic publishes new rate cards.
+ * Prices are USD per 1M tokens, verified against Anthropic's pricing page and
+ * model pages on 2026-09-30. A cache hit costs 0.1x the input price except
+ * where a row sets `pricePer1MTokensCacheRead`: Opus 5.5 (0.05x) and Fable 5.1
+ * (0.025x) differ, and Fable 5 states its standard 0.1x rate explicitly so
+ * the Fable 5.1 rate is not mistaken for it. Cache writes cost 1.25x the input
+ * price at the 5-minute TTL and 2x at the 1-hour TTL on every model; see
+ * {@link estimateAnthropicCostUSD}.
  *
  * `outputTokenLimit` is the model's real max output ceiling, surfaced via
- * getModelInfo for callers that want to size requests. It is informational —
- * NOT the per-request default: when a caller omits `maxTokens`, the request
- * falls back to `config.defaultMaxTokens`, not this value — but a per-call
- * `maxTokens` IS clamped to it via {@link clampAnthropicMaxTokens}. Anthropic
- * specs: Fable 5 = 128K output / 1M context, Opus 5 / 4.x = 128K output / 1M
- * context, Sonnet 5 / 4.6 = 128K output / 1M context, Sonnet 4.5 = 64K / 200K,
- * Haiku 4.5 = 64K output / 200K.
+ * getModelInfo for callers that want to size requests. It is informational,
+ * not the per-request default: when a caller omits `maxTokens`, the request
+ * falls back to `config.defaultMaxTokens`, but a per-call `maxTokens` is
+ * clamped to it via {@link clampAnthropicMaxTokens}. Anthropic's limits:
+ * Opus 5.5, Opus 5, Opus 4.6-4.8, Fable 5.1, Fable 5, Sonnet 5.5, Sonnet 5 and
+ * Sonnet 4.6 take 128K output with a 1M context; Opus 4.5, Sonnet 4.5 and
+ * Haiku 4.5 take 64K output with a 200K context.
  */
 const ANTHROPIC_MODELS: ModelInfo[] = [
   {
@@ -343,6 +367,8 @@ const ANTHROPIC_MODELS: ModelInfo[] = [
     outputTokenLimit: 128000,
     pricePer1MTokensInput: 4,
     pricePer1MTokensOutput: 20,
+    // Cache hits and refreshes bill at 0.05x the input price.
+    pricePer1MTokensCacheRead: 0.2,
     supportsStreaming: true,
     status: 'active',
   },
@@ -356,6 +382,8 @@ const ANTHROPIC_MODELS: ModelInfo[] = [
     outputTokenLimit: 128000,
     pricePer1MTokensInput: 10,
     pricePer1MTokensOutput: 50,
+    // Cache hits and refreshes bill at 0.025x the input price.
+    pricePer1MTokensCacheRead: 0.25,
     supportsStreaming: true,
     status: 'active',
   },
@@ -369,6 +397,8 @@ const ANTHROPIC_MODELS: ModelInfo[] = [
     outputTokenLimit: 128000,
     pricePer1MTokensInput: 10,
     pricePer1MTokensOutput: 50,
+    // The standard 0.1x rate. Fable 5.1's 0.025x does not apply to Fable 5.
+    pricePer1MTokensCacheRead: 1,
     supportsStreaming: true,
     status: 'active',
   },
@@ -425,6 +455,35 @@ const ANTHROPIC_MODELS: ModelInfo[] = [
     status: 'active',
   },
   {
+    // The dated id is the canonical row: the bare alias `claude-opus-4-5`
+    // resolves to it through the prefix fallback in resolveModelCatalogEntry,
+    // as `claude-haiku-4-5` resolves to the dated Haiku row.
+    modelId: 'claude-opus-4-5-20251101',
+    providerId: 'anthropic',
+    displayName: 'Claude Opus 4.5',
+    description: 'Legacy Opus, still served. Superseded by Claude Opus 5.5.',
+    capabilities: ['chat', 'tool_use', 'vision_input'],
+    contextWindowSize: 200000,
+    outputTokenLimit: 64000,
+    pricePer1MTokensInput: 5,
+    pricePer1MTokensOutput: 25,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'claude-sonnet-5-5',
+    providerId: 'anthropic',
+    displayName: 'Claude Sonnet 5.5',
+    description: 'Current Sonnet for everyday coding, agent and enterprise work; adaptive thinking on by default.',
+    capabilities: ['chat', 'tool_use', 'vision_input'],
+    contextWindowSize: 1000000,
+    outputTokenLimit: 128000,
+    pricePer1MTokensInput: 2,
+    pricePer1MTokensOutput: 10,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
     modelId: 'claude-sonnet-5',
     providerId: 'anthropic',
     displayName: 'Claude Sonnet 5',
@@ -432,13 +491,14 @@ const ANTHROPIC_MODELS: ModelInfo[] = [
     capabilities: ['chat', 'tool_use', 'vision_input'],
     contextWindowSize: 1000000,
     outputTokenLimit: 128000,
-    // Sticker rates ($2/$10 intro pricing runs through 2026-08-31 —
-    // meter at sticker so cost rollups stay conservative). Absent from
-    // this table the model priced as costUSD undefined, which turned
-    // the 2026-07-20..26 quota-outage fallback traffic (thousands of
-    // sonnet-5 leg calls/day) into unmetered spend.
-    pricePer1MTokensInput: 3,
-    pricePer1MTokensOutput: 15,
+    // $2/$10 is the standard price: Anthropic kept its launch pricing and
+    // cancelled the increase to $3/$15 scheduled for 2026-09-01 (pricing
+    // page, 2026-09-30). The row must stay in this table: without it the
+    // model prices as costUSD undefined, which turned the 2026-07-20..26
+    // quota-outage fallback traffic (thousands of sonnet-5 leg calls a day)
+    // into unmetered spend.
+    pricePer1MTokensInput: 2,
+    pricePer1MTokensOutput: 10,
     supportsStreaming: true,
     status: 'active',
   },
@@ -538,9 +598,10 @@ export function clampAnthropicMaxTokens(modelId: string, requested: number): num
  * Resolves a caller-supplied model id to its ANTHROPIC_MODELS catalog row.
  * Exact id match wins; otherwise a dated snapshot (`claude-sonnet-5-20260101`)
  * or bare alias is matched by prefix — the SAME resolution the max-tokens
- * clamp uses, shared so pricing and clamping can never disagree about which
- * row a model id means (estimateCost's exact-only match priced every dated
- * snapshot id as costUSD undefined: unmetered spend).
+ * clamp uses, shared so pricing ({@link estimateAnthropicCostUSD}) and
+ * clamping can never disagree about which row a model id means (an
+ * exact-only match prices every dated snapshot id as costUSD undefined:
+ * unmetered spend).
  *
  * The longest catalog id that prefixes `modelId` wins. Catalog ids nest:
  * `claude-opus-5` is a prefix of `claude-opus-5-5`. A first-match scan makes
@@ -561,12 +622,15 @@ export function resolveAnthropicModelEntry(modelId: string): ModelInfo | undefin
  * @param catalog Model rows to search, in any order.
  * @param modelId Caller-supplied model id, bare or dated.
  * @returns The exact row, else the row with the longest id that prefixes
- *   `modelId`, else the first row whose id starts with `modelId`.
+ *   `modelId`, else the first row whose id starts with `modelId`. An empty id
+ *   resolves to nothing: every catalog id starts with `''`, so the last rule
+ *   would otherwise price a response with no model echo as the first row.
  */
 export function resolveModelCatalogEntry(
   catalog: readonly ModelInfo[],
   modelId: string,
 ): ModelInfo | undefined {
+  if (!modelId) return undefined;
   const exact = catalog.find((m) => m.modelId === modelId);
   if (exact) return exact;
   let longest: ModelInfo | undefined;
@@ -576,6 +640,70 @@ export function resolveModelCatalogEntry(
     }
   }
   return longest ?? catalog.find((m) => m.modelId.startsWith(modelId));
+}
+
+/**
+ * Token counts that decide what one Messages API call costs, under the API's
+ * own `usage` field names.
+ */
+export interface AnthropicUsageForCost {
+  /** Input tokens billed at the full input price (cache reads and writes excluded). */
+  input_tokens: number;
+  /** Output tokens, thinking included. */
+  output_tokens: number;
+  /** Tokens read from the prompt cache. */
+  cache_read_input_tokens?: number;
+  /** Tokens written to the prompt cache, both TTLs together. */
+  cache_creation_input_tokens?: number;
+  /** The same writes split by TTL, when the response reports the split. */
+  cache_creation?: AnthropicCacheCreationBreakdown | null;
+}
+
+/**
+ * Estimates the USD cost of one Anthropic Messages API call from its usage.
+ *
+ * | Tokens | Price |
+ * | --- | --- |
+ * | `input_tokens` | the input price |
+ * | `cache_read_input_tokens` | the row's `pricePer1MTokensCacheRead`, else 0.1x the input price |
+ * | 5-minute cache writes | 1.25x the input price |
+ * | 1-hour cache writes | 2x the input price |
+ * | `output_tokens` | the output price |
+ *
+ * `input_tokens` excludes cached tokens, so the input components add up
+ * without double counting. The 1-hour share of the writes comes from
+ * `cache_creation.ephemeral_1h_input_tokens`: a response without that split
+ * is priced as 5-minute writes only, and a 1-hour count above the write total
+ * is capped at the total.
+ *
+ * @param modelId Model id, bare or dated, resolved with
+ *   {@link resolveAnthropicModelEntry}.
+ * @param usage Token counts from the response.
+ * @returns The cost in USD, or `undefined` when the catalog has no price for
+ *   the model (unknown, empty or unpriced id).
+ */
+export function estimateAnthropicCostUSD(
+  modelId: string,
+  usage: AnthropicUsageForCost,
+): number | undefined {
+  const info = resolveAnthropicModelEntry(modelId);
+  const inputPrice = info?.pricePer1MTokensInput;
+  const outputPrice = info?.pricePer1MTokensOutput;
+  if (!inputPrice || !outputPrice) return undefined;
+  const cacheReadPrice = info?.pricePer1MTokensCacheRead ?? inputPrice * 0.1;
+  const split = usage.cache_creation ?? undefined;
+  const written =
+    usage.cache_creation_input_tokens
+    ?? ((split?.ephemeral_5m_input_tokens ?? 0) + (split?.ephemeral_1h_input_tokens ?? 0));
+  const writtenOneHour = Math.min(Math.max(split?.ephemeral_1h_input_tokens ?? 0, 0), written);
+  // Tokens times USD per 1M tokens: the sum is in millionths of a dollar.
+  const microDollars =
+    usage.input_tokens * inputPrice
+    + (usage.cache_read_input_tokens ?? 0) * cacheReadPrice
+    + (written - writtenOneHour) * inputPrice * 1.25
+    + writtenOneHour * inputPrice * 2
+    + usage.output_tokens * outputPrice;
+  return microDollars / 1_000_000;
 }
 
 // ---------------------------------------------------------------------------
@@ -720,8 +848,8 @@ export class AnthropicProvider implements IProvider {
         payload,
         options.requestTimeout,
       );
-      this.recordCacheLeakSample(modelId, payload, apiResponse);
-      return this.mapResponseToCompletion(apiResponse, structuredOutputName);
+      this.recordCacheLeakSample(modelId, payload, apiResponse, options.cache === false);
+      return this.mapResponseToCompletion(apiResponse, structuredOutputName, modelId);
     }
 
     // Default: ride the SSE path so parseSseStream's idle watchdog bounds
@@ -733,8 +861,8 @@ export class AnthropicProvider implements IProvider {
     // let the caller (or the retry loop below) recover in seconds.
     const payload = this.buildRequestPayload(modelId, messages, options, true);
     const apiResponse = await this.streamMessagesToResponse(payload, options.requestTimeout);
-    this.recordCacheLeakSample(modelId, payload, apiResponse);
-    return this.mapResponseToCompletion(apiResponse, structuredOutputName);
+    this.recordCacheLeakSample(modelId, payload, apiResponse, options.cache === false);
+    return this.mapResponseToCompletion(apiResponse, structuredOutputName, modelId);
   }
 
   /**
@@ -744,12 +872,16 @@ export class AnthropicProvider implements IProvider {
    * 256 chars of the system prompt, read from the just-built payload so it
    * reflects what actually went to the wire. Fail-open by construction.
    *
+   * @param cacheOptOut True when the caller turned caching off for this
+   *   request (`options.cache === false`). Its uncached input is deliberate,
+   *   so the detector does not count it toward the `unmarked` warning.
    * @private
    */
   private recordCacheLeakSample(
     modelId: string,
     payload: Record<string, unknown>,
     apiResponse: Pick<AnthropicMessagesResponse, 'usage'>,
+    cacheOptOut = false,
   ): void {
     try {
       const system = payload.system as
@@ -770,6 +902,7 @@ export class AnthropicProvider implements IProvider {
         uncachedInputTokens: apiResponse.usage?.input_tokens ?? 0,
         cacheReadTokens: apiResponse.usage?.cache_read_input_tokens ?? 0,
         cacheCreationTokens: apiResponse.usage?.cache_creation_input_tokens ?? 0,
+        ...(cacheOptOut ? { cacheOptOut: true } : {}),
       });
     } catch {
       // Telemetry must never break a request.
@@ -892,6 +1025,7 @@ export class AnthropicProvider implements IProvider {
     let outputTokens = 0;
     let cacheCreationTokens: number | undefined;
     let cacheReadTokens: number | undefined;
+    let cacheCreationSplit: AnthropicCacheCreationBreakdown | null | undefined;
     let diagnostics: AnthropicMessagesResponse['diagnostics'];
     let sawMessageDelta = false;
     const blocks = new Map<number, AccumBlock>();
@@ -912,6 +1046,8 @@ export class AnthropicProvider implements IProvider {
           inputTokens = event.message.usage?.input_tokens ?? 0;
           cacheCreationTokens = event.message.usage?.cache_creation_input_tokens;
           cacheReadTokens = event.message.usage?.cache_read_input_tokens;
+          // The 5m/1h split of the cache writes prices the 1h share at 2x.
+          cacheCreationSplit = event.message.usage?.cache_creation;
           // Cache diagnostics ride message_start in streaming responses.
           diagnostics = event.message.diagnostics;
           break;
@@ -1017,6 +1153,7 @@ export class AnthropicProvider implements IProvider {
         output_tokens: outputTokens,
         ...(cacheCreationTokens !== undefined && { cache_creation_input_tokens: cacheCreationTokens }),
         ...(cacheReadTokens !== undefined && { cache_read_input_tokens: cacheReadTokens }),
+        ...(cacheCreationSplit != null && { cache_creation: cacheCreationSplit }),
       },
       ...(diagnostics !== undefined && { diagnostics }),
     };
@@ -1067,6 +1204,8 @@ export class AnthropicProvider implements IProvider {
     let outputTokens = 0;
     let cacheCreationTokens: number | undefined;
     let cacheReadTokens: number | undefined;
+    /** The 5m/1h split of the cache writes, reported on message_start. */
+    let cacheCreationSplit: AnthropicCacheCreationBreakdown | null | undefined;
     /**
      * Cache-diagnostics verdict, delivered ONLY on message_start (no later
      * SSE event repeats it). `undefined` = the API sent none (not opted in);
@@ -1112,6 +1251,7 @@ export class AnthropicProvider implements IProvider {
             // accumulate path at streamToCompletion does the same).
             cacheCreationTokens = event.message.usage?.cache_creation_input_tokens;
             cacheReadTokens = event.message.usage?.cache_read_input_tokens;
+            cacheCreationSplit = event.message.usage?.cache_creation;
             // Cache diagnostics ride message_start in streaming responses
             // (mirrors the streamToCompletion aggregate path).
             streamDiagnostics = event.message.diagnostics;
@@ -1234,14 +1374,14 @@ export class AnthropicProvider implements IProvider {
               // Cache-aware like the non-streaming path: input_tokens
               // excludes cached tokens, so dropping the cache counts here
               // undercosted every streamed turn once automatic caching
-              // landed (reads 0.10x + writes 1.25x are real spend).
-              costUSD: this.estimateCost(
-                inputTokens,
-                outputTokens,
-                modelId,
-                cacheReadTokens,
-                cacheCreationTokens,
-              ),
+              // landed (cache reads and writes are real spend).
+              costUSD: estimateAnthropicCostUSD(modelId, {
+                input_tokens: inputTokens,
+                output_tokens: outputTokens,
+                cache_read_input_tokens: cacheReadTokens,
+                cache_creation_input_tokens: cacheCreationTokens,
+                cache_creation: cacheCreationSplit,
+              }),
               ...(cacheCreationTokens !== undefined && {
                 cacheCreationInputTokens: cacheCreationTokens,
               }),
@@ -1262,18 +1402,23 @@ export class AnthropicProvider implements IProvider {
             // streamed conversation surfaces (narrator, companion) — where
             // the 2026-07 history-caching regressions actually lived — were
             // invisible to the zero-read / unmarked tripwires.
-            this.recordCacheLeakSample(modelId, payload, {
-              usage: {
-                input_tokens: inputTokens,
-                output_tokens: outputTokens,
-                ...(cacheCreationTokens !== undefined && {
-                  cache_creation_input_tokens: cacheCreationTokens,
-                }),
-                ...(cacheReadTokens !== undefined && {
-                  cache_read_input_tokens: cacheReadTokens,
-                }),
+            this.recordCacheLeakSample(
+              modelId,
+              payload,
+              {
+                usage: {
+                  input_tokens: inputTokens,
+                  output_tokens: outputTokens,
+                  ...(cacheCreationTokens !== undefined && {
+                    cache_creation_input_tokens: cacheCreationTokens,
+                  }),
+                  ...(cacheReadTokens !== undefined && {
+                    cache_read_input_tokens: cacheReadTokens,
+                  }),
+                },
               },
-            });
+              options.cache === false,
+            );
 
             yield {
               id: responseId,
@@ -2314,12 +2459,17 @@ export class AnthropicProvider implements IProvider {
    * the stop reason from Anthropic's vocabulary to IProvider conventions.
    *
    * @param {AnthropicMessagesResponse} apiResponse - Raw Anthropic response.
+   * @param structuredOutputName - Name of the forced structured-output tool,
+   *   whose input becomes the message content.
+   * @param requestedModelId - The model the request named. Prices the call
+   *   when the response carries no model echo.
    * @returns {ModelCompletionResponse} Normalized completion response.
    * @private
    */
   private mapResponseToCompletion(
     apiResponse: AnthropicMessagesResponse,
     structuredOutputName?: string,
+    requestedModelId?: string,
   ): ModelCompletionResponse {
     // Collect text content
     const textParts = apiResponse.content
@@ -2378,12 +2528,9 @@ export class AnthropicProvider implements IProvider {
       promptTokens: apiResponse.usage.input_tokens,
       completionTokens: apiResponse.usage.output_tokens,
       totalTokens: apiResponse.usage.input_tokens + apiResponse.usage.output_tokens,
-      costUSD: this.estimateCost(
-        apiResponse.usage.input_tokens,
-        apiResponse.usage.output_tokens,
-        apiResponse.model,
-        apiResponse.usage.cache_read_input_tokens,
-        apiResponse.usage.cache_creation_input_tokens,
+      costUSD: estimateAnthropicCostUSD(
+        apiResponse.model || requestedModelId || '',
+        apiResponse.usage,
       ),
       cacheCreationInputTokens: apiResponse.usage.cache_creation_input_tokens,
       cacheReadInputTokens: apiResponse.usage.cache_read_input_tokens,
@@ -2461,59 +2608,6 @@ export class AnthropicProvider implements IProvider {
         arguments: tc.argsJson || '{}',
       },
     }));
-  }
-
-  /**
-   * Estimates USD cost for a given model and token counts.
-   *
-   * Looks up pricing from the static model catalog. Returns undefined
-   * if the model is not found in the catalog.
-   *
-   * @param {number} inputTokens - Number of input tokens.
-   * @param {number} outputTokens - Number of output tokens.
-   * @param {string} modelId - Model identifier for pricing lookup.
-   * @returns {number | undefined} Estimated cost in USD.
-   * @private
-   */
-  /**
-   * Estimate cost in USD for a completion, including Anthropic's prompt-
-   * caching tier pricing.
-   *
-   * Anthropic billing tiers (as of 2025):
-   *   input_tokens            × 1.00 × base input rate  (non-cached input)
-   *   cache_read_input_tokens × 0.10 × base input rate  (cache hit)
-   *   cache_creation_input_tokens × 1.25 × base input rate  (5-min TTL write)
-   *   output_tokens           × 1.00 × base output rate
-   *
-   * The API's `input_tokens` field already EXCLUDES cached tokens, so we
-   * sum three separate components for total input cost. Previous
-   * implementation used only `input_tokens` × rate, which happened to
-   * be correct for the non-cached portion but hid cache creation cost
-   * and ignored cache read cost entirely — meaning reported costUSD
-   * was always BELOW true billed amount whenever caching was active.
-   *
-   * 1-hour TTL cache-creation rate is 2× the base input rate, not 1.25×.
-   * We can't tell which TTL was used from the response, so we assume
-   * the default 5-minute tier. For long-lived cached contexts the
-   * reported cost will under-estimate by the 0.75× difference on
-   * creation tokens (minor; mostly one-shot at run start).
-   */
-  private estimateCost(
-    inputTokens: number,
-    outputTokens: number,
-    modelId: string,
-    cacheReadTokens?: number,
-    cacheCreationTokens?: number,
-  ): number | undefined {
-    const info = resolveAnthropicModelEntry(modelId);
-    if (!info?.pricePer1MTokensInput || !info?.pricePer1MTokensOutput) return undefined;
-    const inputPrice = info.pricePer1MTokensInput;
-    const outputPrice = info.pricePer1MTokensOutput;
-    const nonCachedInput = (inputTokens / 1_000_000) * inputPrice;
-    const cachedRead = ((cacheReadTokens ?? 0) / 1_000_000) * inputPrice * 0.10;
-    const cachedCreate = ((cacheCreationTokens ?? 0) / 1_000_000) * inputPrice * 1.25;
-    const output = (outputTokens / 1_000_000) * outputPrice;
-    return nonCachedInput + cachedRead + cachedCreate + output;
   }
 
   /**

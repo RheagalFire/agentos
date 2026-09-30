@@ -30,6 +30,17 @@ describe('modelSupportsForcedToolChoice', () => {
     expect(modelSupportsForcedToolChoice('claude-opus-5-20260701')).toBe(true);
   });
 
+  // Sonnet 5.5 returns HTTP 400 on {type:'tool'} and {type:'any'} (probed
+  // 2026-09-30) while Sonnet 5 accepts both, so the same boundary applies.
+  it('denies Claude Sonnet 5.5 and Claude Mythos 5.1 and still allows Claude Sonnet 5', () => {
+    expect(modelSupportsForcedToolChoice('claude-sonnet-5-5')).toBe(false);
+    expect(modelSupportsForcedToolChoice('claude-sonnet-5-5-20261001')).toBe(false);
+    expect(modelSupportsForcedToolChoice('CLAUDE-SONNET-5-5')).toBe(false);
+    expect(modelSupportsForcedToolChoice('claude-mythos-5-1')).toBe(false);
+    expect(modelSupportsForcedToolChoice('claude-sonnet-5')).toBe(true);
+    expect(modelSupportsForcedToolChoice('claude-sonnet-5-20260101')).toBe(true);
+  });
+
   it('allows every other current family', () => {
     for (const id of [
       'claude-sonnet-5',

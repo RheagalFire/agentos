@@ -316,12 +316,16 @@ export ANTHROPIC_API_KEY=sk-ant-...
 |-------|---------|--------|-------------|-------|
 | `claude-opus-5-5` | 1M | Yes | Yes | Recommended starting model ($4/$20 per MTok) |
 | `claude-fable-5-1` | 1M | Yes | Yes | Most capable ($10/$50 per MTok) |
-| `claude-sonnet-5` | 1M | Yes | Yes | Near-Opus coding and agentic work |
+| `claude-sonnet-5-5` | 1M | Yes | Yes | Current Sonnet ($2/$10 per MTok) |
+| `claude-sonnet-5` | 1M | Yes | Yes | Near-Opus coding and agentic work ($2/$10 per MTok) |
 | `claude-opus-5` | 1M | Yes | Yes | Previous Opus ($5/$25 per MTok) |
 | `claude-sonnet-4-6` | 1M | Yes | Yes | Best value |
 | `claude-haiku-4-5-20251001` | 200K | Yes | Yes | Fastest |
+| `claude-opus-4-5-20251101` | 200K | Yes | Yes | Legacy Opus, 64K output ($5/$25 per MTok) |
 
-Reasoning-default models (`claude-opus-5-5`, `claude-fable-5-1`, `claude-opus-5`, `claude-fable-5`, `claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-4-7`) reject `temperature` and `top_p` with HTTP 400; the provider drops both automatically for these models and sends adaptive thinking when a thinking budget is requested. Claude Opus 5.5 and the Fable models also reject a forced `tool_choice`, so the provider sends `auto` for them and structured output uses the prompt-based JSON path. Anthropic retired `claude-opus-4-20250514` and `claude-sonnet-4-20250514` on 2026-06-15.
+Reasoning-default models (`claude-opus-5-5`, `claude-fable-5-1`, `claude-sonnet-5-5`, `claude-opus-5`, `claude-fable-5`, `claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-4-7`) reject `temperature` and `top_p` with HTTP 400; the provider drops both automatically for these models and sends adaptive thinking when a thinking budget is requested. Claude Opus 5.5, Claude Sonnet 5.5, Claude Mythos 5.1 and the Fable models also reject a forced `tool_choice`, so the provider sends `auto` for them and structured output uses the prompt-based JSON path. Anthropic retired `claude-opus-4-20250514` and `claude-sonnet-4-20250514` on 2026-06-15.
+
+`usage.costUSD` prices cache reads at 0.1x the input price, except Claude Opus 5.5 (0.05x) and Claude Fable 5.1 (0.025x), and cache writes at 1.25x for the 5-minute TTL and 2x for the 1-hour TTL, read from the response's `cache_creation` split.
 
 ### Google Gemini
 

@@ -479,6 +479,11 @@ export interface ModelInfo {
   outputTokenLimit?: number;
   pricePer1MTokensInput?: number;
   pricePer1MTokensOutput?: number;
+  /**
+   * USD per 1M prompt-cache read tokens. Absent means the provider's standard
+   * ratio applies (Anthropic: 0.1 x {@link pricePer1MTokensInput}).
+   */
+  pricePer1MTokensCacheRead?: number;
   pricePer1MTokensTotal?: number;
   supportsStreaming?: boolean;
   defaultTemperature?: number;

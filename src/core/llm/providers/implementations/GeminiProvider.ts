@@ -337,9 +337,9 @@ const GEMINI_MODELS: ModelInfo[] = [
   },
 
   // --- Flash. 3.6, 3.7 and 3.8 list at $0.75 / $3.75 through 2026-12-31 and
-  // $1.50 / $7.50 from 2027-01-01. They meter at $1.50 / $7.50, as
-  // claude-sonnet-5 meters at its sticker rate in the Anthropic catalog, so
-  // cost rollups stay conservative and stay right after the promotion. ---
+  // $1.50 / $7.50 from 2027-01-01. They meter at $1.50 / $7.50 because the
+  // promotion has a published end date: cost rollups stay conservative until
+  // then and stay right after it. ---
   {
     modelId: 'gemini-3.8-flash',
     providerId: 'gemini',

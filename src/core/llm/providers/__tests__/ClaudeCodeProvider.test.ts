@@ -204,10 +204,11 @@ describe('ClaudeCodeProvider', () => {
 
     it('returns the static Claude model catalog', async () => {
       const models = await provider.listAvailableModels();
-      expect(models.length).toBe(8);
+      expect(models.length).toBe(9);
       const ids = models.map(m => m.modelId);
       expect(ids).toContain('claude-fable-5-1');
       expect(ids).toContain('claude-opus-5-5');
+      expect(ids).toContain('claude-sonnet-5-5');
       expect(ids).toContain('claude-sonnet-5');
       expect(ids).toContain('claude-sonnet-4-6');
       expect(ids).toContain('claude-fable-5');

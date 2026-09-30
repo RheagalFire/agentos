@@ -81,7 +81,7 @@ AgentOS includes a complete [`OpenAIOAuthFlow`](https://github.com/framerslab/ag
 - **Tool calling**: `--json-schema` for structured output enforcement
 - **Streaming**: `--output-format stream-json` with `--verbose --include-partial-messages`
 - **Key flags**: `--bare` (skip plugins/hooks), `--max-turns 1` (single completion)
-- **Models**: claude-opus-5-5, claude-fable-5-1, claude-fable-5, claude-sonnet-5, claude-sonnet-4-6 (default), claude-haiku-4-5-20251001
+- **Models**: claude-opus-5-5, claude-fable-5-1, claude-fable-5, claude-sonnet-5-5, claude-sonnet-5, claude-sonnet-4-6 (default), claude-haiku-4-5-20251001
 - **Cost**: $0 per token (subscription)
 - **Auto-detection**: Checks if `claude` is on PATH (after API-key providers, before Ollama)
 
