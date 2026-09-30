@@ -509,6 +509,69 @@ export class GMI implements IGMI {
   }
 
   /**
+   * Assembles the conversation history and user input for one model call of
+   * a turn.
+   *
+   * The history is the conversation before this turn, then this turn's own
+   * messages. The conversation before the turn is the host's durable history
+   * (`metadata.conversationHistoryForPrompt`) when the host passed a non-empty
+   * one, which ends before the current user message; otherwise it is this
+   * GMI's history as the turn found it, without the user message the turn
+   * recorded. The turn's own messages are that user message and the assistant
+   * replies and tool results of earlier calls in the turn, so a tool round's
+   * calls and results reach the next call on either history.
+   *
+   * On a turn's first call, plain text input travels as `userInput`, which the
+   * chat template places last and attaches retrieved context to; the durable
+   * path has always sent it that way. Structured (multimodal) input stays a
+   * history message, so its parts reach the provider intact and only once.
+   *
+   * @param turn - Where the turn's messages come from.
+   * @param turn.durableHistory - The host's history before this turn, or
+   *   `null` to use this GMI's own history.
+   * @param turn.historyAtTurnStart - This GMI's history once the turn input
+   *   was recorded.
+   * @param turn.currentUserMessage - The user message the turn input added,
+   *   when the turn is user-initiated.
+   * @param turn.turnMessages - Assistant replies and tool results the turn has
+   *   added so far.
+   * @returns The `conversationHistory` and `userInput` prompt components,
+   *   and how many history messages belong to this turn (token budgeting
+   *   leaves those whole).
+   */
+  private buildPromptConversation(turn: {
+    durableHistory: ConversationMessage[] | null;
+    historyAtTurnStart: readonly ChatMessage[];
+    currentUserMessage: ChatMessage | undefined;
+    turnMessages: readonly ChatMessage[];
+  }): { conversationHistory: ConversationMessage[]; userInput: string | null; currentTurnMessageCount: number } {
+    const { durableHistory, historyAtTurnStart, currentUserMessage, turnMessages } = turn;
+    const toConversationMessage = (message: ChatMessage): ConversationMessage =>
+      this.conversationHistoryManager.convertToConversationMessage(message);
+
+    const historyBeforeTurn =
+      durableHistory ??
+      historyAtTurnStart
+        .filter((message) => message !== currentUserMessage)
+        .map(toConversationMessage);
+    const userContent = currentUserMessage?.content;
+    const userText =
+      turnMessages.length === 0 && typeof userContent === 'string' && userContent !== ''
+        ? userContent
+        : null;
+    const turnHistory: ChatMessage[] = [
+      ...(currentUserMessage && userText === null ? [currentUserMessage] : []),
+      ...turnMessages,
+    ];
+
+    return {
+      conversationHistory: [...historyBeforeTurn, ...turnHistory.map(toConversationMessage)],
+      userInput: userText,
+      currentTurnMessageCount: turnHistory.length,
+    };
+  }
+
+  /**
    * Determines if RAG retrieval should be triggered based on the current query and persona configuration.
    * @private
    * @param {string} query - The current user query.
@@ -538,19 +601,19 @@ export class GMI implements IGMI {
   }
 
   /**
-   * Determines the prompt format type based on model provider.
-   * @param modelDetails - Model metadata from the provider manager.
-   * @param providerId - The provider identifier.
-   * @returns The prompt format type string.
+   * Returns the PromptEngine template GMI builds its prompts with.
+   *
+   * GMI hands the constructed prompt to `IProvider.generateCompletionStream`,
+   * whose input is an OpenAI-style `ChatMessage[]` for every provider; each
+   * provider converts that array to its own wire format (Anthropic messages
+   * with a separate system field, Gemini contents with a systemInstruction).
+   * A provider-specific template would hand the provider another shape; the
+   * `anthropic_messages` template, for one, returns an object with the
+   * system prompt split out, which AnthropicProvider cannot iterate.
+   *
+   * @returns Always `'openai_chat'`.
    */
-  private determinePromptFormat(
-    modelDetails: { providerId?: string } | null | undefined,
-    providerId?: string,
-  ): string {
-    const pid = (modelDetails?.providerId || providerId || '').toLowerCase();
-    if (pid.includes('anthropic')) return 'anthropic_messages';
-    if (pid.includes('google') || pid.includes('gemini')) return 'google_gemini';
-    if (pid.includes('cohere')) return 'cohere_chat';
+  private determinePromptFormat(): 'openai_chat' {
     return 'openai_chat';
   }
 
@@ -627,7 +690,26 @@ export class GMI implements IGMI {
       const maxHistoryMessages = this.activePersona.conversationContextConfig?.maxMessages ||
                                this.activePersona.memoryConfig?.conversationContext?.maxMessages ||
                                DEFAULT_MAX_CONVERSATION_HISTORY_TURNS;
+      const messagesBeforeInput = new Set<ChatMessage>(this.conversationHistoryManager.history);
       this.conversationHistoryManager.update(turnInput, maxHistoryMessages);
+      // The turn's prompt sources: this GMI's history once the input is
+      // recorded, the user message the input added (user-initiated turns
+      // only), the host's durable history when it passed one, and the
+      // assistant replies and tool results the loop below adds.
+      const historyAtTurnStart = [...this.conversationHistoryManager.history];
+      const currentUserMessage = historyAtTurnStart.find(
+        (message) => message.role === 'user' && !messagesBeforeInput.has(message),
+      );
+      const currentTurnText = currentUserMessage?.content
+        ? (typeof currentUserMessage.content === 'string'
+            ? currentUserMessage.content
+            : JSON.stringify(currentUserMessage.content))
+        : '';
+      const durableHistoryForPrompt =
+        Array.isArray(turnInput.metadata?.conversationHistoryForPrompt) && turnInput.metadata?.conversationHistoryForPrompt.length > 0
+          ? (turnInput.metadata?.conversationHistoryForPrompt as ConversationMessage[])
+          : null;
+      const turnMessages: ChatMessage[] = [];
 
       // Analyze sentiment of user input only when sentiment tracking is enabled
       if (this.activePersona.sentimentTracking?.enabled) {
@@ -679,16 +761,11 @@ export class GMI implements IGMI {
             : "";
         let assembledMemoryContext: AssembledMemoryContext | null = null;
 
-        const lastMessage = this.conversationHistoryManager.history.length > 0 ? this.conversationHistoryManager.history[this.conversationHistoryManager.history.length - 1] : null;
-        const isUserInitiatedTurn = lastMessage?.role === 'user';
-        const currentTurnText =
-          isUserInitiatedTurn && lastMessage?.content
-            ? (typeof lastMessage.content === 'string'
-                ? lastMessage.content
-                : JSON.stringify(lastMessage.content))
-            : '';
+        // Retrieval and memory assembly run for a user turn's first model
+        // call only; later calls continue from tool results.
+        const isUserInitiatedTurn = currentUserMessage !== undefined && turnMessages.length === 0;
 
-        if (this.retrievalAugmentor && this.activePersona.memoryConfig?.ragConfig?.enabled && isUserInitiatedTurn && lastMessage?.content) {
+        if (this.retrievalAugmentor && this.activePersona.memoryConfig?.ragConfig?.enabled && isUserInitiatedTurn && currentTurnText) {
           const currentQueryForRag = currentTurnText;
           if (this.shouldTriggerRAGRetrieval(currentQueryForRag)) {
             this.addTraceEntry(ReasoningEntryType.RAG_QUERY_START, "RAG retrieval triggered.", { queryPreview: currentQueryForRag.substring(0, 100) });
@@ -777,15 +854,18 @@ export class GMI implements IGMI {
           });
         }
 
-        const durableHistoryForPrompt =
-          Array.isArray(turnInput.metadata?.conversationHistoryForPrompt) && turnInput.metadata?.conversationHistoryForPrompt.length > 0
-            ? (turnInput.metadata?.conversationHistoryForPrompt as ConversationMessage[])
-            : null;
+        const promptConversation = this.buildPromptConversation({
+          durableHistory: durableHistoryForPrompt,
+          historyAtTurnStart,
+          currentUserMessage,
+          turnMessages,
+        });
 
         const promptComponents: PromptComponents = {
           systemPrompts,
-          conversationHistory: durableHistoryForPrompt ?? this.conversationHistoryManager.buildForPrompt(),
-          userInput: isUserInitiatedTurn ? currentTurnText : null,
+          conversationHistory: promptConversation.conversationHistory,
+          currentTurnMessageCount: promptConversation.currentTurnMessageCount,
+          userInput: promptConversation.userInput,
           retrievedContext: [
             assembledMemoryContext?.contextText,
             augmentedContextFromRAG,
@@ -809,7 +889,7 @@ export class GMI implements IGMI {
             providerId: modelDetails?.providerId || providerIdForModel || this.llmProviderManager.getProviderForModel(modelIdToUse)?.providerId || 'unknown',
             maxContextTokens: modelDetails?.contextWindowSize || 8192, // Default fallback
             capabilities: modelDetails?.capabilities || [],
-            promptFormatType: this.determinePromptFormat(modelDetails, providerIdForModel),
+            promptFormatType: this.determinePromptFormat(),
             toolSupport: {
               supported: modelDetails?.capabilities.includes('tool_use') || false,
               format: this.determineToolFormat(modelDetails, providerIdForModel),
@@ -821,6 +901,20 @@ export class GMI implements IGMI {
         );
 
         promptEngineResult.issues?.forEach(issue => this.addTraceEntry(ReasoningEntryType.WARNING, `Prompt Engine Issue: ${issue.message}`, issue as any));
+        // A failed template leaves the prompt empty, and every provider takes
+        // a non-empty ChatMessage[]; fail the turn rather than send nothing.
+        const promptMessages = promptEngineResult.prompt;
+        if (!Array.isArray(promptMessages) || promptMessages.length === 0) {
+          throw new GMIError(
+            `Prompt construction produced no chat messages for model '${modelTargetInfo.modelId}' (template '${promptEngineResult.metadata?.templateUsed ?? 'unknown'}').`,
+            GMIErrorCode.GMI_PROCESSING_ERROR,
+            {
+              turnId,
+              templateUsed: promptEngineResult.metadata?.templateUsed,
+              issues: promptEngineResult.issues?.filter((issue) => issue.type === 'error'),
+            },
+          );
+        }
         this.addTraceEntry(ReasoningEntryType.PROMPT_CONSTRUCTION_COMPLETE, `Prompt constructed for model ${modelTargetInfo.modelId}.`);
 
         const provider = this.llmProviderManager.getProvider(modelTargetInfo.providerId);
@@ -883,7 +977,7 @@ export class GMI implements IGMI {
         let currentIterationThinkingBlocks: ThinkingBlock[] = [];
 
         let textDeltaEmitted = false;
-        for await (const chunk of provider.generateCompletionStream(modelTargetInfo.modelId, promptEngineResult.prompt as ChatMessage[], llmOptions)) {
+        for await (const chunk of provider.generateCompletionStream(modelTargetInfo.modelId, promptMessages, llmOptions)) {
           if (chunk.error) {
 
             throw new GMIError(`LLM stream error: ${chunk.error.message}`, GMIErrorCode.LLM_PROVIDER_ERROR, chunk.error.details);
@@ -945,7 +1039,7 @@ export class GMI implements IGMI {
           yield this.createOutputChunk(turnInput.interactionId, GMIOutputChunkType.TEXT_DELTA, aggregatedResponseText);
         }
 
-        this.conversationHistoryManager.push({
+        const assistantMessage: ChatMessage = {
           role: 'assistant',
           content: currentIterationTextResponse || null,
           tool_calls: currentIterationToolCallRequests.length > 0
@@ -957,7 +1051,9 @@ export class GMI implements IGMI {
               }))
             : undefined,
           ...(currentIterationThinkingBlocks.length > 0 && { thinkingBlocks: currentIterationThinkingBlocks }),
-        });
+        };
+        this.conversationHistoryManager.push(assistantMessage);
+        turnMessages.push(assistantMessage);
 
         if (currentIterationToolCallRequests.length > 0) {
           this.state = GMIPrimeState.AWAITING_TOOL_RESULT;
@@ -986,7 +1082,9 @@ export class GMI implements IGMI {
               );
             }
           }
-          toolExecutionResults.forEach(tcResult => this.conversationHistoryManager.updateWithToolResult(tcResult));
+          for (const tcResult of toolExecutionResults) {
+            turnMessages.push(this.conversationHistoryManager.updateWithToolResult(tcResult));
+          }
           currentIterationTextResponse = ""; // Reset for next iteration if any
           currentIterationToolCallRequests = []; // Reset
           this.state = GMIPrimeState.PROCESSING;

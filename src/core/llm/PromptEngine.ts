@@ -31,6 +31,7 @@ import {
   IPromptEngineUtilityAI,
   TokenEstimator,
 } from './IPromptEngine';
+import { resolveCacheCapabilities } from './providers/model-cache-capabilities';
 import {
   ContextualPromptElement,
   ContextualPromptElementCriteria,
@@ -97,6 +98,10 @@ export class PromptEngine implements IPromptEngine {
   constructor() {
     this.defaultTemplates = {
       'openai_chat': this.createOpenAIChatTemplate(),
+      // GeminiProvider takes OpenAI-style ChatMessage[] and converts it to
+      // Gemini contents itself, so a caller that names this format gets the
+      // chat template rather than an empty prompt.
+      'google_gemini': this.createOpenAIChatTemplate(),
       'anthropic_messages': this.createAnthropicMessagesTemplate(),
       'generic_completion': this.createGenericCompletionTemplate(),
     };
@@ -398,7 +403,7 @@ export class PromptEngine implements IPromptEngine {
     let estimatedTokens = 0;
     if (components.systemPrompts) estimatedTokens += (await Promise.all(components.systemPrompts.map(sp => this.estimateTokenCount(sp.content, modelTargetInfo.modelId)))).reduce((a,b) => a+b, 0);
     if (components.userInput) estimatedTokens += await this.estimateTokenCount(components.userInput, modelTargetInfo.modelId);
-    if (components.conversationHistory) estimatedTokens += await this.calculateTokensForMessages(components.conversationHistory, modelTargetInfo.modelId); // Corrected: Call fixed calculateTokensForMessages
+    if (components.conversationHistory) estimatedTokens += await this.calculateTokensForMessages(components.conversationHistory, modelTargetInfo.modelId, this.thinkingSentFor(components.conversationHistory, modelTargetInfo));
 
 
     if (estimatedTokens > modelTargetInfo.maxContextTokens) {
@@ -516,7 +521,8 @@ export class PromptEngine implements IPromptEngine {
      * Key Composition Strategy (intentional truncation for privacy & size):
      *  - First 50 chars of each system prompt concatenated (order sensitive)
      *  - First 100 chars of user input
-     *  - Last turn content excerpt (first 50 chars) for light history sensitivity
+     *  - Last turn content excerpt (first 50 chars; structured content is
+     *    serialized, see cacheKeyContentExcerpt) for light history sensitivity
      *  - Tool id list (joined)
      *  - Model id, template name, persona id, mood, task hint
      *
@@ -527,7 +533,9 @@ export class PromptEngine implements IPromptEngine {
     const relevantData = {
       system: components.systemPrompts?.map(p => p.content.substring(0,50)).join(';'),
       userInput: components.userInput?.substring(0,100),
-      historyLastTurn: components.conversationHistory?.[components.conversationHistory.length -1]?.content?.toString().substring(0,50),
+      historyLastTurn: this.cacheKeyContentExcerpt(
+        components.conversationHistory?.[components.conversationHistory.length - 1]?.content,
+      ),
       tools: components.tools?.map(t => t.id).join(','),
       modelId: modelInfo.modelId,
       template: templateName,
@@ -544,6 +552,23 @@ export class PromptEngine implements IPromptEngine {
       hash |= 0;
     }
     return `promptcache:${modelInfo.modelId}:${hash.toString(36)}`;
+  }
+
+  /**
+   * Returns the excerpt of the last history message that goes into the cache
+   * key. Structured (multimodal) content is serialized and gets the same 100
+   * characters the key takes from `userInput`: its `toString()` is
+   * "[object Object]" for every message, and GMI sends a multimodal message
+   * as history rather than as `userInput`, so without its text two different
+   * multimodal turns would share one cached prompt.
+   *
+   * @param content - Content of the last history message, if any.
+   * @returns The excerpt, or `undefined` when there is no content.
+   */
+  private cacheKeyContentExcerpt(content: Message['content'] | undefined): string | undefined {
+    if (content === null || content === undefined) return undefined;
+    if (typeof content === 'string') return content.substring(0, 50);
+    return JSON.stringify(content).substring(0, 100);
   }
 
   private setupCacheEviction(): void {
@@ -763,7 +788,8 @@ export class PromptEngine implements IPromptEngine {
     };
 
     const budget = modelInfo.optimalContextTokens || modelInfo.maxContextTokens;
-    let currentTokens = await this.calculateTotalTokens(optimized, modelInfo.modelId);
+    const sendsThinking = this.thinkingSentFor(optimized.conversationHistory, modelInfo);
+    let currentTokens = await this.calculateTotalTokens(optimized, modelInfo.modelId, sendsThinking);
     modifications.details!.originalEstimatedTokenCount = currentTokens;
 
     const budgets = {
@@ -775,41 +801,64 @@ export class PromptEngine implements IPromptEngine {
     };
 
     if (optimized.conversationHistory && optimized.conversationHistory.length > 0) {
-      let historyTokens = await this.calculateTokensForMessages(optimized.conversationHistory, modelInfo.modelId);
+      const historyTokens = await this.calculateTokensForMessages(optimized.conversationHistory, modelInfo.modelId, sendsThinking);
       if (historyTokens > budgets.history || currentTokens > budget) {
-        const originalCount = optimized.conversationHistory.length;
-        if (this.utilityAI && this.config.historyManagement.summarizationTriggerRatio > 0 && (historyTokens / budgets.history > this.config.historyManagement.summarizationTriggerRatio)) {
-          try {
-            const { summaryMessages, finalTokenCount } = await this.utilityAI.summarizeConversationHistory(
-              optimized.conversationHistory,
-              (currentTokens > budget) ? budgets.history - (currentTokens - budget) : budgets.history,
-              modelInfo,
-              this.config.historyManagement.preserveImportantMessages
-            );
-            optimized.conversationHistory = summaryMessages;
-            modifications.details!.summarizedComponents!.push('conversationHistory');
-            modifications.wasModified = true;
-            currentTokens = currentTokens - historyTokens + finalTokenCount;
-            historyTokens = finalTokenCount;
-          } catch (e) {
-            issues?.push({type: 'warning', code: 'HISTORY_SUMMARIZATION_FAILED', message: `History summarization failed: ${e instanceof Error ? e.message : String(e)}`});
-            optimized.conversationHistory = this.truncateMessages(optimized.conversationHistory, budgets.history, (content) => this.estimateTokenCount(content, modelInfo.modelId));
-            modifications.details!.truncatedComponents!.push('conversationHistory');
-            modifications.wasModified = true;
-            const newHistoryTokens = await this.calculateTokensForMessages(optimized.conversationHistory, modelInfo.modelId);
-            currentTokens = currentTokens - historyTokens + newHistoryTokens;
-            historyTokens = newHistoryTokens;
+        // The turn being answered stays whole: summarizing or truncating it
+        // would drop the request itself (a structured user message has no
+        // userInput copy) or split a tool call from its result. Only the
+        // messages before it are reduced, to what the budget leaves them.
+        const history = optimized.conversationHistory;
+        const turnCount = Math.min(
+          Math.max(0, Math.floor(optimized.currentTurnMessageCount ?? 0)),
+          history.length,
+        );
+        const turnMessages = history.slice(history.length - turnCount);
+        const earlier = history.slice(0, history.length - turnCount);
+        const turnTokens = await this.calculateTokensForMessages(turnMessages, modelInfo.modelId, sendsThinking);
+        const earlierTokens = historyTokens - turnTokens;
+        // The earlier history keeps its share of the history budget, and no
+        // more than fits beside everything else in the prompt.
+        const earlierBudget = Math.max(0, budgets.history - turnTokens);
+        const earlierTarget = Math.max(0, Math.min(earlierBudget, budget - (currentTokens - earlierTokens)));
+        // When the turn is kept, or the request travels as userInput, there
+        // is always a message to send, so the earlier history may go
+        // entirely.
+        const minEarlierKept = turnMessages.length > 0 || optimized.userInput ? 0 : 1;
+        let reducedEarlier = earlier;
+        if (earlier.length > 0 && earlierTarget <= 0 && minEarlierKept === 0) {
+          // Nothing earlier fits; a summary would still add a message.
+          reducedEarlier = [];
+          modifications.details!.truncatedComponents!.push('conversationHistory');
+          modifications.wasModified = true;
+        } else if (earlier.length > 0) {
+          if (this.utilityAI && this.config.historyManagement.summarizationTriggerRatio > 0 && (historyTokens / budgets.history > this.config.historyManagement.summarizationTriggerRatio)) {
+            try {
+              const { summaryMessages } = await this.utilityAI.summarizeConversationHistory(
+                earlier,
+                earlierTarget,
+                modelInfo,
+                this.config.historyManagement.preserveImportantMessages
+              );
+              reducedEarlier = summaryMessages;
+              modifications.details!.summarizedComponents!.push('conversationHistory');
+              modifications.wasModified = true;
+            } catch (e) {
+              issues?.push({type: 'warning', code: 'HISTORY_SUMMARIZATION_FAILED', message: `History summarization failed: ${e instanceof Error ? e.message : String(e)}`});
+              reducedEarlier = this.truncateMessages([...earlier], earlierTarget, (content) => this.estimateTokenCount(content, modelInfo.modelId), minEarlierKept, sendsThinking);
+              modifications.details!.truncatedComponents!.push('conversationHistory');
+              modifications.wasModified = true;
+            }
+          } else {
+            reducedEarlier = this.truncateMessages([...earlier], earlierTarget, (content) => this.estimateTokenCount(content, modelInfo.modelId), minEarlierKept, sendsThinking);
+            if (reducedEarlier.length < earlier.length) {
+              modifications.details!.truncatedComponents!.push('conversationHistory');
+              modifications.wasModified = true;
+            }
           }
-        } else {
-          optimized.conversationHistory = this.truncateMessages(optimized.conversationHistory, budgets.history, (content) => this.estimateTokenCount(content, modelInfo.modelId));
-          if(optimized.conversationHistory.length < originalCount) {
-            modifications.details!.truncatedComponents!.push('conversationHistory');
-            modifications.wasModified = true;
-          }
-          const newHistoryTokens = await this.calculateTokensForMessages(optimized.conversationHistory, modelInfo.modelId);
-          currentTokens = currentTokens - historyTokens + newHistoryTokens;
-          historyTokens = newHistoryTokens;
         }
+        optimized.conversationHistory = [...reducedEarlier, ...turnMessages];
+        const newEarlierTokens = await this.calculateTokensForMessages(reducedEarlier, modelInfo.modelId, sendsThinking);
+        currentTokens = currentTokens - earlierTokens + newEarlierTokens;
       }
     }
 
@@ -857,11 +906,15 @@ export class PromptEngine implements IPromptEngine {
     return { optimizedComponents: optimized, modifications };
   }
 
-  private async calculateTotalTokens(components: PromptComponents, modelId: string): Promise<number> {
+  private async calculateTotalTokens(
+    components: PromptComponents,
+    modelId: string,
+    sendsThinking: (msg: Message) => boolean = () => false,
+  ): Promise<number> {
     let total = 0;
     if(components.systemPrompts) total += (await Promise.all(components.systemPrompts.map(sp => this.estimateTokenCount(sp.content, modelId)))).reduce((a,b) => a+b, 0);
     if(components.userInput) total += await this.estimateTokenCount(components.userInput, modelId);
-    if(components.conversationHistory) total += await this.calculateTokensForMessages(components.conversationHistory, modelId);
+    if(components.conversationHistory) total += await this.calculateTokensForMessages(components.conversationHistory, modelId, sendsThinking);
     if(components.retrievedContext) {
       const contextStr = typeof components.retrievedContext === 'string' ? components.retrievedContext : components.retrievedContext.map(r => r.content).join('\n');
       total += await this.estimateTokenCount(contextStr, modelId);
@@ -870,7 +923,43 @@ export class PromptEngine implements IPromptEngine {
     return total;
   }
 
-  private async calculateTokensForMessages(messages: Message[], modelId: string): Promise<number> {
+  /**
+   * Tells which history messages' thinking the target model receives. Only
+   * Anthropic sends thinking back: all of it to models that keep prior
+   * thinking in context, otherwise only the latest assistant turn's. Other
+   * providers drop it. AnthropicProvider's
+   * `AGENTOS_ANTHROPIC_STRIP_PRIOR_THINKING` override (`1`/`true` strips,
+   * `0`/`false` replays) wins over the model's retention, as it does there.
+   *
+   * @param history The history the prompt is built from.
+   * @param modelInfo The target model.
+   * @returns Whether a message's thinking blocks reach the model.
+   */
+  private thinkingSentFor(
+    history: readonly Message[] | undefined,
+    modelInfo: Readonly<ModelTargetInfo>,
+  ): (msg: Message) => boolean {
+    if (modelInfo.providerId !== 'anthropic' || !history?.length) return () => false;
+    const stripEnv = process.env.AGENTOS_ANTHROPIC_STRIP_PRIOR_THINKING;
+    const replaysAll =
+      stripEnv === '1' || stripEnv === 'true'
+        ? false
+        : stripEnv === '0' || stripEnv === 'false'
+          ? true
+          : resolveCacheCapabilities(modelInfo.modelId).retainsPriorThinkingInContext;
+    if (replaysAll) return () => true;
+    let lastAssistant: Message | undefined;
+    for (const msg of history) {
+      if (msg.role === MessageRole.ASSISTANT) lastAssistant = msg;
+    }
+    return (msg) => msg === lastAssistant;
+  }
+
+  private async calculateTokensForMessages(
+    messages: Message[],
+    modelId: string,
+    sendsThinking: (msg: Message) => boolean = () => false,
+  ): Promise<number> {
     if (!messages) return 0;
     let sum = 0;
     for (const msg of messages) {
@@ -892,16 +981,51 @@ export class PromptEngine implements IPromptEngine {
         // This case should not be common if msg.content is Array for multi-part, but as a fallback:
         sum += await this.estimateTokenCount(JSON.stringify(msg.content), modelId);
       }
+      // Thinking the target receives with the message is input too.
+      if (sendsThinking(msg)) {
+        for (const block of msg.thinkingBlocks ?? []) {
+          sum += await this.estimateTokenCount(block.type === 'thinking' ? block.thinking : block.data, modelId);
+        }
+      }
       sum += 5; // Overhead for role, name, etc.
     }
     return sum;
   }
 
-  private truncateMessages(messages: Message[], targetTokenCount: number, _estimateFn: TokenEstimator): Message[] {
-    let currentTokens = messages.reduce((sum, msg) => sum + (typeof msg.content === 'string' ? msg.content.length : (Array.isArray(msg.content) ? JSON.stringify(msg.content).length : 50)) , 0) / 4; // More robust rough estimate
-    while(currentTokens > targetTokenCount && messages.length > 1) {
-      const removedMsg = messages.shift();
-      currentTokens -= (typeof removedMsg?.content === 'string' ? removedMsg.content.length : (Array.isArray(removedMsg?.content) ? JSON.stringify(removedMsg?.content).length : 50)) / 4;
+  /**
+   * Drops the oldest messages until the rest fit `targetTokenCount`, keeping
+   * at least `minKept`. A tool result left first would reach the provider
+   * without the assistant call it answers, which chat APIs reject, so leading
+   * tool results go too.
+   */
+  private truncateMessages(
+    messages: Message[],
+    targetTokenCount: number,
+    _estimateFn: TokenEstimator,
+    minKept = 1,
+    sendsThinking: (msg: Message) => boolean = () => false,
+  ): Message[] {
+    // Rough estimate: four characters a token, over the content and any
+    // thinking the target receives with the message.
+    const roughTokens = (msg: Message | undefined): number => {
+      if (!msg) return 0;
+      const contentChars = typeof msg.content === 'string'
+        ? msg.content.length
+        : (Array.isArray(msg.content) ? JSON.stringify(msg.content).length : 50);
+      const thinkingChars = sendsThinking(msg)
+        ? (msg.thinkingBlocks ?? []).reduce(
+            (chars, block) => chars + (block.type === 'thinking' ? block.thinking.length : block.data.length),
+            0,
+          )
+        : 0;
+      return (contentChars + thinkingChars) / 4;
+    };
+    let currentTokens = messages.reduce((sum, msg) => sum + roughTokens(msg), 0);
+    while(currentTokens > targetTokenCount && messages.length > minKept) {
+      currentTokens -= roughTokens(messages.shift());
+    }
+    while (messages.length > minKept && messages[0]?.role === MessageRole.TOOL) {
+      messages.shift();
     }
     return messages;
   }
@@ -1050,6 +1174,11 @@ export class PromptEngine implements IPromptEngine {
         chatMsg.content = null;
       }
     }
+          // Anthropic rejects a tool-loop request whose earlier assistant
+          // turn lost its signed thinking, so the blocks ride along verbatim.
+          if (role === 'assistant' && msg.thinkingBlocks && msg.thinkingBlocks.length > 0) {
+            chatMsg.thinkingBlocks = [...msg.thinkingBlocks];
+          }
           messages.push(chatMsg);
         });
       }
@@ -1072,8 +1201,11 @@ export class PromptEngine implements IPromptEngine {
         const ragContent = typeof components.retrievedContext === 'string' ? components.retrievedContext : components.retrievedContext.map(r => `Source: ${r.source}\nContent: ${r.content}`).join('\n\n');
         if (messages.length > 0 && messages[messages.length-1].role === 'user') {
           const lastUserMsg = messages[messages.length-1];
-          const newUserContent = `Context:\n${ragContent}\n\nUser Query: ${lastUserMsg.content}`;
-          messages[messages.length-1].content = newUserContent;
+          // A multimodal message keeps its parts: the context goes in front
+          // as a text part instead of flattening the parts into a string.
+          lastUserMsg.content = Array.isArray(lastUserMsg.content)
+            ? [{ type: 'text', text: `Context:\n${ragContent}\n\nUser Query:` }, ...lastUserMsg.content]
+            : `Context:\n${ragContent}\n\nUser Query: ${lastUserMsg.content}`;
         } else {
           messages.push({role: 'user', content: `Based on the following context:\n${ragContent}\n\nPlease respond to the implicit or explicit user query.`});
         }
