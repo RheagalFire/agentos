@@ -72,7 +72,8 @@ describe('embedText with provider gemini', () => {
 
     const [url, init] = fetchMock.mock.calls[0];
     expect(String(url)).toContain('/models/gemini-embedding-2:batchEmbedContents');
-    expect(String(url)).toContain('key=test-gemini-key');
+    expect(String(url)).not.toContain('key=');
+    expect((init as { headers: Record<string, string> }).headers['x-goog-api-key']).toBe('test-gemini-key');
     expect(JSON.parse(init.body).requests).toHaveLength(2);
     expect(result.provider).toBe('gemini');
     expect(result.embeddings).toEqual([[0, 0.5], [1, 1.5]]);

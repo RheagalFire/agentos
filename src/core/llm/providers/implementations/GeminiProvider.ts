@@ -8,7 +8,7 @@
  * conventions used by IProvider:
  *
  * Key API differences from OpenAI:
- * - Auth: API key passed as `?key=` query parameter, NOT as a Bearer header.
+ * - Auth: API key in the `x-goog-api-key` header, never in the URL.
  * - Roles: Gemini uses `user` / `model` (not `assistant`).
  * - System instruction: Separate `systemInstruction` field, not a role.
  * - Tool calling: Uses `functionDeclarations` under `tools[]`, response uses `functionCall`.
@@ -56,7 +56,8 @@ export interface GeminiProviderConfig {
   /**
    * Google Gemini API key.
    * Typically sourced from the `GEMINI_API_KEY` environment variable.
-   * Passed as a query parameter (`?key=...`), not as a header.
+   * Sent in the `x-goog-api-key` header, never in the request URL, so it
+   * stays out of proxy and access logs.
    */
   apiKey: string;
   /**
@@ -1633,10 +1634,32 @@ export class GeminiProvider implements IProvider {
   // -------------------------------------------------------------------------
 
   /**
+   * The next API key to send: the pool rotates between configured keys and
+   * skips one in cooldown after a 429. Falls back to the configured key when
+   * the provider was configured without initialization (tests).
+   */
+  private nextApiKey(): string {
+    return this.keyPool?.hasKeys ? this.keyPool.next() : this.config.apiKey;
+  }
+
+  /**
+   * Request headers for one call. The key travels in `x-goog-api-key`, which
+   * Gemini accepts on every endpoint this provider calls.
+   */
+  private requestHeaders(apiKey: string): Record<string, string> {
+    return {
+      'Content-Type': 'application/json',
+      'User-Agent': 'AgentOS/1.0 (GeminiProvider)',
+      'x-goog-api-key': apiKey,
+    };
+  }
+
+  /**
    * Makes a non-streaming API request to the Gemini API with retry logic.
    *
-   * Authentication uses a `?key=` query parameter (Gemini's auth mechanism),
-   * NOT a header-based approach like OpenAI or Anthropic.
+   * The API key goes in the `x-goog-api-key` header. Each attempt draws a key
+   * from the pool, so a retry after a 429 uses another key when one is
+   * configured.
    *
    * @template T The expected response type.
    * @param {string} endpoint - API endpoint path (e.g., "/models/gemini-2.5-flash:generateContent").
@@ -1650,13 +1673,7 @@ export class GeminiProvider implements IProvider {
     body: Record<string, unknown>,
     requestTimeoutOverride?: number,
   ): Promise<T> {
-    // API key is passed as query parameter — Gemini's auth convention
-    const apiKey = this.keyPool?.hasKeys ? this.keyPool.next() : this.config.apiKey;
-    const url = `${this.config.baseURL}${endpoint}?key=${apiKey}`;
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'User-Agent': 'AgentOS/1.0 (GeminiProvider)',
-    };
+    const url = `${this.config.baseURL}${endpoint}`;
 
     let lastError: Error = new GeminiProviderError(
       'Request failed after all retries.',
@@ -1671,13 +1688,14 @@ export class GeminiProvider implements IProvider {
         : this.config.requestTimeout;
 
     for (let attempt = 0; attempt < this.config.maxRetries!; attempt++) {
+      const apiKey = this.nextApiKey();
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), effectiveTimeout);
 
       try {
         const response = await fetch(url, {
           method: 'POST',
-          headers,
+          headers: this.requestHeaders(apiKey),
           body: JSON.stringify(body),
           signal: controller.signal,
         });
@@ -1708,6 +1726,9 @@ export class GeminiProvider implements IProvider {
               errorStatus,
               errorData,
             );
+            // The key's quota is spent: the pool rests it, and the next
+            // attempt draws another key when one is configured.
+            this.keyPool?.markExhausted(apiKey);
             const retryAfter = response.headers.get('retry-after');
             // Retry-After is authoritative when present; otherwise jittered backoff.
             const retryAfterMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : computeRetryBackoffMs(attempt);
@@ -1769,8 +1790,8 @@ export class GeminiProvider implements IProvider {
   /**
    * Makes a streaming API request and returns the raw ReadableStream.
    *
-   * Uses the `?alt=sse` query parameter to enable SSE streaming,
-   * combined with the `?key=` query parameter for authentication.
+   * Uses the `?alt=sse` query parameter to enable SSE streaming; the API key
+   * goes in the `x-goog-api-key` header.
    *
    * @param {string} endpoint - API endpoint (e.g., "/models/gemini-2.5-flash:streamGenerateContent").
    * @param {Record<string, unknown>} body - Request body.
@@ -1783,13 +1804,9 @@ export class GeminiProvider implements IProvider {
     body: Record<string, unknown>,
     requestTimeoutOverride?: number,
   ): Promise<ReadableStream<Uint8Array>> {
-    // Both alt=sse and key= are query params
-    const apiKey = this.keyPool?.hasKeys ? this.keyPool.next() : this.config.apiKey;
-    const url = `${this.config.baseURL}${endpoint}?alt=sse&key=${apiKey}`;
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'User-Agent': 'AgentOS/1.0 (GeminiProvider)',
-    };
+    const apiKey = this.nextApiKey();
+    const url = `${this.config.baseURL}${endpoint}?alt=sse`;
+    const headers = this.requestHeaders(apiKey);
 
     const controller = new AbortController();
     // CR8: honor a per-call requestTimeout override over the provider default.
@@ -1811,6 +1828,8 @@ export class GeminiProvider implements IProvider {
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({})) as Partial<GeminiAPIError>;
         const errorMessage = errorData.error?.message || `HTTP ${response.status}: ${response.statusText}`;
+        // A key whose quota is spent rests, so the next request draws another.
+        if (response.status === 429) this.keyPool?.markExhausted(apiKey);
         throw new GeminiProviderError(
           errorMessage,
           'STREAM_CONNECTION_FAILED',

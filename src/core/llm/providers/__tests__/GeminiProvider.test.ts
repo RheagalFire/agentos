@@ -8,7 +8,7 @@
  * - Tool definition conversion (OpenAI functions -> `functionDeclarations`)
  * - Tool call response mapping (`functionCall` -> `tool_calls`)
  * - Finish reason mapping (`STOP`/`MAX_TOKENS`/`SAFETY`/`RECITATION`)
- * - Auth via query parameter (`?key=`) not header
+ * - Auth via the `x-goog-api-key` header, never the URL
  * - Usage metadata extraction (`usageMetadata` -> `ModelUsage`)
  * - Streaming SSE parsing
  */
@@ -125,11 +125,11 @@ describe('GeminiProvider', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Auth: query parameter (not header)
+  // Auth: x-goog-api-key header, never the URL
   // -------------------------------------------------------------------------
 
   describe('authentication', () => {
-    it('passes API key as query parameter, not as Authorization header', async () => {
+    it('sends the API key in the x-goog-api-key header, never in the URL', async () => {
       fetchMock.mockResolvedValueOnce(mockJsonResponse(makeGeminiResponse()));
 
       await provider.generateCompletion('gemini-2.5-flash', [
@@ -139,13 +139,91 @@ describe('GeminiProvider', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [url, options] = fetchMock.mock.calls[0];
 
-      // API key should be in the URL as a query parameter
-      expect(url).toContain('?key=test-gemini-key');
-
-      // Should NOT have an Authorization header
+      expect(String(url)).not.toContain('key=');
+      expect(String(url)).not.toContain('test-gemini-key');
+      expect(options.headers['x-goog-api-key']).toBe('test-gemini-key');
       expect(options.headers['Authorization']).toBeUndefined();
-      // Should NOT have an x-api-key header
       expect(options.headers['x-api-key']).toBeUndefined();
+    });
+
+    it.each([
+      [
+        'generateCompletion',
+        () => mockJsonResponse(makeGeminiResponse()),
+        (p: GeminiProvider) => p.generateCompletion('gemini-2.5-flash', [{ role: 'user', content: 'Hi' }], {}),
+      ],
+      [
+        'generateCompletionStream',
+        () =>
+          ({
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            body: createSseStream([JSON.stringify(makeGeminiResponse())]),
+          }) as unknown as Response,
+        async (p: GeminiProvider) => {
+          for await (const _chunk of p.generateCompletionStream('gemini-2.5-flash', [{ role: 'user', content: 'Hi' }], {})) {
+            // drain
+          }
+        },
+      ],
+      [
+        'generateEmbeddings',
+        () => mockJsonResponse({ embeddings: [{ values: [0.1, 0.2] }] }),
+        (p: GeminiProvider) => p.generateEmbeddings('gemini-embedding-2', ['hi']),
+      ],
+      [
+        'checkHealth',
+        () => mockJsonResponse(makeGeminiResponse()),
+        (p: GeminiProvider) => p.checkHealth(),
+      ],
+    ])('%s authenticates with the header only', async (_name, reply, call) => {
+      fetchMock.mockResolvedValueOnce(reply());
+
+      await call(provider);
+
+      expect(fetchMock).toHaveBeenCalled();
+      for (const [url, options] of fetchMock.mock.calls) {
+        expect(String(url)).not.toContain('key=');
+        expect((options as { headers: Record<string, string> }).headers['x-goog-api-key']).toBe('test-gemini-key');
+      }
+    });
+
+    it('rotates pooled keys through the header', async () => {
+      const pooled = new GeminiProvider();
+      await pooled.initialize({ apiKey: 'key-a,key-b' });
+      fetchMock
+        .mockResolvedValueOnce(mockJsonResponse(makeGeminiResponse()))
+        .mockResolvedValueOnce(mockJsonResponse(makeGeminiResponse()))
+        .mockResolvedValueOnce(mockJsonResponse(makeGeminiResponse()));
+
+      for (let i = 0; i < 3; i++) {
+        await pooled.generateCompletion('gemini-2.5-flash', [{ role: 'user', content: 'Hi' }], {});
+      }
+
+      // The primary key has weight 2 in the pool.
+      expect(
+        fetchMock.mock.calls.map(([, options]) => (options as { headers: Record<string, string> }).headers['x-goog-api-key']),
+      ).toEqual(['key-a', 'key-a', 'key-b']);
+    });
+
+    it('retries a 429 with the next pooled key', async () => {
+      const pooled = new GeminiProvider();
+      await pooled.initialize({ apiKey: 'key-a,key-b', maxRetries: 2 });
+      fetchMock
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ error: { code: 429, message: 'Quota exceeded.', status: 'RESOURCE_EXHAUSTED' } }), {
+            status: 429,
+            headers: { 'content-type': 'application/json', 'retry-after': '0' },
+          }),
+        )
+        .mockResolvedValueOnce(mockJsonResponse(makeGeminiResponse()));
+
+      await pooled.generateCompletion('gemini-2.5-flash', [{ role: 'user', content: 'Hi' }], {});
+
+      expect(
+        fetchMock.mock.calls.map(([, options]) => (options as { headers: Record<string, string> }).headers['x-goog-api-key']),
+      ).toEqual(['key-a', 'key-b']);
     });
 
     it('uses model-scoped endpoint URL', async () => {
@@ -739,10 +817,10 @@ describe('GeminiProvider', () => {
         // just consume
       }
 
-      const [url] = fetchMock.mock.calls[0];
-      expect(url).toContain('streamGenerateContent');
-      expect(url).toContain('alt=sse');
-      expect(url).toContain('key=test-gemini-key');
+      const [url, options] = fetchMock.mock.calls[0];
+      expect(String(url)).toMatch(/:streamGenerateContent\?alt=sse$/);
+      expect(String(url)).not.toContain('key=');
+      expect(options.headers['x-goog-api-key']).toBe('test-gemini-key');
     });
 
     it('emits abort chunk when abortSignal is pre-aborted', async () => {

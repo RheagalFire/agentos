@@ -348,20 +348,21 @@ describe('Gemini thought signatures', () => {
 });
 
 describe('Gemini request errors', () => {
-  // undici names the whole URL, key included, when it cannot parse it.
-  const parseError = () =>
-    new TypeError('Failed to parse URL from /api/gemini/models/x:batchEmbedContents?key=secret-key-123');
+  // undici quotes a header value it rejects, so a key with a stray control
+  // character would appear in the error.
+  const headerError = () =>
+    new TypeError('Headers.append: "secret-key-123\u0000" is an invalid header value.');
 
-  it('keeps the API key out of a failed request error', async () => {
+  it('keeps the API key out of the request URL and a failed request error', async () => {
     vi.clearAllMocks();
-    fetchMock.mockRejectedValueOnce(parseError());
+    fetchMock.mockRejectedValueOnce(headerError());
     const provider = new GeminiProvider();
     await provider.initialize({ apiKey: 'secret-key-123', baseURL: '/api/gemini', maxRetries: 1 });
 
     const error = (await provider.generateEmbeddings('gemini-embedding-2', ['hi']).catch((e: unknown) => e)) as Error;
 
+    expect(String(fetchMock.mock.calls[0][0])).not.toContain('secret-key-123');
     expect(error.message).not.toContain('secret-key-123');
-    expect(error.message).toContain('key=[redacted]');
   });
 
   it('keeps base URL credentials out of a failed request error', async () => {
@@ -369,7 +370,7 @@ describe('Gemini request errors', () => {
     // undici rejects a URL with credentials and names it in the message.
     fetchMock.mockRejectedValueOnce(new TypeError(
       'Request cannot be constructed from a URL that includes credentials: ' +
-        'https://svc:gw-token@gateway.example.com/v1beta/models/x:batchEmbedContents?key=secret-key-123',
+        'https://svc:gw-token@gateway.example.com/v1beta/models/x:batchEmbedContents',
     ));
     const provider = new GeminiProvider();
     await provider.initialize({
@@ -400,7 +401,7 @@ describe('Gemini request errors', () => {
     ['https://secret-key-123:gw-token@gateway.example.com/v1beta', 'https://[redacted]@gateway.example.com/v1beta'],
   ])('keeps credentials out of the error for base URL %s', async (baseURL, masked) => {
     vi.clearAllMocks();
-    fetchMock.mockRejectedValueOnce(new TypeError(`Failed to parse URL from ${baseURL}/models/x:batchEmbedContents?key=secret-key-123`));
+    fetchMock.mockRejectedValueOnce(new TypeError(`Failed to parse URL from ${baseURL}/models/x:batchEmbedContents`));
     const provider = new GeminiProvider();
     await provider.initialize({ apiKey: 'secret-key-123', baseURL, maxRetries: 1 });
 
@@ -410,16 +411,16 @@ describe('Gemini request errors', () => {
     expect(error.message).toContain(masked);
   });
 
-  it('keeps the API key out of a failed stream error', async () => {
+  it('keeps the API key out of the stream URL and a failed stream error', async () => {
     vi.clearAllMocks();
-    fetchMock.mockRejectedValueOnce(parseError());
+    fetchMock.mockRejectedValueOnce(headerError());
     const provider = new GeminiProvider();
     await provider.initialize({ apiKey: 'secret-key-123', baseURL: '/api/gemini' });
 
     const stream = provider.generateCompletionStream('gemini-3.8-flash', [{ role: 'user', content: 'hi' }], {});
     const error = (await stream.next().catch((e: unknown) => e)) as Error;
 
+    expect(String(fetchMock.mock.calls[0][0])).not.toContain('secret-key-123');
     expect(error.message).not.toContain('secret-key-123');
-    expect(error.message).toContain('key=[redacted]');
   });
 });

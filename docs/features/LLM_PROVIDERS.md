@@ -337,6 +337,8 @@ When Claude declines a request (`stop_reason: "refusal"`), the provider throws a
 export GEMINI_API_KEY=AIza...
 ```
 
+The key travels in the `x-goog-api-key` header, never in the request URL, so proxy and access logs do not record it. A comma-separated list of keys rotates per request, and a key that answers HTTP 429 rests while the next request uses another one.
+
 | Model | Context | Vision | Tool Calling | Notes |
 |-------|---------|--------|-------------|-------|
 | `gemini-3.1-pro-preview` | 1M | Yes | Yes | Most capable ($2/$12 per MTok, $4/$18 once the prompt passes 200K tokens) |
