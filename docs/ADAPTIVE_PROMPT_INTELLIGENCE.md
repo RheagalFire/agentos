@@ -134,7 +134,7 @@ flowchart TD
   check -- pendingEvents.has eventName --> event[event_based fires]
   check -- workingMemory flag set --> manual[manual fires]
 
-  interval --> exec[executeMetaprompts in parallel]
+  interval --> exec[queue one background batch]
   event --> exec
   manual --> exec
 
@@ -164,7 +164,7 @@ flowchart TD
   wmi --> ready
 ```
 
-Triggered metaprompts execute in parallel via `Promise.allSettled`, so one slow handler does not block the others. Failures are logged to the reasoning trace and do not block the user-visible response.
+The metaprompts that fire on one turn form one batch, and the metaprompts in a batch execute in parallel via `Promise.allSettled`, so one slow handler does not block the others. Batches run in the background, one at a time per GMI, in the order they were triggered, so two batches never race on the same mood or context field. Failures are logged to the reasoning trace and do not block the user-visible response. Metaprompt work never changes the GMI's lifecycle state (`getCurrentState()`), so the next turn can start while a batch is still running.
 
 ### `turn_interval` — periodic self-regulation
 
@@ -550,7 +550,7 @@ Three knobs change the cost curve directly:
 
 ### Latency
 
-Metaprompt execution runs in parallel with the main turn via `Promise.allSettled`, but the parallel block must complete before the next turn's `PromptEngine.assemble()` reads the updated state. In practice, this means a metaprompt firing on turn N influences turn N+1, not turn N. The user-visible latency on turn N is unaffected: the regular completion streams while metaprompts run in the background. Lexicon-based sentiment analysis adds 10-50ms to the per-turn local work; LLM-based adds the full provider round-trip to background work but still does not block the user-visible reply.
+The executor checks triggers at the end of a turn, after the regular completion has streamed, and queues the metaprompts that fire as a background batch. The turn does not wait for the batch's LLM calls, so the user-visible latency on turn N is unaffected. A batch applies its updates when its calls return: a metaprompt firing on turn N shapes the first prompt assembled after that, normally turn N+1, and a slow call can land during a later turn. Batches for one GMI run one at a time, so their updates apply in trigger order. `GMI.shutdown()` waits up to five seconds for a running batch before it closes working memory. Lexicon-based sentiment analysis adds 10-50ms to the per-turn local work; LLM-based adds the full provider round-trip to background work but still does not block the user-visible reply.
 
 **Failure modes.** A failed metaprompt is logged to the reasoning trace as an `ERROR` entry and does not block the user-visible reply. A JSON parsing failure on the metaprompt response is auto-recovered via [`IUtilityAI.parseJsonSafe()`](https://github.com/framerslab/agentos/blob/master/src/cognition/nlp/ai_utilities/IUtilityAI.ts), which prompts a cheaper model to fix malformed JSON before giving up. An unknown mood value is dropped silently (validated against the [`GMIMood`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/IGMI.ts) enum).
 

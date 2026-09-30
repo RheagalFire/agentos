@@ -72,20 +72,36 @@ export interface MetapromptExecutorConfig {
   getUserContext: () => UserContext;
   /** Callback returning the current task context. */
   getTaskContext: () => TaskContext;
-  /** Callback to set the GMI's operational state. */
+  /**
+   * Callback to set the GMI's operational state.
+   *
+   * @deprecated Metaprompt runs no longer change lifecycle state; the executor never calls this.
+   */
   setState: (state: GMIPrimeState) => void;
-  /** Callback returning the current GMI operational state. */
+  /**
+   * Callback returning the current GMI operational state.
+   *
+   * @deprecated The executor no longer reads lifecycle state; it tracks its own work queue.
+   */
   getState: () => GMIPrimeState;
   /** Callback returning the GMI instance ID (for logging). */
   getGmiId: () => string;
 }
 
+/** Longest time {@link MetapromptExecutor.drain} waits by default, in milliseconds. */
+const DEFAULT_DRAIN_TIMEOUT_MS = 5000;
+
 /**
  * Handles metaprompt trigger checking, execution, and state application.
  *
- * Owns the `metaPromptTriggerCounters` map and the `selfReflectionIntervalTurns`
- * / `turnsSinceLastReflection` counters (though the latter are not currently
- * incremented by the executor itself — the GMI's turn loop still manages them).
+ * The metaprompts that fire on one turn are queued as one background batch.
+ * Batches and manual self-reflection cycles run one at a time, in the order
+ * they were queued, so two of them never race on the mood and context they
+ * update, and the turn that triggered a batch does not wait for its LLM calls.
+ * Metaprompt work never changes the GMI's lifecycle state; that state belongs
+ * to the turn loop.
+ *
+ * Owns the per-metaprompt turn counters used by `turn_interval` triggers.
  *
  * All GMI state mutations flow back through callbacks so the executor never
  * directly mutates GMI internals.
@@ -93,6 +109,15 @@ export interface MetapromptExecutorConfig {
 export class MetapromptExecutor {
   /** Per-metaprompt turn counters for `turn_interval` triggers. */
   private metaPromptTriggerCounters: Map<string, number> = new Map();
+
+  /**
+   * Tail of the metaprompt work queue. Every batch and self-reflection cycle
+   * chains onto it, so only one runs at a time. It never rejects.
+   */
+  private queueTail: Promise<void> = Promise.resolve();
+
+  /** Number of batches and self-reflection cycles that are queued or running. */
+  private inFlight = 0;
 
   /** Self-reflection interval (turns between reflections). */
   public selfReflectionIntervalTurns: number;
@@ -114,7 +139,7 @@ export class MetapromptExecutor {
   // ---------------------------------------------------------------------------
 
   /**
-   * Checks all metaprompt triggers and executes any that fire.
+   * Checks all metaprompt triggers and queues any that fire.
    *
    * Iterates through the persona's metaprompt definitions, evaluating each
    * trigger type:
@@ -122,8 +147,11 @@ export class MetapromptExecutor {
    * - `event_based`: fires if the event type is in the pending events set.
    * - `manual`: fires if a flag was set in working memory.
    *
-   * Triggered metaprompts are executed in parallel via `Promise.allSettled`.
-   * Execution errors are logged but do not block the turn.
+   * The metaprompts that fire are queued as one background batch and this
+   * method returns without waiting for their LLM calls. Batches run one at a
+   * time; inside a batch the metaprompts run in parallel via
+   * `Promise.allSettled`. Execution errors are logged to the reasoning trace
+   * and never reach the turn.
    *
    * @param turnId - The current turn identifier (for tracing).
    */
@@ -171,15 +199,83 @@ export class MetapromptExecutor {
         { ids: triggeredMetaPrompts.map((m) => m.id), turnId },
       );
 
-      this.executeMetaprompts(triggeredMetaPrompts).catch((err) => {
-        console.error(`GMI (ID: ${this.config.getGmiId()}): Metaprompt execution error:`, err);
-        this.config.addTraceEntry(
-          'ERROR',
-          'Metaprompt execution failed',
-          { error: (err as Error).message },
-        );
-      });
+      // Queue the batch and return: the turn does not wait for metaprompt LLM calls.
+      void this.enqueue('Metaprompt execution', () => this.executeMetaprompts(triggeredMetaPrompts));
     }
+  }
+
+  /**
+   * Reports whether a metaprompt batch or self-reflection cycle is queued or running.
+   *
+   * @returns `true` while any metaprompt work is pending.
+   */
+  public isRunning(): boolean {
+    return this.inFlight > 0;
+  }
+
+  /**
+   * Resolves once every queued metaprompt batch and self-reflection cycle has
+   * settled, including work queued while waiting. Never rejects.
+   */
+  public async whenIdle(): Promise<void> {
+    let tail: Promise<void>;
+    do {
+      tail = this.queueTail;
+      await tail;
+    } while (tail !== this.queueTail);
+  }
+
+  /**
+   * Waits for queued and running metaprompt work to settle, for at most
+   * `timeoutMs`. The GMI calls this during shutdown so that a batch still in
+   * flight can store its updates before working memory closes, while a
+   * provider call that never settles cannot hold shutdown open.
+   *
+   * @param timeoutMs - Longest wait, in milliseconds.
+   * @returns `true` when all work settled, `false` when the wait timed out.
+   */
+  public async drain(timeoutMs: number = DEFAULT_DRAIN_TIMEOUT_MS): Promise<boolean> {
+    if (!this.isRunning()) return true;
+
+    let resolveTimedOut!: (settled: boolean) => void;
+    const timedOut = new Promise<boolean>((resolve) => {
+      resolveTimedOut = resolve;
+    });
+    const timer = setTimeout(() => resolveTimedOut(false), timeoutMs);
+    // Waiting on a hung provider call must not keep the process alive.
+    (timer as unknown as { unref?: () => void }).unref?.();
+
+    try {
+      return await Promise.race([this.whenIdle().then(() => true), timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Chains one unit of metaprompt work onto the queue, so it starts only after
+   * all earlier work has settled. A failure is logged to the console and the
+   * reasoning trace, and the queue moves on to the next unit.
+   *
+   * @param label - Name used in failure logs (for example 'Metaprompt execution').
+   * @param task - The work to run.
+   * @returns A promise that settles when this unit finishes. It never rejects.
+   */
+  private enqueue(label: string, task: () => Promise<void>): Promise<void> {
+    this.inFlight += 1;
+    const run = this.queueTail
+      .then(task)
+      .catch((error: unknown) => {
+        console.error(`GMI (ID: ${this.config.getGmiId()}): ${label} failed:`, error);
+        this.config.addTraceEntry('ERROR', `${label} failed`, {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        this.inFlight -= 1;
+      });
+    this.queueTail = run;
+    return run;
   }
 
   /**
@@ -225,18 +321,18 @@ export class MetapromptExecutor {
   }
 
   /**
-   * Executes multiple metaprompts in parallel using `Promise.allSettled`.
+   * Executes one batch of metaprompts in parallel using `Promise.allSettled`.
    *
-   * Transitions the GMI to REFLECTING state during execution, restoring the
-   * previous state afterwards.
+   * A failed metaprompt is recorded as an ERROR trace entry and does not stop
+   * the others. The batch never changes the GMI's lifecycle state: it runs in
+   * the background, so the turn that triggered it may have finished and a
+   * later turn may be in progress. {@link MetapromptExecutor.checkAndTriggerMetaprompts}
+   * queues batches so that they run one at a time.
    *
    * @param metaPrompts - The metaprompt definitions to execute.
    */
   public async executeMetaprompts(metaPrompts: MetaPromptDefinition[]): Promise<void> {
     if (metaPrompts.length === 0) return;
-
-    const previousState = this.config.getState();
-    this.config.setState(GMIPrimeState.REFLECTING);
 
     this.config.addTraceEntry(
       'SELF_REFLECTION_START',
@@ -271,14 +367,6 @@ export class MetapromptExecutor {
         gmiError.toPlainObject(),
       );
     } finally {
-      const disallowedStates = new Set([
-        GMIPrimeState.IDLE,
-        GMIPrimeState.INITIALIZING,
-      ]);
-      this.config.setState(
-        disallowedStates.has(previousState) ? GMIPrimeState.READY : previousState,
-      );
-
       this.config.addTraceEntry(
         'SELF_REFLECTION_COMPLETE',
         'Metaprompt execution cycle complete',
@@ -652,8 +740,11 @@ export class MetapromptExecutor {
    * Triggers and processes a full self-reflection cycle using the
    * `gmi_self_trait_adjustment` metaprompt.
    *
-   * Performs the same work as `handleTraitAdjustment` plus guard checks
-   * (already reflecting, no metaprompt defined) and explicit state management.
+   * Performs the same work as `handleTraitAdjustment`, behind two guards: the
+   * cycle is skipped when the persona defines no such metaprompt, and when a
+   * metaprompt batch or another cycle is already queued or running. The cycle
+   * runs on the metaprompt queue and never changes the GMI's lifecycle state.
+   * The returned promise settles when the cycle has finished.
    */
   public async triggerAndProcessSelfReflection(): Promise<void> {
     const persona = this.config.getPersona();
@@ -667,7 +758,7 @@ export class MetapromptExecutor {
       );
       return;
     }
-    if (this.config.getState() === GMIPrimeState.REFLECTING) {
+    if (this.isRunning()) {
       this.config.addTraceEntry(
         'SELF_REFLECTION_SKIPPED',
         'Self-reflection already in progress.',
@@ -675,8 +766,17 @@ export class MetapromptExecutor {
       return;
     }
 
-    const previousState = this.config.getState();
-    this.config.setState(GMIPrimeState.REFLECTING);
+    await this.enqueue('Self-reflection', () => this.runSelfReflectionCycle(reflectionMetaPromptDef));
+  }
+
+  /**
+   * Runs one self-reflection cycle for the `gmi_self_trait_adjustment`
+   * metaprompt: gathers evidence, calls the LLM, and applies the parsed
+   * updates. Errors are recorded in the reasoning trace and not rethrown.
+   *
+   * @param reflectionMetaPromptDef - The `gmi_self_trait_adjustment` definition.
+   */
+  private async runSelfReflectionCycle(reflectionMetaPromptDef: MetaPromptDefinition): Promise<void> {
     this.config.addTraceEntry('SELF_REFLECTION_START', 'Starting self-reflection cycle.');
 
     try {
@@ -812,13 +912,6 @@ export class MetapromptExecutor {
       );
       console.error(`GMI (ID: ${this.config.getGmiId()}) self-reflection error:`, gmiError);
     } finally {
-      const disallowedStates = new Set<GMIPrimeState>([
-        GMIPrimeState.IDLE,
-        GMIPrimeState.INITIALIZING,
-      ]);
-      this.config.setState(
-        disallowedStates.has(previousState) ? GMIPrimeState.READY : previousState,
-      );
       this.config.addTraceEntry(
         'SELF_REFLECTION_COMPLETE',
         'Self-reflection cycle finished.',
