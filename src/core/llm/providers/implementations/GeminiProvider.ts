@@ -1322,14 +1322,22 @@ export class GeminiProvider implements IProvider {
         // --- Tool result messages become user-role functionResponse ---
         // Gemini expects tool results as functionResponse parts in a user turn.
         let responseData: Record<string, unknown>;
-        try {
-          const raw = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '');
-          responseData = typeof msg.content === 'string'
-            ? JSON.parse(raw)
-            : { result: raw };
-        } catch {
-          // If the tool result isn't valid JSON, wrap it
-          responseData = { result: typeof msg.content === 'string' ? msg.content : String(msg.content) };
+        if (typeof msg.content === 'string') {
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(msg.content);
+          } catch {
+            // If the tool result isn't valid JSON, wrap it
+            parsed = msg.content;
+          }
+          // functionResponse.response is a JSON object (a protobuf Struct);
+          // Gemini rejects a string, number, array or null there with HTTP
+          // 400, so such a result is wrapped.
+          responseData = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? (parsed as Record<string, unknown>)
+            : { result: parsed };
+        } else {
+          responseData = { result: JSON.stringify(msg.content ?? '') };
         }
 
         const responsePart: GeminiPart = {

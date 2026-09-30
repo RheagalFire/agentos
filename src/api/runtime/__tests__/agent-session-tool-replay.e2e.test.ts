@@ -16,6 +16,7 @@ const fetchMock = vi.fn();
 vi.stubGlobal('fetch', fetchMock);
 
 import { agent } from '../../agent.js';
+import { generateText } from '../../generateText.js';
 import { globalLLMProviderHealth } from '../../../core/safety/LLMProviderHealthRegistry.js';
 
 type Json = Record<string, any>;
@@ -149,6 +150,33 @@ describe('session replay after a tool round: Gemini', () => {
         parts: [{ text: 'Sunny in Paris.' }],
       });
     }
+  });
+
+  it.each([
+    ['a string', 'Sunny, 18C', { result: 'Sunny, 18C' }],
+    ['an array', ['Paris', 18], { result: ['Paris', 18] }],
+  ])('sends a tool result that is %s as an object, which functionResponse requires', async (_kind, output, expected) => {
+    serve([
+      () => jsonResponse(functionCallResponse([{ functionCall: { name: 'get_weather', args: { city: 'Paris' } } }])),
+      () => jsonResponse(geminiText('Sunny in Paris.')),
+    ]);
+
+    const result = await generateText({
+      provider: 'gemini',
+      model: 'gemini-3.1-pro-preview',
+      apiKey: 'gemini-tool-shape-key',
+      prompt: 'Weather in Paris?',
+      tools: { get_weather: { ...weatherTool.get_weather, execute: async () => output } },
+      maxSteps: 3,
+      fallbackProviders: [],
+    });
+
+    expect(result.text).toBe('Sunny in Paris.');
+    const contents = postedBodies()[1].body.contents as Json[];
+    expect(contents[contents.length - 1]).toEqual({
+      role: 'user',
+      parts: [{ functionResponse: { name: 'get_weather', response: expected } }],
+    });
   });
 
   it('answers parallel function calls in one user turn, each response named after its call', async () => {
