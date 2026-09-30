@@ -40,6 +40,7 @@ import { toOpenAiResponseFormat } from './openai-response-format-guard';
 import { clampMaxOutputTokens } from '../model-output-limits.js';
 import { mapEffortToOpenAiReasoningEffort, mapEffortToOpenAiReasoningEffortForModel, mapEffortToOpenAiResponsesEffort } from '../model-effort.js';
 import { computeRetryBackoffMs } from './retry-backoff.js';
+import { redactUrlSecrets } from '../url-secrets.js';
 // Assuming a fetch-like interface is available globally or polyfilled (e.g., node-fetch)
 // For Node.js, ensure 'node-fetch' is a dependency or use Node's built-in fetch from v18+.
 // import fetch, { RequestInit, Response as FetchResponse, AbortController } from 'node-fetch'; // Example for Node
@@ -1926,7 +1927,13 @@ export class OpenAIProvider implements IProvider {
         } else if (error instanceof Error && error.name === 'AbortError') {
           lastError = new OpenAIProviderError(`Request timed out after ${effectiveTimeout}ms.`, 'REQUEST_TIMEOUT', undefined, undefined, undefined, error);
         } else {
-          lastError = new OpenAIProviderError(error instanceof Error ? error.message : 'Network or unknown error', 'NETWORK_ERROR', undefined, undefined, undefined, error);
+          // fetch quotes a URL it rejects (base URL credentials included) and
+          // a header value it rejects (the key), so the message is masked and
+          // the raw error is not kept.
+          lastError = new OpenAIProviderError(
+            redactUrlSecrets(error instanceof Error ? error.message : 'Network or unknown error', this.config.baseURL, [apiKey]),
+            'NETWORK_ERROR',
+          );
         }
         
         if (attempt === this.config.maxRetries! - 1) {
@@ -1944,7 +1951,11 @@ export class OpenAIProvider implements IProvider {
     // For network errors, replace the cryptic cause chain with a clean message
     if (lastError instanceof OpenAIProviderError && lastError.code === 'NETWORK_ERROR') {
       throw new OpenAIProviderError(
-        `Network error: unable to reach ${this.config.baseURL}. Check your internet connection.`,
+        redactUrlSecrets(
+          `Network error: unable to reach ${this.config.baseURL}. Check your internet connection.`,
+          this.config.baseURL,
+          [apiKey],
+        ),
         'NETWORK_ERROR',
       );
     }

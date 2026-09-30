@@ -18,6 +18,7 @@ import { getDefaultProvider } from './runtime/global-default.js';
 import { attachGenAiAttributes, attachUsageAttributes, toTurnMetricUsage } from './observability.js';
 import { recordAgentOSUsage, type AgentOSUsageLedgerOptions } from './runtime/usageLedger.js';
 import { recordAgentOSTurnMetrics, withAgentOSSpan } from '../safety/evaluation/observability/otel.js';
+import { redactUrlSecrets } from '../core/llm/providers/url-secrets.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -197,7 +198,8 @@ interface OllamaEmbedResponse {
  * @param input - Array of strings to embed.
  * @param dimensions - Optional dimensionality reduction hint.
  * @returns Parsed {@link OpenAIEmbeddingResponse}.
- * @throws {Error} On non-2xx HTTP status or network failure.
+ * @throws {Error} On non-2xx HTTP status or network failure, with base URL
+ *   credentials and the API key masked out of the message.
  */
 async function callOpenAIEmbedding(
   baseUrl: string,
@@ -215,21 +217,53 @@ async function callOpenAIEmbedding(
 
   const url = `${baseUrl.replace(/\/+$/, '')}/embeddings`;
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (error) {
+    throw embeddingFetchError(error, 'Embedding', baseUrl, [apiKey]);
+  }
 
   if (!response.ok) {
     const text = await response.text().catch(() => '(no body)');
-    throw new Error(`Embedding request failed (${response.status}): ${text}`);
+    // A server can echo the key or the URL it was called with.
+    throw new Error(`Embedding request failed (${response.status}): ${redactUrlSecrets(text, baseUrl, [apiKey])}`);
   }
 
   return response.json() as Promise<OpenAIEmbeddingResponse>;
+}
+
+/**
+ * The error raised when fetch rejects an embedding request. fetch quotes the
+ * request URL when it rejects it (a base URL with `user:password@`, or one it
+ * cannot parse) and quotes a header value it rejects, which carries the API
+ * key, so the message is masked. The cause is dropped, since a parse
+ * failure's cause holds the raw URL; a network error code such as
+ * ECONNREFUSED is kept in the message.
+ *
+ * @param error What fetch rejected with.
+ * @param label Names the request in the message.
+ * @param baseUrl The base URL the request was built from.
+ * @param secrets Other secrets the request carried, such as the API key.
+ * @returns An error safe to pass to callers, logs and spans.
+ */
+function embeddingFetchError(
+  error: unknown,
+  label: string,
+  baseUrl: string,
+  secrets: ReadonlyArray<string> = [],
+): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = (error as { cause?: { code?: unknown } } | null | undefined)?.cause?.code;
+  const suffix = typeof code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(code) ? ` (${code})` : '';
+  return new Error(`${label} request failed: ${redactUrlSecrets(message, baseUrl, secrets)}${suffix}`);
 }
 
 /**
@@ -243,7 +277,8 @@ async function callOpenAIEmbedding(
  * @param modelId - The Ollama model name (e.g. `nomic-embed-text`).
  * @param input - Array of strings to embed.
  * @returns Parsed {@link OllamaEmbedResponse}.
- * @throws {Error} On non-2xx HTTP status or network failure.
+ * @throws {Error} On non-2xx HTTP status or network failure, with base URL
+ *   credentials masked out of the message.
  */
 async function callOllamaEmbed(
   baseUrl: string,
@@ -252,15 +287,20 @@ async function callOllamaEmbed(
 ): Promise<OllamaEmbedResponse> {
   const url = `${baseUrl.replace(/\/+$/, '')}/api/embed`;
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: modelId, input }),
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: modelId, input }),
+    });
+  } catch (error) {
+    throw embeddingFetchError(error, 'Ollama embed', baseUrl);
+  }
 
   if (!response.ok) {
     const text = await response.text().catch(() => '(no body)');
-    throw new Error(`Ollama embed request failed (${response.status}): ${text}`);
+    throw new Error(`Ollama embed request failed (${response.status}): ${redactUrlSecrets(text, baseUrl)}`);
   }
 
   return response.json() as Promise<OllamaEmbedResponse>;
