@@ -51,7 +51,7 @@ AgentOS abstracts LLM access behind a unified [`IProvider`](https://github.com/f
 | Provider | Env Var | Default Model | Streaming | Tool Calling | Vision | Embedding | Cost Tier |
 |----------|---------|---------------|-----------|--------------|--------|-----------|-----------|
 | **OpenAI** | `OPENAI_API_KEY` | `gpt-4o` | Yes | Yes | Yes | Yes | $$$ |
-| **Anthropic** | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5-20250929` | Yes | Yes | Yes | No | $$$ |
+| **Anthropic** | `ANTHROPIC_API_KEY` | `claude-sonnet-4-6` | Yes | Yes | Yes | No | $$$ |
 | **Gemini** | `GEMINI_API_KEY` | `gemini-2.5-flash` | Yes | Yes | Yes | Yes | $$ |
 | **Groq** | `GROQ_API_KEY` | `llama-3.3-70b-versatile` | Yes | Yes | No | No | $ |
 | **Together** | `TOGETHER_API_KEY` | `meta-llama/Llama-3.3-70B-Instruct-Turbo` | Yes | Yes | No | Yes | $ |
@@ -59,7 +59,7 @@ AgentOS abstracts LLM access behind a unified [`IProvider`](https://github.com/f
 | **xAI** | `XAI_API_KEY` | `grok-2` | Yes | Yes | Yes | No | $$ |
 | **OpenRouter** | `OPENROUTER_API_KEY` | `openai/gpt-4o` | Yes | Yes | Yes* | Yes* | Varies |
 | **Ollama** | `OLLAMA_BASE_URL` | `llama3.2` | Yes | Partial | Model-dep. | Yes | Free |
-| **Claude Code CLI** | _(PATH detection)_ | `claude-sonnet-4-5-20250929` | Yes | Yes | Yes | No | Free* |
+| **Claude Code CLI** | _(PATH detection)_ | `claude-sonnet-4-6` | Yes | Yes | Yes | No | Free* |
 | **Gemini CLI** | _(PATH detection)_ | `gemini-2.5-flash` | Yes | Partial** | Yes | No | Free* |
 
 *CLI providers use your existing subscription — $0 per token.
@@ -277,11 +277,15 @@ export OPENAI_API_KEY=sk-...
 
 | Model | Context | Vision | Tool Calling | Notes |
 |-------|---------|--------|-------------|-------|
-| `gpt-4o` | 128K | Yes | Yes | Best all-around |
+| `gpt-6-astra` | 1.05M | Yes | Partial | Most capable GPT ($10/$50 per MTok) |
+| `gpt-6-sol` | 1.05M | Yes | Partial | GPT-6 at $2/$10 per MTok |
+| `gpt-6-luna` | 1.05M | Yes | Partial | Cheapest GPT-6 ($0.10/$0.50 per MTok) |
+| `gpt-5.6-sol` | 1.05M | Yes | Yes | GPT-5.6 flagship ($4/$20 per MTok) |
+| `gpt-4o` | 128K | Yes | Yes | Accepts `temperature` |
 | `gpt-4o-mini` | 128K | Yes | Yes | Fast, cheap |
-| `o1` | 200K | Yes | Yes | Reasoning model |
-| `o3-mini` | 200K | No | Yes | Fast reasoning |
-| `gpt-image-1` | — | — | — | Image generation only |
+| `gpt-image-1` | n/a | n/a | n/a | Image generation only. OpenAI retires it on 2026-10-23 |
+
+The GPT-5, GPT-6 and o-series models reject `temperature` and `top_p` and require `max_completion_tokens`; the provider handles both. The provider sends a GPT-5 or GPT-6 request to the Responses API when it is not streamed, carries function tools, sets `effort`, sets no `responseFormat` and has only text message content, and sends everything else to Chat Completions. OpenAI serves GPT-6 tool calls through Responses (Chat Completions accepts them from Sol and Luna only with `reasoning_effort: "none"`), and serves the `-pro` models, `gpt-5.3-codex` and `gpt-5.6-cyber` only through Responses, so those work here only on the Responses path. OpenAI retires `o1`, `o1-pro`, `o3-mini` and `o4-mini` on 2026-10-23, and `o3` and `o3-pro` on 2026-12-11.
 
 **OAuth support:** Use your ChatGPT subscription instead of an API key via the device code flow. See [OAuth Auth](./OAUTH_AUTH.md) for details.
 
@@ -293,12 +297,14 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 | Model | Context | Vision | Tool Calling | Notes |
 |-------|---------|--------|-------------|-------|
-| `claude-fable-5` | 1M | Yes | Yes | Most capable ($10/$50 per MTok) |
-| `claude-opus-4-8` | 1M | Yes | Yes | Best for agents and coding |
+| `claude-opus-5-5` | 1M | Yes | Yes | Recommended starting model ($4/$20 per MTok) |
+| `claude-fable-5-1` | 1M | Yes | Yes | Most capable ($10/$50 per MTok) |
+| `claude-sonnet-5` | 1M | Yes | Yes | Near-Opus coding and agentic work |
+| `claude-opus-5` | 1M | Yes | Yes | Previous Opus ($5/$25 per MTok) |
 | `claude-sonnet-4-6` | 1M | Yes | Yes | Best value |
 | `claude-haiku-4-5-20251001` | 200K | Yes | Yes | Fastest |
 
-Reasoning-default models (`claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`) reject `temperature` and `top_p` with HTTP 400; the provider drops both automatically for these models and sends adaptive thinking when a thinking budget is requested.
+Reasoning-default models (`claude-opus-5-5`, `claude-fable-5-1`, `claude-opus-5`, `claude-fable-5`, `claude-sonnet-5`, `claude-opus-4-8`, `claude-opus-4-7`) reject `temperature` and `top_p` with HTTP 400; the provider drops both automatically for these models and sends adaptive thinking when a thinking budget is requested. Claude Opus 5.5 and the Fable models also reject a forced `tool_choice`, so the provider sends `auto` for them and structured output uses the prompt-based JSON path. Anthropic retired `claude-opus-4-20250514` and `claude-sonnet-4-20250514` on 2026-06-15.
 
 ### Google Gemini
 
@@ -308,9 +314,14 @@ export GEMINI_API_KEY=AIza...
 
 | Model | Context | Vision | Tool Calling | Notes |
 |-------|---------|--------|-------------|-------|
-| `gemini-2.5-pro` | 1M | Yes | Yes | Largest context |
+| `gemini-3.1-pro-preview` | 1M | Yes | Yes | Most capable ($2/$12 per MTok, $4/$18 once the prompt passes 200K tokens) |
+| `gemini-3.8-flash` | 1M | Yes | Yes | Newest Flash ($0.75/$3.75 per MTok through 2026-12-31, then $1.50/$7.50) |
+| `gemini-3.5-flash-lite` | 1M | Yes | Yes | Low-cost Gemini 3 |
+| `gemini-2.5-pro` | 1M | Yes | Yes | Previous-generation Pro |
 | `gemini-2.5-flash` | 1M | Yes | Yes | Fast, large context |
-| `gemini-2.0-flash` | 1M | Yes | Yes | Previous gen |
+| `gemini-2.5-flash-lite` | 1M | Yes | Yes | Cheapest ($0.10/$0.40 per MTok) |
+
+Google has retired `gemini-2.0-flash`, `gemini-2.0-flash-lite` and `gemini-1.5-pro`, and requests for them return HTTP 404. A request for `gemini-3.1-pro-preview` that returns 404 is retried once on `gemini-pro-latest`. On `gemini-3.1-pro-preview`, `effort` sets the thinking level (`low`, `medium` or `high`; `xhigh` and `max` send `high`), and other models keep the API default. A `thinkingConfig` object passed through `customModelParams` takes precedence: `thinkingBudget` on Gemini 2.5, `thinkingLevel` on Gemini 3. The shared `thinking` option is Anthropic's and Gemini ignores it. Gemini 3 requires its thought signature back on every tool-call turn; the provider captures and replays it, and sends Google's placeholder when a turn has none, such as a call made by another provider in a fallback chain.
 
 ### Groq
 
@@ -498,7 +509,7 @@ exercised paths.
 | Provider | Models | Dimensions | Batch Size |
 |----------|--------|-----------|------------|
 | OpenAI | `text-embedding-3-small`, `text-embedding-3-large` | 256–3072 | 2048 |
-| Gemini | `text-embedding-004` | 768 | 2048 |
+| Gemini | `gemini-embedding-001`, `gemini-embedding-2` | 3072 | 100 |
 | Together | `togethercomputer/m2-bert-80M-*` | 768 | 512 |
 | Mistral | `mistral-embed` | 1024 | 512 |
 | Ollama | `nomic-embed-text`, `mxbai-embed-large` | 768–1024 | 512 |
