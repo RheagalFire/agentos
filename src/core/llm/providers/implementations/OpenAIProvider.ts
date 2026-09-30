@@ -347,7 +347,8 @@ export function modelRequiresMaxCompletionTokens(modelId: string): boolean {
  * family prefix alone does not decide the size: `gpt-5.4` is a 1.05M model
  * while its `-mini` and `-nano` siblings are 400K.
  *
- *   - 1,050,000: the GPT-6 family, the GPT-5.6 family except `gpt-5.6-cyber`,
+ *   - 1,050,000: the GPT-6 family (`gpt-6.1-sol` included, per the
+ *     2026-09-29 changelog), the GPT-5.6 family except `gpt-5.6-cyber`,
  *     `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4` and `gpt-5.4-pro` (max input
  *     922,000 on GPT-6).
  *   - 400,000: `gpt-5.6-cyber`, `gpt-5.4-mini` / `-nano`, `gpt-5.3-codex`,
@@ -397,15 +398,15 @@ export const OPENAI_LONG_CONTEXT_OUTPUT_MULTIPLIER = 1.5;
  * {@link OPENAI_LONG_CONTEXT_OUTPUT_MULTIPLIER} times the output rate.
  *
  * OpenAI states the rule for its models with a 1.05M context window, so this
- * reuses {@link openAiReasoningContextWindow}. That covers the GPT-6 family,
- * the GPT-5.6 family except `gpt-5.6-cyber`, `gpt-5.5`, `gpt-5.5-pro`,
- * `gpt-5.4` and `gpt-5.4-pro`, bare or dated. Everything else bills flat at
- * every prompt size: the GPT-5 models with a smaller window (`gpt-5.6-cyber`,
- * which the pricing page lists without a long-context rate, `gpt-5.4-mini` /
- * `-nano`, `gpt-5.3` and older, and the chat-latest snapshots), the o-series,
- * and the pre-GPT-5 models, `gpt-4.1` included despite its 1M window. Checked
- * against developers.openai.com/api/docs/pricing and the model pages on
- * 2026-09-30.
+ * reuses {@link openAiReasoningContextWindow}. That covers the GPT-6 family
+ * (`gpt-6.1-sol` included), the GPT-5.6 family except `gpt-5.6-cyber`,
+ * `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4` and `gpt-5.4-pro`, bare or dated.
+ * Everything else bills flat at every prompt size: the GPT-5 models with a
+ * smaller window (`gpt-5.6-cyber`, which the pricing page lists without a
+ * long-context rate, `gpt-5.4-mini` / `-nano`, `gpt-5.3` and older, and the
+ * chat-latest snapshots), the o-series, and the pre-GPT-5 models, `gpt-4.1`
+ * included despite its 1M window. Checked against
+ * developers.openai.com/api/docs/pricing and the model pages on 2026-09-30.
  *
  * @param modelId Model id as requested or as echoed by the API.
  * @returns `true` when a prompt above the threshold bills at the long-context rates.
@@ -650,6 +651,11 @@ export class OpenAIProvider implements IProvider {
     'gpt-6-astra': { input: 0.01, output: 0.05 },
     'gpt-6-sol': { input: 0.002, output: 0.01 },
     'gpt-6-luna': { input: 0.0001, output: 0.0005 },
+    // gpt-6.1-sol (developers.openai.com/api/docs/changelog, 2026-09-29): $2
+    // input and $10 output per 1M like gpt-6-sol, with cached input at $0.10
+    // (5% of input, where the other GPT-6 models charge 10%) and cache writes
+    // at $2.50. This table carries no cached or cache-write column.
+    'gpt-6.1-sol': { input: 0.002, output: 0.01 },
     // GPT-5.5 family (previous flagship, Jun 2026 — $5 / $30 per 1M tokens, a 2x
     // increase over gpt-5.4; verified against OpenAI's published pricing 2026-06-27)
     'gpt-5.5': { input: 0.005, output: 0.03 },

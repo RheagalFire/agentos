@@ -20,7 +20,7 @@ import { globalLLMProviderHealth } from '../../../safety/LLMProviderHealthRegist
 import { OpenAIProvider, openAiHasLongContextPricing } from '../implementations/OpenAIProvider';
 
 /** Ids the mocked GET /v1/models lists. */
-const LISTED_MODELS = ['gpt-6-sol', 'gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4-mini', 'gpt-4.1'];
+const LISTED_MODELS = ['gpt-6-sol', 'gpt-6.1-sol', 'gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4-mini', 'gpt-4.1'];
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -98,6 +98,7 @@ describe('openAiHasLongContextPricing', () => {
   it.each([
     'gpt-6-astra',
     'gpt-6-sol-2026-09-03',
+    'gpt-6.1-sol',
     'gpt-5.6',
     'gpt-5.6-terra',
     'gpt-5.5-pro',
@@ -130,6 +131,10 @@ describe('OpenAIProvider cost around the 272K threshold', () => {
     ['gpt-5.4-mini', 'gpt-5.4-mini', 300_000, 1_000, 0.2295],
     // 500,000 x $2 per 1M: gpt-4.1 stays flat despite its 1M window.
     ['gpt-4.1', 'gpt-4.1', 500_000, 0, 1.0],
+    // 1,000 x $2 + 1,000 x $10 per 1M: gpt-6.1-sol is metered, not undefined.
+    ['gpt-6.1-sol', 'gpt-6.1-sol', 1_000, 1_000, 0.012],
+    // 500,000 x $4 + 10,000 x $15 per 1M: gpt-6.1-sol carries the long-context tier.
+    ['gpt-6.1-sol', 'gpt-6.1-sol', 500_000, 10_000, 2.15],
   ] as Array<[string, string, number, number, number]>)(
     '%s served as %s with %i prompt and %i completion tokens costs %f USD',
     async (model, served, promptTokens, completionTokens, usd) => {

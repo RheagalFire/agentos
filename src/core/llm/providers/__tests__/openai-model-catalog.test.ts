@@ -25,7 +25,7 @@ import {
 } from '../implementations/OpenAIProvider';
 
 const MODEL_IDS = [
-  'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna',
+  'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna', 'gpt-6.1-sol',
   'gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.1',
   'o3', 'o4-mini', 'o3-mini', 'o3-pro', 'o1-mini', 'gpt-5-pro', 'gpt-5.3-chat-latest',
   'gpt-4o', 'gpt-4o-2024-05-13', 'text-embedding-3-large',
@@ -164,6 +164,16 @@ describe('OpenAI model catalog mapping', () => {
     expect(await provider.getModelInfo('gpt-6-luna')).toMatchObject({
       pricePer1MTokensInput: 0.1,
       pricePer1MTokensOutput: 0.5,
+    });
+  });
+
+  it('lists gpt-6.1-sol at $2 / $10 per 1M with a 1.05M window', async () => {
+    // Released 2026-09-29 (developers.openai.com/api/docs/changelog). A model
+    // with no price row lists at 0 here and meters costUSD undefined.
+    expect(await provider.getModelInfo('gpt-6.1-sol')).toMatchObject({
+      pricePer1MTokensInput: 2,
+      pricePer1MTokensOutput: 10,
+      contextWindowSize: 1050000,
     });
   });
 
