@@ -316,10 +316,14 @@ export function resolveModelOption(opts: ModelOption, task: TaskType = 'text'): 
     // Alternative "provider/model" format — check if the prefix before the
     // first "/" is a known provider ID. This avoids misinterpreting OpenRouter
     // model paths like "meta-llama/llama-3.1-8b" as provider "meta-llama".
+    // An explicit provider wins over another provider's prefix: a gateway
+    // names models `vendor/model` (OpenRouter's `openai/gpt-5.6-sol`), and
+    // that id belongs to the gateway, not to the vendor's own API. A prefix
+    // that repeats the explicit provider is dropped.
     const slashIdx = opts.model.indexOf('/');
     if (slashIdx > 0) {
       const maybeProvider = opts.model.slice(0, slashIdx);
-      if (PROVIDER_DEFAULTS[maybeProvider]) {
+      if (PROVIDER_DEFAULTS[maybeProvider] && (!opts.provider || opts.provider === maybeProvider)) {
         return { providerId: maybeProvider, modelId: opts.model.slice(slashIdx + 1) };
       }
     }

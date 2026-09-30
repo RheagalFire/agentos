@@ -140,6 +140,28 @@ describe('resolveModelOption', () => {
     expect(result).toEqual({ providerId: 'openai', modelId: 'gpt-4o-mini' });
   });
 
+  it('keeps a gateway model id under the provider the caller named', () => {
+    expect(resolveModelOption({ provider: 'openrouter', model: 'openai/gpt-5.6-sol' }, 'text')).toEqual({
+      providerId: 'openrouter',
+      modelId: 'openai/gpt-5.6-sol',
+    });
+    expect(resolveModelOption({ provider: 'openrouter', model: 'anthropic/claude-sonnet-5' }, 'text')).toEqual({
+      providerId: 'openrouter',
+      modelId: 'anthropic/claude-sonnet-5',
+    });
+  });
+
+  it('reads a vendor prefix as the provider when none is named, and drops one that repeats it', () => {
+    expect(resolveModelOption({ model: 'anthropic/claude-sonnet-5' }, 'text')).toEqual({
+      providerId: 'anthropic',
+      modelId: 'claude-sonnet-5',
+    });
+    expect(resolveModelOption({ provider: 'anthropic', model: 'anthropic/claude-sonnet-5' }, 'text')).toEqual({
+      providerId: 'anthropic',
+      modelId: 'claude-sonnet-5',
+    });
+  });
+
   it('resolves legacy model string (backwards compat)', () => {
     const result = resolveModelOption({ model: 'openai:gpt-4o-mini' }, 'text');
     expect(result).toEqual({ providerId: 'openai', modelId: 'gpt-4o-mini' });
