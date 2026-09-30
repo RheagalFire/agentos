@@ -80,7 +80,7 @@ class LLMProviderCircuitOpenError extends Error {
   }
 }
 import type { IModelRouter, ModelRouteParams } from '../core/llm/routing/IModelRouter.js';
-import type { SessionTranscriptMessage } from './sessionTranscript.js';
+import { toProviderReplayMessage, type SessionTranscriptMessage } from './sessionTranscript.js';
 import type {
   MessageContent,
   MessageContentPart,
@@ -1632,13 +1632,15 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
       }
 
       if (opts.messages) {
-        for (const m of opts.messages) messages.push({ role: m.role, content: m.content });
+        // Session history replays through here, so keep the tool pairing
+        // and thinking fields (see toProviderReplayMessage).
+        for (const m of opts.messages) messages.push(toProviderReplayMessage(m));
       }
       // Transcript delta capture (sessions, spec 2026-07-20 §1b): everything
       // from here on is THIS call's contribution. Callers that carry their
       // new user turn inside opts.messages mark how many trailing caller
       // messages belong to the delta.
-      const transcriptDeltaStart =
+      let transcriptDeltaStart =
         messages.length - (opts._transcriptIncludeTrailingCallerMessages ?? 0);
       if (opts.prompt) messages.push({ role: 'user', content: opts.prompt });
 
@@ -1703,6 +1705,9 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
           const firstNonSystem = messages.findIndex((m) => m.role !== 'system');
           const insertIdx = firstNonSystem === -1 ? messages.length: firstNonSystem;
           messages.splice(insertIdx, 0, { role: 'system', content: planPrompt });
+          // The plan lands ahead of this call's transcript delta; keep the
+          // delta starting at the same message.
+          if (insertIdx <= transcriptDeltaStart) transcriptDeltaStart += 1;
           span?.setAttribute('agentos.api.plan_steps', resolvedPlan.steps.length);
         }
       }
@@ -2089,6 +2094,9 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
             ...(((choice.message as unknown as { thinking?: unknown } | undefined)?.thinking) !== undefined
               ? { thinking: (choice.message as unknown as { thinking?: unknown }).thinking }
               : {}),
+            ...(choice.message?.thinkingBlocks?.length
+              ? { thinkingBlocks: choice.message.thinkingBlocks }
+              : {}),
           });
           return {
             transcriptDelta: messages.slice(transcriptDeltaStart) as unknown as SessionTranscriptMessage[],
@@ -2244,6 +2252,9 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
           content: textContent,
           ...(((choice.message as unknown as { thinking?: unknown } | undefined)?.thinking) !== undefined
             ? { thinking: (choice.message as unknown as { thinking?: unknown }).thinking }
+            : {}),
+          ...(choice.message?.thinkingBlocks?.length
+            ? { thinkingBlocks: choice.message.thinkingBlocks }
             : {}),
         });
         return {

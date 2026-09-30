@@ -29,6 +29,7 @@ import {
   type ToolCallRecord,
 } from './generateText.js';
 import type { CacheDiagnostics } from '../core/llm/providers/IProvider.js';
+import { toProviderReplayMessage } from './sessionTranscript.js';
 import type { ModelRouteParams } from '../core/llm/routing/IModelRouter.js';
 import { resolveDynamicToolCalls } from './runtime/dynamicToolCalling.js';
 import type { ITool, ToolExecutionContext } from '../core/tools/ITool.js';
@@ -469,8 +470,10 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
         messages.push({ role: 'system', content: parts });
       }
 
+      // Session history replays through here, so keep the tool pairing and
+      // thinking fields (see toProviderReplayMessage).
       if (opts.messages)
-        for (const m of opts.messages) messages.push({ role: m.role, content: m.content });
+        for (const m of opts.messages) messages.push(toProviderReplayMessage(m));
       if (opts.prompt) messages.push({ role: 'user', content: opts.prompt });
 
       rootSpan?.setAttribute('agentos.api.tool_count', tools.length);
@@ -915,10 +918,16 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
           return;
         }
 
+        // Anthropic requires the tool turn's signed thinking back on the
+        // continuation request (same rule generateText applies per step).
+        const stepThinkingBlocks = finalChunk?.choices?.[0]?.message?.thinkingBlocks;
         messages.push({
           role: 'assistant',
           content: effectiveStepText || null,
           tool_calls: streamedToolCalls,
+          ...(stepThinkingBlocks && stepThinkingBlocks.length > 0
+            ? { thinkingBlocks: stepThinkingBlocks }
+            : {}),
         } as any);
 
         for (const toolCall of streamedToolCalls) {

@@ -1304,12 +1304,19 @@ export class GeminiProvider implements IProvider {
    * - `assistant` -> `model` (Gemini uses "model" instead of "assistant")
    * - `tool` -> `user` with `functionResponse` parts
    *
+   * Consecutive tool results share one `user` turn, because Gemini requires
+   * the responses to a turn of parallel function calls in a single content
+   * (one functionResponse part per call). A tool result without `name`, as
+   * `generateText` records them, takes the function name of the call with the
+   * same id.
+   *
    * @param {ChatMessage[]} messages - IProvider-format messages.
    * @returns {GeminiContent[]} Gemini-format content array.
    * @private
    */
   private convertMessages(messages: ChatMessage[]): GeminiContent[] {
     const contents: GeminiContent[] = [];
+    const toolNameByCallId = new Map<string, string>();
 
     for (const msg of messages) {
       if (msg.role === 'assistant') {
@@ -1329,6 +1336,7 @@ export class GeminiProvider implements IProvider {
         if (msg.tool_calls?.length) {
           const turnHasSignature = msg.tool_calls.some(tc => tc.thoughtSignature);
           msg.tool_calls.forEach((tc, i) => {
+            if (tc.id) toolNameByCallId.set(tc.id, tc.function.name);
             let parsedArgs: Record<string, unknown>;
             try {
               parsedArgs = typeof tc.function.arguments === 'string'
@@ -1370,15 +1378,24 @@ export class GeminiProvider implements IProvider {
           responseData = { result: typeof msg.content === 'string' ? msg.content : String(msg.content) };
         }
 
-        contents.push({
-          role: 'user',
-          parts: [{
-            functionResponse: {
-              name: msg.name || 'unknown',
-              response: responseData,
-            },
-          }],
-        });
+        const responsePart: GeminiPart = {
+          functionResponse: {
+            name: msg.name
+              || (msg.tool_call_id ? toolNameByCallId.get(msg.tool_call_id) : undefined)
+              || 'unknown',
+            response: responseData,
+          },
+        };
+        const previous = contents[contents.length - 1];
+        if (
+          previous?.role === 'user'
+          && previous.parts.length > 0
+          && previous.parts.every(part => part.functionResponse)
+        ) {
+          previous.parts.push(responsePart);
+        } else {
+          contents.push({ role: 'user', parts: [responsePart] });
+        }
 
       } else {
         // --- User messages ---

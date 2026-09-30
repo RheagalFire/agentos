@@ -2178,6 +2178,32 @@ export class AnthropicProvider implements IProvider {
       };
     }
 
+    // --- Assistant text turn that carries thinking ---
+    // A session transcript records a final answer's signed thinking; it
+    // replays verbatim ahead of the answer's content, like a tool turn's.
+    // The content converts exactly as it would without thinking, so text
+    // parts keep their cache_control breakpoints. For models that do not
+    // retain prior thinking, the caller strips it from every assistant turn
+    // but the last one before this runs.
+    if (msg.role === 'assistant' && msg.thinkingBlocks?.length) {
+      const rest = this.toAnthropicMessage({ ...msg, thinkingBlocks: undefined });
+      const restContent = rest.content;
+      const blocks: Array<Record<string, unknown>> = Array.isArray(restContent)
+        ? (restContent as Array<Record<string, unknown>>)
+        : typeof restContent === 'string' && restContent
+          ? [{ type: 'text', text: restContent }]
+          : [];
+      // An answer with no content keeps the plain shape: Anthropic rejects an
+      // assistant turn that holds only thinking.
+      if (blocks.length === 0) return rest;
+      const thinking = msg.thinkingBlocks.map((tb) =>
+        tb.type === 'thinking'
+          ? { type: 'thinking', thinking: tb.thinking, signature: tb.signature }
+          : { type: 'redacted_thinking', data: tb.data },
+      );
+      return { role: 'assistant', content: [...thinking, ...blocks] };
+    }
+
     // --- Multimodal content (vision) ---
     if (Array.isArray(msg.content)) {
       const anthropicContent: Array<Record<string, unknown>> = [];
