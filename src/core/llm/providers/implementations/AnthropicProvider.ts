@@ -36,14 +36,14 @@ import {
 import { stripForeignVendorParams } from '../openrouter-only-params';
 import { AnthropicProviderError } from '../errors/AnthropicProviderError';
 import { ApiKeyPool } from '../../../providers/ApiKeyPool.js';
-import { resolveThinkingPayload } from '../model-thinking.js';
+import { resolveThinkingOff, resolveThinkingPayload } from '../model-thinking.js';
 import { modelSupportsForcedToolChoice } from '../model-forced-tool-choice.js';
 import {
   modelSupportsStrictToolUse,
   toolInputSchemaSupportsStrict,
   toolInputSchemaWithExplicitNoExtraProps,
 } from '../model-strict-tool-use.js';
-import { modelSupportsEffort, isEffortLevel } from '../model-effort.js';
+import { resolveAnthropicEffort } from '../model-effort.js';
 import { computeRetryBackoffMs } from './retry-backoff.js';
 import { recordCacheUsage } from './cacheLeakDetector.js';
 import { resolveCacheCapabilities } from '../model-cache-capabilities.js';
@@ -732,6 +732,20 @@ export function estimateAnthropicCostUSD(
 // ---------------------------------------------------------------------------
 // Provider implementation
 // ---------------------------------------------------------------------------
+
+/** Keys of warnings already printed by {@link warnOnce}. */
+const warnedKeys = new Set<string>();
+
+/**
+ * Prints `message` once per process for `key`, so a setting applied to every
+ * request (thinking off on an always-on model, a capped effort) warns once
+ * rather than on every call.
+ */
+function warnOnce(key: string, message: string): void {
+  if (warnedKeys.has(key)) return;
+  warnedKeys.add(key);
+  console.warn(message);
+}
 
 /**
  * @class AnthropicProvider
@@ -1829,14 +1843,45 @@ export class AnthropicProvider implements IProvider {
       delete payload.top_p;
     }
 
+    // --- Thinking off (options.thinking === false) ---
+    // Leaving the field out keeps the model's default, which is thinking ON
+    // for Opus 5 and Sonnet 5+, so turning it off takes the model's own
+    // shape. Some models accept that shape only at effort high or below; the
+    // effort block below caps it there.
+    let thinkingOffEffortCap: 'high' | undefined;
+    if (!thinkingResolved && options.thinking === false) {
+      const off = resolveThinkingOff(modelId);
+      if (off.kind === 'send') {
+        payload.thinking = off.thinking;
+        thinkingOffEffortCap = off.maxEffort;
+      } else if (off.kind === 'always_on') {
+        warnOnce(
+          `thinking-always-on:${modelId}`,
+          `[agentos] AnthropicProvider: thinking cannot be turned off on ${modelId}; the request runs ` +
+            `with adaptive thinking. Lower options.effort to reduce it.`,
+        );
+      }
+    }
+
     // --- Effort (output_config.effort) ---
     // Reasoning depth + token-spend control on effort-capable Claude models
     // (Opus 4.5+/Sonnet 4.6/Fable/Mythos). Independent of thinking + tool_choice
-    // — it rides on output_config. Dropped on unsupported models OR invalid
-    // values so an out-of-range effort can never 400 the request.
-    if (options.effort && isEffortLevel(options.effort) && modelSupportsEffort(modelId)) {
+    // — it rides on output_config. Dropped on unsupported models or invalid
+    // values, and lowered to a level the model takes, so an out-of-range
+    // effort never returns 400 (see resolveAnthropicEffort).
+    let effort = resolveAnthropicEffort(modelId, options.effort);
+    if (thinkingOffEffortCap && (effort === 'xhigh' || effort === 'max')) {
+      warnOnce(
+        `thinking-off-effort:${modelId}`,
+        `[agentos] AnthropicProvider: ${modelId} turns thinking off only at effort ` +
+          `${thinkingOffEffortCap} or below; sending effort '${thinkingOffEffortCap}' ` +
+          `instead of '${effort}'.`,
+      );
+      effort = thinkingOffEffortCap;
+    }
+    if (effort) {
       const oc = (payload.output_config as Record<string, unknown> | undefined) ?? {};
-      payload.output_config = { ...oc, effort: options.effort };
+      payload.output_config = { ...oc, effort };
     }
 
     // --- Cache diagnostics (beta cache-diagnosis-2026-04-07) ---
@@ -1978,7 +2023,10 @@ export class AnthropicProvider implements IProvider {
     {
       const tc = payload.tool_choice as { type?: string } | undefined;
       if (tc && (tc.type === 'any' || tc.type === 'tool')) {
-        const thinkingActive = Boolean(payload.thinking);
+        // Only a thinking-on shape conflicts with a forced tool_choice; the
+        // off shapes (disabled, between_tools) do not.
+        const thinkingType = (payload.thinking as { type?: string } | undefined)?.type;
+        const thinkingActive = thinkingType === 'adaptive' || thinkingType === 'enabled';
         const modelRejectsForced = !modelSupportsForcedToolChoice(modelId);
         if (thinkingActive || modelRejectsForced) {
           const reason = thinkingActive
@@ -3111,9 +3159,14 @@ export class AnthropicProvider implements IProvider {
     }
   }
 
-  /** True when the request enables extended thinking or replays thinking blocks. */
+  /**
+   * True when the request enables extended thinking or replays thinking
+   * blocks. `{ type: 'disabled' }` turns thinking off; `between_tools` still
+   * returns thinking blocks between tool calls, so it counts.
+   */
   private payloadUsesThinking(body: Record<string, unknown>): boolean {
-    if (body.thinking != null) return true;
+    const thinkingType = (body.thinking as { type?: unknown } | null | undefined)?.type;
+    if (body.thinking != null && thinkingType !== 'disabled') return true;
     const messages = body.messages;
     if (!Array.isArray(messages)) return false;
     return messages.some(m => {

@@ -325,3 +325,139 @@ describe('Claude refusals through the public API', () => {
     expect(postedBodies().map((body) => body.model)).toEqual(['claude-opus-5-5']);
   });
 });
+
+/** Request headers of every request, in call order. */
+function postedHeaders(): Array<Record<string, string>> {
+  return fetchMock.mock.calls.map(([, init]) => {
+    const headers = (init as { headers?: unknown } | undefined)?.headers;
+    if (headers instanceof Headers) return Object.fromEntries(headers.entries());
+    return (headers ?? {}) as Record<string, string>;
+  });
+}
+
+describe('Claude thinking off and effort through the public API', () => {
+  it('turns Sonnet 5.5 off with between_tools and caps effort at high', async () => {
+    route({ 'claude-sonnet-5-5': [textTurn('claude-sonnet-5-5', 'Done.')] });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await generateText({
+      provider: 'anthropic',
+      model: 'claude-sonnet-5-5',
+      prompt: 'Be quick.',
+      thinking: false,
+      effort: 'max',
+      fallbackProviders: [],
+    });
+
+    const [body] = postedBodies();
+    expect(body.thinking).toEqual({ type: 'between_tools' });
+    expect(body.output_config).toEqual({ effort: 'high' });
+    warn.mockRestore();
+  });
+
+  it('sends each fallback model its own off shape, never Sonnet 5.5\'s', async () => {
+    route({
+      'claude-sonnet-5-5': [refusalTurn('claude-sonnet-5-5')],
+      'claude-sonnet-5': [textTurn('claude-sonnet-5', 'Done.')],
+    });
+
+    const result = await generateText({
+      provider: 'anthropic',
+      model: 'claude-sonnet-5-5',
+      prompt: 'Be quick.',
+      thinking: false,
+      fallbackProviders: [{ provider: 'anthropic', model: 'claude-sonnet-5' }],
+    });
+
+    expect(result.text).toBe('Done.');
+    const [primary, leg] = postedBodies();
+    expect(primary.thinking).toEqual({ type: 'between_tools' });
+    expect(leg.thinking).toEqual({ type: 'disabled' });
+  });
+
+  it('keeps a forced tool_choice and sends no interleaved-thinking beta when Opus 5 has thinking off', async () => {
+    route({ 'claude-opus-5': [textTurn('claude-opus-5', 'No tool needed.')] });
+    const { tools } = weatherTools();
+
+    await generateText({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+      prompt: 'Weather in Paris?',
+      tools,
+      toolChoice: 'required',
+      thinking: false,
+      fallbackProviders: [],
+    });
+
+    const [body] = postedBodies();
+    expect(body.thinking).toEqual({ type: 'disabled' });
+    expect(body.tool_choice).toEqual({ type: 'any' });
+    expect(postedHeaders()[0]['anthropic-beta'] ?? '').not.toContain('interleaved-thinking');
+  });
+
+  it('turns thinking off for the planning call too, in generateText and streamText', async () => {
+    const plan = '{"steps":[{"description":"Answer directly.","tool":null,"reasoning":"No tool needed."}]}';
+    route({
+      'claude-opus-5': [
+        textTurn('claude-opus-5', plan),
+        textTurn('claude-opus-5', 'Done.'),
+        textTurn('claude-opus-5', plan),
+        textTurn('claude-opus-5', 'Streamed.'),
+      ],
+    });
+
+    await generateText({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+      prompt: 'Be quick.',
+      planning: true,
+      thinking: false,
+      fallbackProviders: [],
+    });
+    const stream = streamText({
+      provider: 'anthropic',
+      model: 'claude-opus-5',
+      prompt: 'Be quick.',
+      planning: true,
+      thinking: false,
+      fallbackProviders: [],
+    });
+    await collect(stream.fullStream);
+
+    const bodies = postedBodies();
+    expect(bodies).toHaveLength(4);
+    for (const body of bodies) expect(body.thinking).toEqual({ type: 'disabled' });
+  });
+
+  it('sends no thinking field to a model that always thinks or thinks only when asked', async () => {
+    route({
+      'claude-opus-5-5': [textTurn('claude-opus-5-5', 'One.')],
+      'claude-opus-4-8': [textTurn('claude-opus-4-8', 'Two.')],
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await generateText({ provider: 'anthropic', model: 'claude-opus-5-5', prompt: 'Hi', thinking: false, fallbackProviders: [] });
+    await generateText({ provider: 'anthropic', model: 'claude-opus-4-8', prompt: 'Hi', thinking: false, fallbackProviders: [] });
+
+    const [alwaysOn, onRequest] = postedBodies();
+    expect(alwaysOn.thinking).toBeUndefined();
+    expect(onRequest.thinking).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  it('sends each Claude model an effort level it accepts', async () => {
+    route({
+      'claude-sonnet-4-6': [textTurn('claude-sonnet-4-6', 'a')],
+      'claude-opus-4-5-20251101': [textTurn('claude-opus-4-5-20251101', 'b')],
+      'claude-opus-4-6': [textTurn('claude-opus-4-6', 'c')],
+      'claude-opus-4-8': [textTurn('claude-opus-4-8', 'd')],
+    });
+
+    await generateText({ provider: 'anthropic', model: 'claude-sonnet-4-6', prompt: 'x', effort: 'xhigh', fallbackProviders: [] });
+    await generateText({ provider: 'anthropic', model: 'claude-opus-4-5-20251101', prompt: 'x', effort: 'max', fallbackProviders: [] });
+    await generateText({ provider: 'anthropic', model: 'claude-opus-4-6', prompt: 'x', effort: 'max', fallbackProviders: [] });
+    await generateText({ provider: 'anthropic', model: 'claude-opus-4-8', prompt: 'x', effort: 'xhigh', fallbackProviders: [] });
+
+    expect(postedBodies().map((b) => b.output_config?.effort)).toEqual(['high', 'high', 'max', 'xhigh']);
+  });
+});

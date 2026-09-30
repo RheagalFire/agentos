@@ -227,6 +227,15 @@ export interface PlanningConfig {
    * planning-specific value here overrides the inherited one.
    */
   cache?: { ttl?: '5m' | '1h' } | false;
+
+  /**
+   * `false` turns model thinking off for the planning completion, on models
+   * that allow it. Inherits the call's `thinking: false` when unset, so a
+   * caller that switched thinking off does not pay for it in planning. A
+   * thinking budget is not inherited: it is sized for the main call and may
+   * not fit the planning call's `maxTokens`.
+   */
+  thinking?: false;
 }
 
 /**
@@ -425,13 +434,15 @@ export interface GenerateTextOptions {
   /** Hard cap on output tokens. Provider-dependent default applies when omitted. */
   maxTokens?: number;
   /**
-   * Extended-thinking switch forwarded to thinking-capable models (Opus
-   * 4.7/4.8). Any positive `budgetTokens` enables adaptive thinking — the
-   * only form this family accepts; the number itself is not sent and
-   * `maxTokens` passes through unchanged. Omitted = thinking off (provider
-   * default behavior). Has no effect on models that do not support thinking.
+   * Extended-thinking switch forwarded to Claude models. Any positive
+   * `budgetTokens` turns adaptive thinking on (the number itself is not sent
+   * and `maxTokens` passes through unchanged). `false` turns thinking off
+   * with the model's own off shape; Opus 5.5, Fable and Mythos always think.
+   * Omitted keeps the model's default: thinking on for Opus 5 and later,
+   * Sonnet 5 and later, Fable and Mythos, off for older models. Other
+   * providers ignore it.
    */
-  thinking?: { budgetTokens: number };
+  thinking?: { budgetTokens: number } | false;
   /**
    * Reasoning depth / token-spend control forwarded to effort-capable models
    * (Opus 4.5+, Sonnet 4.6, Fable/Mythos 5) as `output_config.effort`
@@ -1035,6 +1046,7 @@ export async function createPlan(
     // Inherited (or planning-specific) cache control: a cache:false root
     // call's planning sub-call must not auto-cache behind the caller's back.
     ...(config?.cache !== undefined ? { cache: config.cache } : {}),
+    ...(config?.thinking === false ? { thinking: false } : {}),
   });
 
   // Accumulate planning call usage
@@ -1813,6 +1825,7 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
             ...(planConfig?.cache !== undefined || opts.cache !== undefined
               ? { cache: planConfig?.cache ?? opts.cache }
               : {}),
+            ...(planConfig?.thinking === false || opts.thinking === false ? { thinking: false as const } : {}),
           },
           totalUsage,
         );
@@ -2609,8 +2622,9 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
                   // answered to open with its signed thinking, and a turn
                   // another model ran has none, so the continuation runs
                   // without a thinking budget. Adaptive thinking turns itself
-                  // off for such a turn.
-                  ...(opts.thinking !== undefined &&
+                  // off for such a turn. `thinking: false` stays as asked.
+                  ...(typeof opts.thinking === 'object' &&
+                  opts.thinking !== null &&
                   (fb.provider === 'anthropic' || /claude/i.test(fb.model ?? '')) &&
                   toolTurnLacksThinking(toolProgress.completedToolRounds.messages)
                     ? { thinking: undefined }

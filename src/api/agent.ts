@@ -796,9 +796,9 @@ export function agent(opts: AgentOptions): Agent {
     // agency()-level enforcement. Unset keeps the provider's default
     // failover pacing. A per-call requestTimeout in `extra` overrides this.
     requestTimeout: opts.controls?.maxDurationMs,
-    // Extended-thinking budget forwarded to thinking-capable models on every
-    // generate / stream / session call (both spread baseOpts). Unset means
-    // thinking stays off; the provider ignores it on unsupported models.
+    // Extended-thinking switch forwarded to Claude models on every generate /
+    // stream / session call (both spread baseOpts): `{ budgetTokens }` turns
+    // thinking on, `false` turns it off, unset keeps the model's default.
     thinking: opts.thinking,
     // Reasoning-effort control forwarded the same way as thinking (both spread
     // into baseOpts -> every generate/stream/session call). Unset -> provider

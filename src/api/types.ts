@@ -1324,11 +1324,13 @@ export interface BaseAgentConfig {
    */
   maxTokens?: number;
   /**
-   * Extended-thinking budget (in tokens) forwarded to thinking-capable
-   * models (Opus 4.7/4.8) on every `generate()` / `stream()` / session call
-   * this agent makes. When set, the provider emits reasoning blocks and
-   * floors `maxTokens` at `budgetTokens + 8192`. Omitted = thinking off.
-   * No effect on models that do not support extended thinking.
+   * Extended-thinking switch forwarded to Claude models on every
+   * `generate()` / `stream()` / session call this agent makes. Any positive
+   * `budgetTokens` turns adaptive thinking on (the number itself is not
+   * sent). `false` turns thinking off with the model's own off shape; Opus
+   * 5.5, Fable and Mythos always think. Omitted keeps the model's default:
+   * thinking on for Opus 5 and later, Sonnet 5 and later, Fable and Mythos,
+   * off for older models. Other providers ignore it.
    *
    * @example
    * ```ts
@@ -1341,7 +1343,7 @@ export interface BaseAgentConfig {
    * });
    * ```
    */
-  thinking?: { budgetTokens: number };
+  thinking?: { budgetTokens: number } | false;
   /**
    * Reasoning-effort control forwarded to every generate/stream/session call.
    * On effort-capable Claude models (Opus 4.5+, Sonnet 4.6, Fable/Mythos 5) the

@@ -140,15 +140,17 @@ export interface ModelCompletionOptions {
    */
   requestTimeout?: number;
   /**
-   * Anthropic extended-thinking switch. When set on a reasoning-default
-   * Claude model (Opus 4.7/4.8), the provider sends
-   * `thinking: { type: 'adaptive' }` — the only form this family accepts;
-   * the budget number is not sent and max_tokens passes through unchanged.
-   * Providers/models that don't support it ignore the field. Single-shot
-   * calls only — preserving thinking blocks across an agent tool loop is
-   * a separate concern.
+   * Anthropic extended-thinking switch. `{ budgetTokens }` turns thinking on:
+   * on a thinking-capable Claude model the provider sends
+   * `thinking: { type: 'adaptive' }` (the budget number is not sent and
+   * max_tokens passes through unchanged). `false` turns it off with the shape
+   * the model takes (`between_tools` on Sonnet 5.5, `disabled` on Opus 5 and
+   * Sonnet 5, capping effort at `high` where the model requires it); Opus
+   * 5.5, Fable and Mythos always think. Omitted keeps the model's default,
+   * which is thinking on for Opus 5 and later, Sonnet 5 and later, Fable and
+   * Mythos, and off for older models. Other providers ignore the field.
    */
-  thinking?: { budgetTokens: number };
+  thinking?: { budgetTokens: number } | false;
   /**
    * Reasoning-effort control. On effort-capable Claude models (Opus 4.5+,
    * Sonnet 4.6, Fable/Mythos 5) the provider sends `output_config.effort`

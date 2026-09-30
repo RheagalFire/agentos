@@ -217,6 +217,26 @@ describe('generateText failover after a tool ran', () => {
     expect(optionsOf(2).thinking).toBeUndefined();
   });
 
+  it('keeps thinking off on a Claude continuation when the caller turned it off', async () => {
+    hoisted.generateCompletion
+      .mockResolvedValueOnce(nativeToolCall())
+      .mockRejectedValueOnce(timeout())
+      .mockResolvedValueOnce(textStep('claude-opus-5', 'Sent it.'));
+
+    await generateText({
+      provider: 'openai',
+      model: 'gpt-4.1',
+      prompt: 'Email Sam.',
+      tools: [sendEmail] as never,
+      maxSteps: 5,
+      thinking: false,
+      fallbackProviders: [{ provider: 'anthropic', model: 'claude-opus-5' }],
+    });
+
+    const legOptions = (hoisted.generateCompletion.mock.calls[2] as unknown[])[2] as { thinking?: unknown };
+    expect(legOptions.thinking).toBe(false);
+  });
+
   it('surfaces the error instead of failing over once a prompt-shim tool ran', async () => {
     hoisted.generateCompletion
       .mockResolvedValueOnce({

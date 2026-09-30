@@ -511,9 +511,14 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
           // Inherit the root per-call cache control (planning-specific
           // override wins) — a cache:false stream's planning sub-call must
           // not auto-cache behind the caller's back.
-          planConfig?.cache !== undefined || opts.cache !== undefined
-            ? { ...planConfig, cache: planConfig?.cache ?? opts.cache }
-            : planConfig,
+          {
+            ...planConfig,
+            requestTimeout: planConfig?.requestTimeout ?? opts.requestTimeout,
+            ...(planConfig?.cache !== undefined || opts.cache !== undefined
+              ? { cache: planConfig?.cache ?? opts.cache }
+              : {}),
+            ...(planConfig?.thinking === false || opts.thinking === false ? { thinking: false as const } : {}),
+          },
           usage,
         );
 

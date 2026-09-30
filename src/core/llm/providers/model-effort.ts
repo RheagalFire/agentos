@@ -34,6 +34,26 @@ export function isEffortLevel(v: unknown): v is EffortLevel {
 }
 
 /**
+ * The `output_config.effort` to send to a Claude model, or undefined to omit
+ * it. Each model accepts its own ladder (Anthropic's model docs): Opus 4.5
+ * takes low, medium and high; Opus 4.6 and Sonnet 4.6 add max but not xhigh,
+ * which arrived with Opus 4.7; Opus 4.7 and later, Sonnet 5 and later, Fable
+ * and Mythos take all five. A level the model does not take is sent as
+ * `high` instead of returning 400. Matches bare and provider-prefixed ids,
+ * like {@link modelSupportsEffort}.
+ *
+ * @param modelId Anthropic-side model id.
+ * @param effort Caller-supplied effort value.
+ * @returns The level to send, or undefined for an unsupported model or value.
+ */
+export function resolveAnthropicEffort(modelId: string, effort: unknown): EffortLevel | undefined {
+  if (!isEffortLevel(effort) || !modelSupportsEffort(modelId)) return undefined;
+  if (/claude-opus-4-5/i.test(modelId) && (effort === 'xhigh' || effort === 'max')) return 'high';
+  if (/claude-(opus|sonnet)-4-6/i.test(modelId) && effort === 'xhigh') return 'high';
+  return effort;
+}
+
+/**
  * OpenAI reasoning models (o-series, GPT-5 and GPT-6 families) take
  * `reasoning_effort` (none|low|medium|high|xhigh) — the OpenAI analogue of
  * Anthropic's `output_config.effort`. This maps the agentos effort scale onto
