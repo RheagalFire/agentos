@@ -33,7 +33,7 @@ import {
   ProviderEmbeddingResponse,
   CacheDiagnostics,
 } from '../IProvider';
-import { stripOpenRouterOnlyParams } from '../openrouter-only-params';
+import { stripForeignVendorParams } from '../openrouter-only-params';
 import { AnthropicProviderError } from '../errors/AnthropicProviderError';
 import { ApiKeyPool } from '../../../providers/ApiKeyPool.js';
 import { resolveThinkingPayload } from '../model-thinking.js';
@@ -1737,8 +1737,9 @@ export class AnthropicProvider implements IProvider {
     }
 
     // Pass through any custom model params — minus OpenRouter's routing
-    // controls, which only OpenRouter's body accepts (a fallback leg reuses
-    // the same params object across hosts; see openrouter-only-params).
+    // controls and Gemini's request fields, which only those vendors' bodies
+    // accept (a fallback leg reuses the same params object across hosts; see
+    // openrouter-only-params).
     //
     // This runs BEFORE the forced tool_choice reconciliation below so that a
     // `tool_choice` injected through customModelParams is reconciled too —
@@ -1753,7 +1754,7 @@ export class AnthropicProvider implements IProvider {
     let customSystemOverride = false;
     let customMessagesOverride = false;
     {
-      const passthrough = stripOpenRouterOnlyParams(options.customModelParams);
+      const passthrough = stripForeignVendorParams(options.customModelParams);
       if (passthrough) {
         customSystemOverride = Object.prototype.hasOwnProperty.call(passthrough, 'system');
         customMessagesOverride = Object.prototype.hasOwnProperty.call(passthrough, 'messages');

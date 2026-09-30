@@ -23,6 +23,7 @@ import { OpenRouterProviderError } from '../errors/OpenRouterProviderError';
 import { ApiKeyPool } from '../../../providers/ApiKeyPool.js';
 import { createGMIErrorFromError, GMIErrorCode } from '../../../utils/errors.js'; // Corrected import path
 import { clampMaxOutputTokens } from '../model-output-limits.js';
+import { stripGeminiOnlyParams } from '../openrouter-only-params';
 
 /**
  * Configuration specific to the OpenRouterProvider.
@@ -529,7 +530,9 @@ export class OpenRouterProvider implements IProvider {
       // usage chunk on streams). Placed before the customModelParams spread
       // so callers can override it.
       usage: { include: true },
-      ...(options.customModelParams || {}),
+      // Gemini's request fields never apply here (a Gemini call that fell
+      // over to OpenRouter still carries them); routing controls stay.
+      ...(stripGeminiOnlyParams(options.customModelParams) || {}),
     };
     this.applyDefaultProviderPrefs(payload);
     this.applySchemaRoutingPrefs(payload, options);
@@ -675,7 +678,9 @@ export class OpenRouterProvider implements IProvider {
       // usage chunk on streams). Placed before the customModelParams spread
       // so callers can override it.
       usage: { include: true },
-      ...(options.customModelParams || {}),
+      // Gemini's request fields never apply here (a Gemini call that fell
+      // over to OpenRouter still carries them); routing controls stay.
+      ...(stripGeminiOnlyParams(options.customModelParams) || {}),
     };
     this.applyDefaultProviderPrefs(payload);
     this.applySchemaRoutingPrefs(payload, options);
@@ -790,7 +795,7 @@ export class OpenRouterProvider implements IProvider {
       input: texts,
       ...(options?.encodingFormat && { encoding_format: options.encodingFormat }),
       ...(options?.dimensions && { dimensions: options.dimensions }),
-      ...(options?.customModelParams || {}),
+      ...(stripGeminiOnlyParams(options?.customModelParams) || {}),
     };
     if (options?.inputType && payload.customModelParams && typeof payload.customModelParams === 'object') {
       (payload.customModelParams as Record<string, unknown>).input_type = options.inputType;

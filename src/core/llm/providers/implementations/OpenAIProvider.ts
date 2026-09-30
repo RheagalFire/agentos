@@ -32,7 +32,7 @@ import {
   ProviderEmbeddingOptions,
   ProviderEmbeddingResponse,
 } from '../IProvider';
-import { stripOpenRouterOnlyParams } from '../openrouter-only-params';
+import { stripForeignVendorParams } from '../openrouter-only-params';
 import { resolveOpenAiCacheRetentionParams, resolvePromptCacheKey } from '../openai-cache-params';
 import { OpenAIProviderError } from '../errors/OpenAIProviderError';
 import { ApiKeyPool } from '../../../providers/ApiKeyPool.js';
@@ -1009,8 +1009,8 @@ export class OpenAIProvider implements IProvider {
         // For now, customModelParams is the way for non-standard things.
     }
     {
-      // Strip OpenRouter-only routing controls; see openrouter-only-params.
-      const passthrough = stripOpenRouterOnlyParams(options?.customModelParams);
+      // Strip OpenRouter routing controls and Gemini request fields; see openrouter-only-params.
+      const passthrough = stripForeignVendorParams(options?.customModelParams);
       if (passthrough) {
         Object.assign(payload, passthrough);
       }
@@ -1184,8 +1184,8 @@ export class OpenAIProvider implements IProvider {
     this.applyCacheAndTierParams(payload, modelId, options);
 
     {
-      // Strip OpenRouter-only routing controls; see openrouter-only-params.
-      const passthrough = stripOpenRouterOnlyParams(options.customModelParams);
+      // Strip OpenRouter routing controls and Gemini request fields; see openrouter-only-params.
+      const passthrough = stripForeignVendorParams(options.customModelParams);
       if (passthrough) {
         Object.assign(payload, passthrough);
       }
@@ -1324,10 +1324,10 @@ export class OpenAIProvider implements IProvider {
     this.applyCacheAndTierParams(payload, modelId, options);
 
     {
-      // Strip OpenRouter-only routing controls; see openrouter-only-params.
+      // Strip OpenRouter routing controls and Gemini request fields; see openrouter-only-params.
       // The /responses body rejects unknown top-level fields just like
       // /chat/completions.
-      const passthrough = stripOpenRouterOnlyParams(options.customModelParams);
+      const passthrough = stripForeignVendorParams(options.customModelParams);
       if (passthrough) {
         Object.assign(payload, passthrough);
       }
