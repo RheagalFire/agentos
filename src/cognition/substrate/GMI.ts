@@ -406,6 +406,25 @@ export class GMI implements IGMI {
   }
 
   /**
+   * Sets one personality trait on this instance only. The persona definition
+   * is shared by every GMI of that persona (it is the GMIManager registry
+   * object), so the change is made on a copy that replaces this instance's
+   * active persona; other sessions and GMIs created later keep the original.
+   *
+   * @param trait - Trait key, e.g. `openness` or `honesty`.
+   * @param value - New trait value.
+   * @throws {GMIError} When the GMI has not been initialized.
+   */
+  public setPersonalityTrait(trait: string, value: number): void {
+    const persona = this.getPersona();
+    this.activePersona = {
+      ...persona,
+      personalityTraits: { ...(persona.personalityTraits ?? {}), [trait]: value },
+    };
+    this.addTraceEntry(ReasoningEntryType.STATE_CHANGE, `Personality trait '${trait}' set to ${value}.`, { trait, value });
+  }
+
+  /**
    * Adds an entry to the GMI's reasoning trace.
    * @private
    */
@@ -893,7 +912,12 @@ export class GMI implements IGMI {
         }
 
         if (isUserInitiatedTurn && currentTurnText) {
-          assembledMemoryContext = await this.memoryBridge?.assembleContext(currentTurnText) ?? null;
+          // Recall is limited to this turn's user, session and conversation scopes.
+          assembledMemoryContext = await this.memoryBridge?.assembleContext(currentTurnText, {
+            sessionId: turnInput.sessionId,
+            conversationId: this.getConversationIdForTurn(turnInput),
+            organizationId: this.getOrganizationIdForTurn(turnInput),
+          }) ?? null;
         }
 
         const promptExecContext = this.buildPromptExecutionContext();

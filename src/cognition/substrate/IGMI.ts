@@ -575,6 +575,18 @@ export interface IGMI {
    */
   recordUserFeedback?(feedback: NormalizedUserFeedback & { userId: string }): Promise<void>;
 
+  /**
+   * Sets one personality trait on this instance without mutating the persona
+   * definition shared with other sessions. Used by the self-improvement
+   * `adapt_personality` tool. Optional so that custom IGMI implementations
+   * keep compiling; without it, personality adaptation reports that the
+   * caller could not be resolved.
+   *
+   * @param trait - Trait key, e.g. `openness` or `honesty`.
+   * @param value - New trait value.
+   */
+  setPersonalityTrait?(trait: string, value: number): void;
+
   getReasoningTrace(): Readonly<ReasoningTrace>;
   getWorkingMemorySnapshot(): Promise<Record<string, any>>;
   getCognitiveMemoryManager(): import('../memory/CognitiveMemoryManager.js').ICognitiveMemoryManager | undefined;
