@@ -1466,10 +1466,13 @@ export class GMI implements IGMI {
     }
 
     if (!providerId && modelId.includes('/')) {
-      const parts = modelId.split('/');
-      if (parts.length >= 2) { // Can be "openai/gpt-3.5-turbo" or "ollama/modelname/variant"
-        providerId = parts[0];
-        // modelId = parts.slice(1).join('/'); // Keep full model name if provider prefix was there
+      // A namespaced id names its provider only when that provider is
+      // registered here. Otherwise it is a router's model id (OpenRouter
+      // lists `openai/gpt-4o-mini`), and the registry lookup below finds the
+      // provider that serves it.
+      const prefix = modelId.split('/')[0];
+      if (prefix && this.llmProviderManager.getProvider(prefix)) {
+        providerId = prefix;
       }
     }
 
@@ -1482,9 +1485,15 @@ export class GMI implements IGMI {
         throw new GMIError(`Cannot determine providerId for model '${modelId}'. No explicit providerId, unable to infer from modelId, and no default provider found for it.`, GMIErrorCode.CONFIGURATION_ERROR, {modelId});
       }
     }
-     // Ensure modelId doesn't contain the provider prefix if providerId is now set
-     if (modelId.startsWith(providerId + '/')) {
-        modelId = modelId.substring(providerId.length + 1);
+    // Drop the provider prefix from the model id. OpenRouter's own ids are
+    // namespaced slugs, and some name OpenRouter itself (`openrouter/auto`),
+    // so there the prefix goes only when it wraps another vendor's slug
+    // (`openrouter/openai/gpt-4o` sends `openai/gpt-4o`).
+    if (modelId.startsWith(providerId + '/')) {
+      const unprefixed = modelId.substring(providerId.length + 1);
+      if (providerId !== 'openrouter' || unprefixed.includes('/')) {
+        modelId = unprefixed;
+      }
     }
 
     return { modelId, providerId };

@@ -156,7 +156,12 @@ async function* streamReply(): AsyncGenerator<ModelCompletionResponse, void, und
  * @param autoReply - When set, every metaprompt call answers with this content
  *   at once. Otherwise each call waits in `pending` until the test settles it.
  */
-async function createHarness(persona: IPersonaDefinition, autoReply?: string): Promise<Harness> {
+async function createHarness(
+  persona: IPersonaDefinition,
+  autoReply?: string,
+  options: { providerId?: string; defaultLlmModelId?: string; defaultLlmProviderId?: string } = {},
+): Promise<Harness> {
+  const providerId = options.providerId ?? PROVIDER_ID;
   const pending: PendingCompletion[] = [];
   const generateCompletion = vi.fn<CompletionFn>(
     (): Promise<ModelCompletionResponse> =>
@@ -167,19 +172,19 @@ async function createHarness(persona: IPersonaDefinition, autoReply?: string): P
           }),
   );
   const provider = {
-    providerId: PROVIDER_ID,
+    providerId,
     isInitialized: true,
     generateCompletion,
     generateCompletionStream: () => streamReply(),
   } as unknown as IProvider;
 
   const llmProviderManager = {
-    getProvider: (providerId: string) => (providerId === PROVIDER_ID ? provider : undefined),
+    getProvider: (id: string) => (id === providerId ? provider : undefined),
     getProviderForModel: () => provider,
     getDefaultProvider: () => provider,
     getModelInfo: async () => ({
       modelId: MODEL_ID,
-      providerId: PROVIDER_ID,
+      providerId,
       contextWindowSize: 128000,
       capabilities: ['chat'],
     }),
@@ -206,8 +211,8 @@ async function createHarness(persona: IPersonaDefinition, autoReply?: string): P
     llmProviderManager,
     utilityAI,
     toolOrchestrator,
-    defaultLlmModelId: MODEL_ID,
-    defaultLlmProviderId: PROVIDER_ID,
+    defaultLlmModelId: options.defaultLlmModelId ?? MODEL_ID,
+    defaultLlmProviderId: 'defaultLlmProviderId' in options ? options.defaultLlmProviderId : PROVIDER_ID,
   };
 
   const gmi = new GMI();
@@ -716,6 +721,44 @@ describe('metaprompt work that runs late', () => {
       ).toHaveLength(1),
     );
     expect(h.generateCompletion).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('metaprompt model resolution on OpenRouter', () => {
+  it('finds the registered router for a namespaced default model instead of guessing its prefix', async () => {
+    // Only OpenRouter is registered; the GMI default model is OpenRouter's
+    // namespaced id and no default provider is configured.
+    const persona = { ...createPersona([MANUAL_REFLECTION]), defaultModelId: undefined, defaultProviderId: undefined };
+    const unpinned = { ...MANUAL_REFLECTION, modelId: undefined, providerId: undefined };
+    const h = await createHarness(
+      { ...persona, metaPrompts: [unpinned] } as unknown as IPersonaDefinition,
+      '{}',
+      { providerId: 'openrouter', defaultLlmModelId: 'openai/gpt-4o-mini', defaultLlmProviderId: undefined },
+    );
+    await arm(h);
+    await runTurn(h.gmi, 'turn-1');
+
+    await vi.waitFor(() => expect(h.generateCompletion).toHaveBeenCalledTimes(1));
+    expect(h.generateCompletion.mock.calls[0][0]).toBe('openai/gpt-4o-mini');
+  });
+
+  it.each([
+    { configured: 'openrouter/auto', sent: 'openrouter/auto' },
+    { configured: 'openrouter/openai/gpt-4o-mini', sent: 'openai/gpt-4o-mini' },
+    { configured: 'openai/gpt-4o-mini', sent: 'openai/gpt-4o-mini' },
+  ])('sends $configured to OpenRouter as $sent', async ({ configured, sent }) => {
+    // No provider is named anywhere, so the model id alone decides.
+    const routed = { ...MANUAL_REFLECTION, modelId: configured, providerId: undefined };
+    const persona = { ...createPersona([routed]), defaultModelId: undefined, defaultProviderId: undefined };
+    const h = await createHarness(persona as unknown as IPersonaDefinition, '{}', {
+      providerId: 'openrouter',
+      defaultLlmProviderId: undefined,
+    });
+    await arm(h);
+    await runTurn(h.gmi, 'turn-1');
+
+    await vi.waitFor(() => expect(h.generateCompletion).toHaveBeenCalledTimes(1));
+    expect(h.generateCompletion.mock.calls[0][0]).toBe(sent);
   });
 });
 
