@@ -385,6 +385,31 @@ describe('Gemini request errors', () => {
     expect(error.message).toContain('https://[redacted]@gateway.example.com');
   });
 
+  it.each([
+    // An email-style username carries its own @.
+    ['https://ops@example.com:gw-token@gateway.example.com/v1beta', 'https://[redacted]@gateway.example.com/v1beta'],
+    // A raw / in the password makes the URL unparseable, so fetch quotes it as given.
+    ['https://svc:gw/token@gateway.example.com/v1beta', 'https://[redacted]@gateway.example.com/v1beta'],
+    ["https://svc:gw)to'ken@gateway.example.com/v1beta", 'https://[redacted]@gateway.example.com/v1beta'],
+    // Scheme-relative and scheme-less base URLs.
+    ['//svc:gw-token@gateway.example.com/v1beta', '//[redacted]@gateway.example.com/v1beta'],
+    ['svc:gw-token@gateway.example.com/v1beta', '[redacted]@gateway.example.com/v1beta'],
+    // A // later in the path does not move the start of the credentials.
+    ['svc:gw-token@gateway.example.com//v1beta', '[redacted]@gateway.example.com//v1beta'],
+    // The API key also appears inside the credentials.
+    ['https://secret-key-123:gw-token@gateway.example.com/v1beta', 'https://[redacted]@gateway.example.com/v1beta'],
+  ])('keeps credentials out of the error for base URL %s', async (baseURL, masked) => {
+    vi.clearAllMocks();
+    fetchMock.mockRejectedValueOnce(new TypeError(`Failed to parse URL from ${baseURL}/models/x:batchEmbedContents?key=secret-key-123`));
+    const provider = new GeminiProvider();
+    await provider.initialize({ apiKey: 'secret-key-123', baseURL, maxRetries: 1 });
+
+    const error = (await provider.generateEmbeddings('gemini-embedding-2', ['hi']).catch((e: unknown) => e)) as Error;
+
+    expect(error.message).not.toMatch(/gw-token|gw\/token|gw\)to'ken|secret-key-123/);
+    expect(error.message).toContain(masked);
+  });
+
   it('keeps the API key out of a failed stream error', async () => {
     vi.clearAllMocks();
     fetchMock.mockRejectedValueOnce(parseError());

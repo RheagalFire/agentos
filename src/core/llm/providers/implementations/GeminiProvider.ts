@@ -141,17 +141,48 @@ interface GeminiBatchEmbedResponse {
 const GEMINI_SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
 
 /**
- * Masks the secrets a request URL can carry in an error message: the `key=`
- * query value (requests authenticate with the key in the URL) and any
- * `user:password@` credentials in the base URL. A fetch that rejects its URL,
- * for example a relative, scheme-less or credential-bearing base URL, names
- * the whole URL in its error.
+ * The credentials part of a base URL, read from the raw string: the text
+ * between the authority start (after a leading `scheme://` or `//`, else the
+ * start of a scheme-less URL) and the last `@`. The last `@` is used because an email-style username
+ * carries its own `@`, and the raw string because a URL that fails to parse
+ * (for example with a `/` in the password) still appears verbatim in fetch's
+ * error.
+ *
+ * @param baseURL Configured base URL.
+ * @returns The credentials substring, or undefined when there is none.
+ */
+function baseUrlCredentials(baseURL: string | undefined): string | undefined {
+  if (!baseURL) return undefined;
+  // Only a leading scheme or `//` opens the authority; a `//` later in the
+  // path must not move the start past the credentials.
+  const scheme = /^[a-z][a-z\d+.-]*:\/\//i.exec(baseURL);
+  const start = scheme ? scheme[0].length : baseURL.startsWith('//') ? 2 : 0;
+  const at = baseURL.lastIndexOf('@');
+  return at > start ? baseURL.slice(start, at) : undefined;
+}
+
+/**
+ * Masks the secrets a request URL carries out of an error message: the API
+ * key the request sent as `key=` and any credentials in the base URL. The
+ * known values are replaced literally, since a pattern cannot tell where
+ * arbitrary credentials end. A fetch that rejects its URL (relative,
+ * scheme-less or credential-bearing) names the whole URL in its error.
  *
  * @param message Error message that may contain the request URL.
- * @returns The message with both kinds of secret replaced by `[redacted]`.
+ * @param apiKey The key the request carried.
+ * @param baseURL Configured base URL.
+ * @returns The message with those secrets replaced by `[redacted]`.
  */
-function redactUrlSecrets(message: string): string {
-  return message
+function redactUrlSecrets(message: string, apiKey: string, baseURL: string | undefined): string {
+  // Longest first, so a key that also appears inside the credentials cannot
+  // split them before the whole credentials string is replaced.
+  const secrets = [baseUrlCredentials(baseURL), apiKey]
+    .filter((secret): secret is string => Boolean(secret))
+    .sort((a, b) => b.length - a.length);
+  let out = message;
+  for (const secret of secrets) out = out.split(secret).join('[redacted]');
+  // Backstops for any other key= value or //user:password@ credentials.
+  return out
     .replace(/([?&]key=)[^&\s"')]+/g, '$1[redacted]')
     .replace(/(\/\/)[^/\s@"')]+@/g, '$1[redacted]@');
 }
@@ -1641,7 +1672,8 @@ export class GeminiProvider implements IProvider {
     requestTimeoutOverride?: number,
   ): Promise<T> {
     // API key is passed as query parameter — Gemini's auth convention
-    const url = `${this.config.baseURL}${endpoint}?key=${this.keyPool?.hasKeys ? this.keyPool.next() : this.config.apiKey}`;
+    const apiKey = this.keyPool?.hasKeys ? this.keyPool.next() : this.config.apiKey;
+    const url = `${this.config.baseURL}${endpoint}?key=${apiKey}`;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'User-Agent': 'AgentOS/1.0 (GeminiProvider)',
@@ -1739,7 +1771,9 @@ export class GeminiProvider implements IProvider {
           );
         } else {
           lastError = new GeminiProviderError(
-            error instanceof Error ? redactUrlSecrets(error.message) : 'Network or unknown error',
+            error instanceof Error
+              ? redactUrlSecrets(error.message, apiKey, this.config.baseURL)
+              : 'Network or unknown error',
             'NETWORK_ERROR',
           );
         }
@@ -1771,7 +1805,8 @@ export class GeminiProvider implements IProvider {
     requestTimeoutOverride?: number,
   ): Promise<ReadableStream<Uint8Array>> {
     // Both alt=sse and key= are query params
-    const url = `${this.config.baseURL}${endpoint}?alt=sse&key=${this.keyPool?.hasKeys ? this.keyPool.next() : this.config.apiKey}`;
+    const apiKey = this.keyPool?.hasKeys ? this.keyPool.next() : this.config.apiKey;
+    const url = `${this.config.baseURL}${endpoint}?alt=sse&key=${apiKey}`;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
       'User-Agent': 'AgentOS/1.0 (GeminiProvider)',
@@ -1818,7 +1853,9 @@ export class GeminiProvider implements IProvider {
       clearTimeout(timeoutId);
       if (error instanceof GeminiProviderError) throw error;
       throw new GeminiProviderError(
-        error instanceof Error ? redactUrlSecrets(error.message) : 'Failed to connect to Gemini stream.',
+        error instanceof Error
+          ? redactUrlSecrets(error.message, apiKey, this.config.baseURL)
+          : 'Failed to connect to Gemini stream.',
         'STREAM_CONNECTION_FAILED',
       );
     }
