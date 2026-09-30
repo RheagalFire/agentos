@@ -64,7 +64,7 @@ export { modelSupportsForcedToolChoice };
  * @example
  * const config: AnthropicProviderConfig = {
  *   apiKey: process.env.ANTHROPIC_API_KEY!,
- *   defaultModelId: 'claude-sonnet-4-20250514',
+ *   defaultModelId: 'claude-sonnet-4-6',
  *   maxRetries: 3,
  * };
  */
@@ -81,7 +81,7 @@ export interface AnthropicProviderConfig {
   baseURL?: string;
   /**
    * Default model ID to use if not specified in a request.
-   * @example "claude-sonnet-4-20250514"
+   * @example "claude-sonnet-4-6"
    */
   defaultModelId?: string;
   /**
@@ -132,8 +132,11 @@ export interface AnthropicProviderConfig {
  * Whether the given Claude model id accepts the `temperature` parameter.
  *
  * Anthropic deprecated `temperature` on reasoning-default models. Opus 4.7,
- * Opus 4.8, Sonnet 5, and Fable 5 (extended-thinking by default) reject requests
+ * Opus 4.8, Opus 5, Opus 5.5, Sonnet 5, Fable 5 and Fable 5.1 reject requests
  * that include it with HTTP 400 "`temperature` is deprecated for this model."
+ * Opus 5, Opus 5.5 and Fable 5.1 were live-probed on 2026-09-29. Opus 5.5 and
+ * Fable 5.1 match the existing `opus-5` and `fable-5` alternatives because
+ * `\b` matches at the hyphen before their trailing version digit.
  * Every earlier Claude model (Opus ≤ 4.6, Sonnet 4.6 and earlier, Haiku) still accepts it.
  * The same family also rejects `top_p` / `top_k`, so {@link buildRequestPayload}
  * gates `top_p` on this predicate too.
@@ -150,10 +153,10 @@ export interface AnthropicProviderConfig {
  *   model, `true` otherwise.
  */
 export function modelSupportsTemperature(modelId: string): boolean {
-  // Claude Opus 4.7 / 4.8, Sonnet 5, Fable 5, and any dated variant — reasoning-default
-  // models that reject `temperature` (and `top_p` / `top_k`). Future
-  // reasoning-first siblings get added here as Anthropic releases them, in
-  // lockstep with modelSupportsThinking.
+  // Reasoning-default models that reject `temperature` (and `top_p` / `top_k`):
+  // Claude Opus 4.7 / 4.8 / 5 / 5.5, Sonnet 5, Fable 5 / 5.1, and any dated
+  // variant. Future reasoning-first siblings get added here as Anthropic
+  // releases them, in lockstep with modelSupportsThinking.
   return !/^claude-(opus-4-(7|8)|opus-5|sonnet-5|fable-5)\b/i.test(modelId);
 }
 
@@ -331,10 +334,36 @@ type AnthropicStreamEvent =
  */
 const ANTHROPIC_MODELS: ModelInfo[] = [
   {
+    modelId: 'claude-opus-5-5',
+    providerId: 'anthropic',
+    displayName: 'Claude Opus 5.5',
+    description: "Anthropic's recommended starting model for most workloads. Frontier Opus for agents and coding, priced below Claude Opus 5.",
+    capabilities: ['chat', 'tool_use', 'vision_input'],
+    contextWindowSize: 1000000,
+    outputTokenLimit: 128000,
+    pricePer1MTokensInput: 4,
+    pricePer1MTokensOutput: 20,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
+    modelId: 'claude-fable-5-1',
+    providerId: 'anthropic',
+    displayName: 'Claude Fable 5.1',
+    description: "Anthropic's most capable model, for demanding reasoning and long-horizon agentic work.",
+    capabilities: ['chat', 'tool_use', 'vision_input'],
+    contextWindowSize: 1000000,
+    outputTokenLimit: 128000,
+    pricePer1MTokensInput: 10,
+    pricePer1MTokensOutput: 50,
+    supportsStreaming: true,
+    status: 'active',
+  },
+  {
     modelId: 'claude-fable-5',
     providerId: 'anthropic',
     displayName: 'Claude Fable 5',
-    description: "Anthropic's most capable widely released model, for the most demanding reasoning and long-horizon agentic work.",
+    description: 'Previous Fable generation, superseded by Claude Fable 5.1.',
     capabilities: ['chat', 'tool_use', 'vision_input'],
     contextWindowSize: 1000000,
     outputTokenLimit: 128000,
@@ -457,31 +486,37 @@ const ANTHROPIC_MODELS: ModelInfo[] = [
   },
   // Legacy entries retained for model-ID back-compat. Prices reflect the
   // original rate card for those specific snapshots.
+  // Claude Opus 4 and Claude Sonnet 4 (the 2025-05-14 snapshots) were retired
+  // by Anthropic on 2026-06-15. Both ids return HTTP 404 not_found_error on the
+  // Messages API (probed 2026-09-29, with a claude-sonnet-5 control returning
+  // 200). They stay in the catalog as `deprecated` so a caller still holding
+  // one of them gets limits, a price and a status from the catalog. Anthropic's
+  // documented replacements are claude-opus-4-8 and claude-sonnet-4-6.
   {
     modelId: 'claude-opus-4-20250514',
     providerId: 'anthropic',
     displayName: 'Claude Opus 4 (2025-05-14)',
-    description: 'Original Opus 4 snapshot. Legacy pricing retained.',
+    description: 'Retired 2026-06-15 and no longer served. Use claude-opus-4-8.',
     capabilities: ['chat', 'tool_use', 'vision_input'],
     contextWindowSize: 200000,
     outputTokenLimit: 32000,
     pricePer1MTokensInput: 15,
     pricePer1MTokensOutput: 75,
     supportsStreaming: true,
-    status: 'active',
+    status: 'deprecated',
   },
   {
     modelId: 'claude-sonnet-4-20250514',
     providerId: 'anthropic',
     displayName: 'Claude Sonnet 4 (2025-05-14)',
-    description: 'Original Sonnet 4 snapshot.',
+    description: 'Retired 2026-06-15 and no longer served. Use claude-sonnet-4-6.',
     capabilities: ['chat', 'tool_use', 'vision_input'],
     contextWindowSize: 200000,
     outputTokenLimit: 64000,
     pricePer1MTokensInput: 3,
     pricePer1MTokensOutput: 15,
     supportsStreaming: true,
-    status: 'active',
+    status: 'deprecated',
   },
 ];
 
@@ -506,12 +541,41 @@ export function clampAnthropicMaxTokens(modelId: string, requested: number): num
  * clamp uses, shared so pricing and clamping can never disagree about which
  * row a model id means (estimateCost's exact-only match priced every dated
  * snapshot id as costUSD undefined: unmetered spend).
+ *
+ * The longest catalog id that prefixes `modelId` wins. Catalog ids nest:
+ * `claude-opus-5` is a prefix of `claude-opus-5-5`. A first-match scan makes
+ * the answer depend on array order and can resolve a dated
+ * `claude-opus-5-5-…` snapshot to Opus 5's row, pricing it at $5/$25 instead
+ * of $4/$20. An id that is itself a prefix of a catalog id, such as the bare
+ * alias `claude-haiku-4-5`, resolves to the first catalog id it prefixes.
  */
 export function resolveAnthropicModelEntry(modelId: string): ModelInfo | undefined {
-  return (
-    ANTHROPIC_MODELS.find((m) => m.modelId === modelId) ??
-    ANTHROPIC_MODELS.find((m) => modelId.startsWith(m.modelId) || m.modelId.startsWith(modelId))
-  );
+  return resolveModelCatalogEntry(ANTHROPIC_MODELS, modelId);
+}
+
+/**
+ * Catalog lookup behind {@link resolveAnthropicModelEntry}, taking the catalog
+ * as a parameter so the ordering behavior can be tested against a catalog
+ * whose shorter id comes first.
+ *
+ * @param catalog Model rows to search, in any order.
+ * @param modelId Caller-supplied model id, bare or dated.
+ * @returns The exact row, else the row with the longest id that prefixes
+ *   `modelId`, else the first row whose id starts with `modelId`.
+ */
+export function resolveModelCatalogEntry(
+  catalog: readonly ModelInfo[],
+  modelId: string,
+): ModelInfo | undefined {
+  const exact = catalog.find((m) => m.modelId === modelId);
+  if (exact) return exact;
+  let longest: ModelInfo | undefined;
+  for (const m of catalog) {
+    if (modelId.startsWith(m.modelId) && (!longest || m.modelId.length > longest.modelId.length)) {
+      longest = m;
+    }
+  }
+  return longest ?? catalog.find((m) => m.modelId.startsWith(modelId));
 }
 
 // ---------------------------------------------------------------------------
@@ -531,7 +595,7 @@ export function resolveAnthropicModelEntry(modelId: string): ModelInfo | undefin
  * const provider = new AnthropicProvider();
  * await provider.initialize({ apiKey: 'sk-ant-...' });
  * const response = await provider.generateCompletion(
- *   'claude-sonnet-4-20250514',
+ *   'claude-sonnet-4-6',
  *   [{ role: 'user', content: 'Hello!' }],
  *   { maxTokens: 1024 },
  * );
@@ -622,7 +686,7 @@ export class AnthropicProvider implements IProvider {
    * to Anthropic's `input_schema` format, and normalizes the response back
    * to IProvider conventions.
    *
-   * @param {string} modelId - The Anthropic model to use (e.g., "claude-sonnet-4-20250514").
+   * @param {string} modelId - The Anthropic model to use (e.g., "claude-sonnet-4-6").
    * @param {ChatMessage[]} messages - Conversation messages. System-role messages are
    *   extracted and sent as the top-level `system` parameter.
    * @param {ModelCompletionOptions} options - Completion options. `maxTokens` is strongly
@@ -1326,7 +1390,7 @@ export class AnthropicProvider implements IProvider {
   /**
    * Retrieves metadata for a specific model from the static catalog.
    *
-   * @param {string} modelId - Model identifier (e.g., "claude-sonnet-4-20250514").
+   * @param {string} modelId - Model identifier (e.g., "claude-sonnet-4-6").
    * @returns {Promise<ModelInfo | undefined>} Model info or undefined if not found.
    */
   public async getModelInfo(modelId: string): Promise<ModelInfo | undefined> {

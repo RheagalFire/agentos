@@ -16,6 +16,9 @@ describe('resolveCacheCapabilities', () => {
     ['anthropic.claude-opus-4-8', { floor: 4096, retains: true }],
     ['claude-opus-5', { floor: 2048, retains: true }],
     ['anthropic/claude-opus-5', { floor: 2048, retains: true }],
+    // Opus 5.5 resolves through the claude-opus-5 branch and shares its row.
+    ['claude-opus-5-5', { floor: 2048, retains: true }],
+    ['anthropic/claude-opus-5-5', { floor: 2048, retains: true }],
     ['anthropic:claude-opus-4-7', { floor: 4096, retains: true }],
     ['claude-opus-4-5-20251101', { floor: 4096, retains: true }],
     // Older Opus — pre-retention
@@ -37,6 +40,7 @@ describe('resolveCacheCapabilities', () => {
     ['claude-3-haiku-20240307', { floor: 2048, retains: false }],
     // Fable / Mythos — modern semantics, 2048 floor
     ['claude-fable-5', { floor: 2048, retains: true }],
+    ['claude-fable-5-1', { floor: 2048, retains: true }],
     ['claude-mythos-5', { floor: 2048, retains: true }],
     // Unknown future claude model — modern default, conservative floor
     ['claude-nova-9', { floor: 4096, retains: true }],

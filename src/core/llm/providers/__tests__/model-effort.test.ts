@@ -25,6 +25,12 @@ describe('modelSupportsEffort', () => {
       'claude-sonnet-4-6',
       'claude-fable-5',
       'claude-mythos-5',
+      // Matched through the existing `opus-5` and `fable-5` alternatives
+      // (the pattern is unanchored). Both accept output_config.effort up to
+      // 'max' (probed 2026-09-29).
+      'claude-opus-5-5',
+      'anthropic/claude-opus-5-5',
+      'claude-fable-5-1',
     ]) {
       expect(modelSupportsEffort(m)).toBe(true);
     }

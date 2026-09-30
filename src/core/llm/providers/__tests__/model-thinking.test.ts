@@ -14,6 +14,26 @@ describe('modelSupportsThinking', () => {
     expect(modelSupportsThinking('claude-fable-5-20260609')).toBe(true);
   });
 
+  // Opus 5.5 and Fable 5.1 match the existing `opus-5` and `fable-5`
+  // alternatives because `\b` matches at the hyphen before the trailing
+  // version digit. Pinned so a re-anchoring such as `opus-5$` fails here.
+  it('is true for Opus 5.5 and Fable 5.1, including dated variants', () => {
+    expect(modelSupportsThinking('claude-opus-5-5')).toBe(true);
+    expect(modelSupportsThinking('claude-opus-5-5-20260901')).toBe(true);
+    expect(modelSupportsThinking('claude-fable-5-1')).toBe(true);
+    expect(modelSupportsThinking('claude-fable-5-1-20260901')).toBe(true);
+  });
+
+  // Opus 5.5 and Fable 5.1 reject both `{type:'disabled'}` and
+  // `{type:'enabled', budget_tokens}` with HTTP 400 (probed 2026-09-29), so the
+  // adaptive form is the only thinking payload they accept.
+  it('emits only the adaptive shape for Opus 5.5 and Fable 5.1', () => {
+    for (const id of ['claude-opus-5-5', 'claude-fable-5-1']) {
+      const r = resolveThinkingPayload(id, { budgetTokens: 8000 }, 4000);
+      expect(r!.thinking).toEqual({ type: 'adaptive' });
+    }
+  });
+
   it('is false for Sonnet 4.6 and earlier, haiku, and pre-4.7 opus', () => {
     expect(modelSupportsThinking('claude-sonnet-4-6')).toBe(false);
     expect(modelSupportsThinking('claude-sonnet-4-5')).toBe(false);
