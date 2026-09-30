@@ -1590,8 +1590,10 @@ export class GMI implements IGMI {
     this.addTraceEntry(ReasoningEntryType.LIFECYCLE, "GMI shutting down.");
     try {
       // Give metaprompt work still in flight a bounded window to store its
-      // updates before the memories it writes to are closed.
+      // updates before the memories it writes to are closed, then stop the
+      // queue: work not yet started is skipped, and late results are dropped.
       await this.metapromptExecutor?.drain();
+      this.metapromptExecutor?.close();
       await this.cognitiveMemory?.shutdown?.();
       await this.workingMemory?.close?.();
       // Shared dependencies (tool orchestrator, retrieval augmentor, utility AI, etc.) are owned by

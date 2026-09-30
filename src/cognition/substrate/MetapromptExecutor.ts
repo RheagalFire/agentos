@@ -92,6 +92,40 @@ export interface MetapromptExecutorConfig {
 const DEFAULT_DRAIN_TIMEOUT_MS = 5000;
 
 /**
+ * Longest a queued unit of metaprompt work may run before the queue moves on
+ * without it, in milliseconds. Each metaprompt LLM call also carries it as its
+ * request timeout, so a stalled provider call is normally cut off first.
+ */
+const DEFAULT_RUN_TIMEOUT_MS = 120_000;
+
+/**
+ * Working-memory keys that hold the GMI's own state. A metaprompt changes
+ * mood, user and task context through its update fields, which the GMI
+ * persists under these keys; an imprint that wrote them would bypass that
+ * path (and race it after a deadline) or fire a manual trigger.
+ */
+function isGmiStateKey(key: string): boolean {
+  return (
+    key === 'currentGmiMood' ||
+    key === 'currentUserContext' ||
+    key === 'currentTaskContext' ||
+    key === 'gmi_sentiment_history' ||
+    key.startsWith('manual_trigger_') ||
+    key.startsWith('metaprompt_turn_counter_')
+  );
+}
+
+/**
+ * One unit of metaprompt work on the queue (a batch or a self-reflection
+ * cycle). `isStale()` turns true when the unit ran past its deadline and the
+ * queue moved on without it, or when the executor was closed; its results are
+ * then discarded rather than applied.
+ */
+export interface MetapromptRun {
+  isStale(): boolean;
+}
+
+/**
  * Handles metaprompt trigger checking, execution, and state application.
  *
  * The metaprompts that fire on one turn are queued as one background batch.
@@ -121,6 +155,24 @@ export class MetapromptExecutor {
 
   /** Metaprompt ids already reported as unable to fire, so each is reported once. */
   private readonly invalidTriggerWarnings = new Set<string>();
+
+  /** Set by {@link MetapromptExecutor.close}: no further work starts, and late results are discarded. */
+  private closed = false;
+
+  /** User turns counted so far, to tell whether a queued event batch still belongs to the latest turn. */
+  private countedTurns = 0;
+
+  /** Deadline for each queued unit of work, in milliseconds (see DEFAULT_RUN_TIMEOUT_MS). */
+  public runTimeoutMs: number = DEFAULT_RUN_TIMEOUT_MS;
+
+  /**
+   * The last memory imprint write queued for each key. Writes to one key run
+   * in the order they were made: a unit that passes its deadline mid-write
+   * releases the queue, but a later unit's write to the same key waits for
+   * that write, so it is never overwritten by it. Writes to other keys do
+   * not wait, so one stalled write cannot hold back the rest.
+   */
+  private readonly writeTails = new Map<string, Promise<void>>();
 
   /** Self-reflection interval (turns between reflections). */
   public selfReflectionIntervalTurns: number;
@@ -172,6 +224,8 @@ export class MetapromptExecutor {
     }
 
     const countTurn = options.countTurn !== false;
+    if (countTurn) this.countedTurns += 1;
+    const queuedAtTurn = this.countedTurns;
     const triggeredMetaPrompts: MetaPromptDefinition[] = [];
     const pendingEvents = this.config.getPendingEvents();
 
@@ -223,7 +277,22 @@ export class MetapromptExecutor {
       );
 
       // Queue the batch and return: the turn does not wait for metaprompt LLM calls.
-      void this.enqueue('Metaprompt execution', () => this.executeMetaprompts(triggeredMetaPrompts));
+      void this.enqueue('Metaprompt execution', (run) => {
+        // An event-based metaprompt reacts to the turn that raised the event
+        // (a frustrated or confused message). If a newer user turn has been
+        // counted while this batch waited behind a slow one, that evidence is
+        // gone, so it is dropped rather than applied to a later mood.
+        const current = this.countedTurns === queuedAtTurn;
+        const runnable = current
+          ? triggeredMetaPrompts
+          : triggeredMetaPrompts.filter((mp) => mp.trigger?.type !== 'event_based');
+        if (runnable.length < triggeredMetaPrompts.length) {
+          this.config.addTraceEntry('DEBUG', 'Skipped event-based metaprompts whose triggering turn has passed.', {
+            ids: triggeredMetaPrompts.filter((mp) => !runnable.includes(mp)).map((mp) => mp.id),
+          });
+        }
+        return this.executeMetaprompts(runnable, run);
+      });
     }
   }
 
@@ -233,7 +302,8 @@ export class MetapromptExecutor {
    * @returns `true` while any metaprompt work is pending.
    */
   public isRunning(): boolean {
-    return this.inFlight > 0;
+    // A unit released at its deadline can leave a memory write running.
+    return this.inFlight > 0 || this.writeTails.size > 0;
   }
 
   /**
@@ -245,7 +315,9 @@ export class MetapromptExecutor {
     do {
       tail = this.queueTail;
       await tail;
-    } while (tail !== this.queueTail);
+      // Memory writes a unit started before its deadline outlive the unit.
+      await Promise.all(this.writeTails.values());
+    } while (tail !== this.queueTail || this.writeTails.size > 0);
   }
 
   /**
@@ -276,6 +348,15 @@ export class MetapromptExecutor {
   }
 
   /**
+   * Stops the queue for good, as the GMI shuts down: work that has not started
+   * is skipped, and results of work still running are discarded instead of
+   * applied to memories that are closing.
+   */
+  public close(): void {
+    this.closed = true;
+  }
+
+  /**
    * Chains one unit of metaprompt work onto the queue, so it starts only after
    * all earlier work has settled. A failure is logged to the console and the
    * reasoning trace, and the queue moves on to the next unit.
@@ -284,10 +365,33 @@ export class MetapromptExecutor {
    * @param task - The work to run.
    * @returns A promise that settles when this unit finishes. It never rejects.
    */
-  private enqueue(label: string, task: () => Promise<void>): Promise<void> {
+  private enqueue(label: string, task: (run: MetapromptRun) => Promise<void>): Promise<void> {
     this.inFlight += 1;
-    const run = this.queueTail
-      .then(task)
+    let overdue = false;
+    const run: MetapromptRun = { isStale: () => overdue || this.closed };
+    const unit = async (): Promise<void> => {
+      if (this.closed) return;
+      // A provider call that never settles would hold the queue forever;
+      // past the deadline the queue moves on, and the unit's late results
+      // are discarded (run.isStale()).
+      const timeoutMs = this.runTimeoutMs;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<'timeout'>((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), timeoutMs);
+        (timer as unknown as { unref?: () => void }).unref?.();
+      });
+      try {
+        const outcome = await Promise.race([task(run).then(() => 'done' as const), deadline]);
+        if (outcome === 'timeout') {
+          overdue = true;
+          this.config.addTraceEntry('WARNING', `${label} did not finish within ${timeoutMs}ms; its results will be discarded.`);
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+    const settled = this.queueTail
+      .then(unit)
       .catch((error: unknown) => {
         console.error(`GMI (ID: ${this.config.getGmiId()}): ${label} failed:`, error);
         this.config.addTraceEntry('ERROR', `${label} failed`, {
@@ -297,8 +401,8 @@ export class MetapromptExecutor {
       .finally(() => {
         this.inFlight -= 1;
       });
-    this.queueTail = run;
-    return run;
+    this.queueTail = settled;
+    return settled;
   }
 
   /**
@@ -421,7 +525,7 @@ export class MetapromptExecutor {
    *
    * @param metaPrompts - The metaprompt definitions to execute.
    */
-  public async executeMetaprompts(metaPrompts: MetaPromptDefinition[]): Promise<void> {
+  public async executeMetaprompts(metaPrompts: MetaPromptDefinition[], run?: MetapromptRun): Promise<void> {
     if (metaPrompts.length === 0) return;
 
     this.config.addTraceEntry(
@@ -432,7 +536,7 @@ export class MetapromptExecutor {
 
     try {
       const results = await Promise.allSettled(
-        metaPrompts.map((mp) => this.executeMetapromptHandler(mp)),
+        metaPrompts.map((mp) => this.executeMetapromptHandler(mp, run)),
       );
 
       results.forEach((result, idx) => {
@@ -472,22 +576,22 @@ export class MetapromptExecutor {
    *
    * @param metaPrompt - The metaprompt definition to execute.
    */
-  public async executeMetapromptHandler(metaPrompt: MetaPromptDefinition): Promise<void> {
+  public async executeMetapromptHandler(metaPrompt: MetaPromptDefinition, run?: MetapromptRun): Promise<void> {
     switch (metaPrompt.id) {
       case 'gmi_self_trait_adjustment':
-        return this.handleTraitAdjustment(metaPrompt);
+        return this.handleTraitAdjustment(metaPrompt, run);
       case 'gmi_frustration_recovery':
-        return this.handleFrustrationRecovery(metaPrompt);
+        return this.handleFrustrationRecovery(metaPrompt, run);
       case 'gmi_confusion_clarification':
-        return this.handleConfusionClarification(metaPrompt);
+        return this.handleConfusionClarification(metaPrompt, run);
       case 'gmi_satisfaction_reinforcement':
-        return this.handleSatisfactionReinforcement(metaPrompt);
+        return this.handleSatisfactionReinforcement(metaPrompt, run);
       case 'gmi_error_recovery':
-        return this.handleErrorRecovery(metaPrompt);
+        return this.handleErrorRecovery(metaPrompt, run);
       case 'gmi_engagement_boost':
-        return this.handleEngagementBoost(metaPrompt);
+        return this.handleEngagementBoost(metaPrompt, run);
       default:
-        return this.handleGenericMetaprompt(metaPrompt);
+        return this.handleGenericMetaprompt(metaPrompt, run);
     }
   }
 
@@ -499,7 +603,7 @@ export class MetapromptExecutor {
    *
    * @param metaPrompt - The metaprompt definition.
    */
-  public async handleTraitAdjustment(metaPrompt: MetaPromptDefinition): Promise<void> {
+  public async handleTraitAdjustment(metaPrompt: MetaPromptDefinition, run?: MetapromptRun): Promise<void> {
     const evidenceHistory = this.config.getConversationHistory().slice(-10);
     const evidenceTrace = this.config.getReasoningTraceEntries().slice(-20);
 
@@ -518,8 +622,8 @@ export class MetapromptExecutor {
       task_complexity: this.config.getTaskContext().complexity || 'unknown',
     };
 
-    const response = await this.executeMetapromptWithVariables(metaPrompt, variables);
-    await this.applyMetapromptUpdates(response, metaPrompt.id);
+    const response = await this.executeMetapromptWithVariables(metaPrompt, variables, run);
+    await this.applyMetapromptUpdates(response, metaPrompt.id, run);
   }
 
   /**
@@ -527,7 +631,7 @@ export class MetapromptExecutor {
    *
    * @param metaPrompt - The metaprompt definition.
    */
-  public async handleFrustrationRecovery(metaPrompt: MetaPromptDefinition): Promise<void> {
+  public async handleFrustrationRecovery(metaPrompt: MetaPromptDefinition, run?: MetapromptRun): Promise<void> {
     const sentimentHistory = await this.config.workingMemory.get<SentimentHistoryState>(
       'gmi_sentiment_history',
     );
@@ -546,8 +650,8 @@ export class MetapromptExecutor {
       task_complexity: this.config.getTaskContext().complexity || 'unknown',
     };
 
-    const response = await this.executeMetapromptWithVariables(metaPrompt, variables);
-    await this.applyMetapromptUpdates(response, metaPrompt.id);
+    const response = await this.executeMetapromptWithVariables(metaPrompt, variables, run);
+    await this.applyMetapromptUpdates(response, metaPrompt.id, run);
   }
 
   /**
@@ -555,7 +659,7 @@ export class MetapromptExecutor {
    *
    * @param metaPrompt - The metaprompt definition.
    */
-  public async handleConfusionClarification(metaPrompt: MetaPromptDefinition): Promise<void> {
+  public async handleConfusionClarification(metaPrompt: MetaPromptDefinition, run?: MetapromptRun): Promise<void> {
     const sentimentHistory = await this.config.workingMemory.get<SentimentHistoryState>(
       'gmi_sentiment_history',
     );
@@ -577,8 +681,8 @@ export class MetapromptExecutor {
       task_complexity: this.config.getTaskContext().complexity || 'unknown',
     };
 
-    const response = await this.executeMetapromptWithVariables(metaPrompt, variables);
-    await this.applyMetapromptUpdates(response, metaPrompt.id);
+    const response = await this.executeMetapromptWithVariables(metaPrompt, variables, run);
+    await this.applyMetapromptUpdates(response, metaPrompt.id, run);
   }
 
   /**
@@ -586,7 +690,7 @@ export class MetapromptExecutor {
    *
    * @param metaPrompt - The metaprompt definition.
    */
-  public async handleSatisfactionReinforcement(metaPrompt: MetaPromptDefinition): Promise<void> {
+  public async handleSatisfactionReinforcement(metaPrompt: MetaPromptDefinition, run?: MetapromptRun): Promise<void> {
     const sentimentHistory = await this.config.workingMemory.get<SentimentHistoryState>(
       'gmi_sentiment_history',
     );
@@ -601,8 +705,8 @@ export class MetapromptExecutor {
       task_complexity: this.config.getTaskContext().complexity || 'unknown',
     };
 
-    const response = await this.executeMetapromptWithVariables(metaPrompt, variables);
-    await this.applyMetapromptUpdates(response, metaPrompt.id);
+    const response = await this.executeMetapromptWithVariables(metaPrompt, variables, run);
+    await this.applyMetapromptUpdates(response, metaPrompt.id, run);
   }
 
   /**
@@ -610,7 +714,7 @@ export class MetapromptExecutor {
    *
    * @param metaPrompt - The metaprompt definition.
    */
-  public async handleErrorRecovery(metaPrompt: MetaPromptDefinition): Promise<void> {
+  public async handleErrorRecovery(metaPrompt: MetaPromptDefinition, run?: MetapromptRun): Promise<void> {
     const recentErrors = this.config.getReasoningTraceEntries()
       .slice(-10)
       .filter((e) => e.type === ('ERROR' as ReasoningEntryType));
@@ -623,8 +727,8 @@ export class MetapromptExecutor {
       task_complexity: this.config.getTaskContext().complexity || 'unknown',
     };
 
-    const response = await this.executeMetapromptWithVariables(metaPrompt, variables);
-    await this.applyMetapromptUpdates(response, metaPrompt.id);
+    const response = await this.executeMetapromptWithVariables(metaPrompt, variables, run);
+    await this.applyMetapromptUpdates(response, metaPrompt.id, run);
   }
 
   /**
@@ -632,7 +736,7 @@ export class MetapromptExecutor {
    *
    * @param metaPrompt - The metaprompt definition.
    */
-  public async handleEngagementBoost(metaPrompt: MetaPromptDefinition): Promise<void> {
+  public async handleEngagementBoost(metaPrompt: MetaPromptDefinition, run?: MetapromptRun): Promise<void> {
     const sentimentHistory = await this.config.workingMemory.get<SentimentHistoryState>(
       'gmi_sentiment_history',
     );
@@ -645,8 +749,8 @@ export class MetapromptExecutor {
       task_complexity: this.config.getTaskContext().complexity || 'unknown',
     };
 
-    const response = await this.executeMetapromptWithVariables(metaPrompt, variables);
-    await this.applyMetapromptUpdates(response, metaPrompt.id);
+    const response = await this.executeMetapromptWithVariables(metaPrompt, variables, run);
+    await this.applyMetapromptUpdates(response, metaPrompt.id, run);
   }
 
   /**
@@ -656,7 +760,7 @@ export class MetapromptExecutor {
    *
    * @param metaPrompt - The metaprompt definition.
    */
-  public async handleGenericMetaprompt(metaPrompt: MetaPromptDefinition): Promise<void> {
+  public async handleGenericMetaprompt(metaPrompt: MetaPromptDefinition, run?: MetapromptRun): Promise<void> {
     const variables = {
       recent_conversation: JSON.stringify(this.config.getConversationHistory().slice(-5)),
       recent_reasoning: JSON.stringify(this.config.getReasoningTraceEntries().slice(-10)),
@@ -666,8 +770,8 @@ export class MetapromptExecutor {
       current_sentiment: this.config.getUserContext().currentSentiment || 'neutral',
     };
 
-    const response = await this.executeMetapromptWithVariables(metaPrompt, variables);
-    await this.applyMetapromptUpdates(response, metaPrompt.id);
+    const response = await this.executeMetapromptWithVariables(metaPrompt, variables, run);
+    await this.applyMetapromptUpdates(response, metaPrompt.id, run);
   }
 
   /**
@@ -687,6 +791,7 @@ export class MetapromptExecutor {
   public async executeMetapromptWithVariables(
     metaPrompt: MetaPromptDefinition,
     variables: Record<string, string>,
+    run?: MetapromptRun,
   ): Promise<any> {
     let template: string;
     if (typeof metaPrompt.promptTemplate === 'string') {
@@ -718,6 +823,8 @@ export class MetapromptExecutor {
       temperature: metaPrompt.temperature ?? 0.3,
       maxTokens: metaPrompt.maxOutputTokens ?? 512,
       responseFormat: { type: 'json_object' },
+      // Bounds a stalled provider call before the queue's own deadline does.
+      requestTimeout: this.runTimeoutMs,
     };
 
     const provider = this.config.llmProviderManager.getProvider(providerId);
@@ -726,6 +833,13 @@ export class MetapromptExecutor {
         `Provider '${providerId}' not found for metaprompt '${metaPrompt.id}'.`,
         GMIErrorCode.LLM_PROVIDER_UNAVAILABLE,
       );
+    }
+
+    // A run can go stale while its handler awaits memory reads; it then
+    // starts no provider call whose answer would be discarded.
+    if (run?.isStale()) {
+      this.config.addTraceEntry('WARNING', `Discarded late results of metaprompt '${metaPrompt.id}'.`);
+      return null;
     }
 
     const result = await provider.generateCompletion(
@@ -741,6 +855,13 @@ export class MetapromptExecutor {
         GMIErrorCode.LLM_PROVIDER_ERROR,
         { response: result },
       );
+    }
+
+    // A run that went stale while the provider answered is discarded anyway,
+    // so no JSON repair call is made on its behalf.
+    if (run?.isStale()) {
+      this.config.addTraceEntry('WARNING', `Discarded late results of metaprompt '${metaPrompt.id}'.`);
+      return null;
     }
 
     const parseOptions: ParseJsonOptions = {
@@ -765,9 +886,19 @@ export class MetapromptExecutor {
    *
    * @param updates - The parsed updates from the metaprompt LLM response.
    * @param metapromptId - The ID of the metaprompt that produced these updates.
+   * @param run - The queued unit applying them; once it is stale, nothing
+   *   more is applied.
+   * @returns Keys of the memory imprints stored.
    */
-  public async applyMetapromptUpdates(updates: any, metapromptId: string): Promise<void> {
-    if (!updates) return;
+  public async applyMetapromptUpdates(updates: any, metapromptId: string, run?: MetapromptRun): Promise<string[]> {
+    const storedImprintKeys: string[] = [];
+    if (!updates) return storedImprintKeys;
+    if (run?.isStale()) {
+      // The queue moved on without this unit, or the GMI shut down: its
+      // results would land on state that no longer matches its evidence.
+      this.config.addTraceEntry('WARNING', `Discarded late results of metaprompt '${metapromptId}'.`);
+      return storedImprintKeys;
+    }
 
     let stateChanged = false;
 
@@ -801,12 +932,28 @@ export class MetapromptExecutor {
     // Memory imprints
     if (updates.newMemoryImprints && Array.isArray(updates.newMemoryImprints)) {
       for (const imprint of updates.newMemoryImprints) {
-        if (imprint.key) {
-          await this.config.workingMemory.set(imprint.key, imprint.value);
+        // A write can outlast the run's deadline. Once the queue has moved
+        // on or the GMI has shut down, the remaining imprints would overwrite
+        // newer values or reach a closed memory, so they are dropped.
+        if (run?.isStale()) {
+          this.config.addTraceEntry('WARNING', `Discarded late results of metaprompt '${metapromptId}'.`);
+          break;
         }
-      }
-      if (updates.newMemoryImprints.length > 0) {
-        stateChanged = true;
+        if (imprint.key && isGmiStateKey(imprint.key)) {
+          this.config.addTraceEntry('WARNING', `Skipped memory imprint '${imprint.key}' from metaprompt '${metapromptId}': the key holds GMI state.`);
+          continue;
+        }
+        if (imprint.key) {
+          const stored = await this.writeInOrder(run, imprint.key, () =>
+            this.config.workingMemory.set(imprint.key, imprint.value),
+          );
+          if (!stored) {
+            this.config.addTraceEntry('WARNING', `Discarded late results of metaprompt '${metapromptId}'.`);
+            break;
+          }
+          storedImprintKeys.push(imprint.key);
+          stateChanged = true;
+        }
       }
     }
 
@@ -823,6 +970,35 @@ export class MetapromptExecutor {
         },
       );
     }
+    return storedImprintKeys;
+  }
+
+  /**
+   * Runs one memory write after every write to the same key queued before
+   * it, unless `run` has gone stale by the time its turn comes.
+   *
+   * @param run The unit making the write.
+   * @param key The working-memory key written.
+   * @param write The write itself.
+   * @returns Whether the write ran.
+   */
+  private writeInOrder(run: MetapromptRun | undefined, key: string, write: () => Promise<void>): Promise<boolean> {
+    const previous = this.writeTails.get(key) ?? Promise.resolve();
+    const result = previous.then(async () => {
+      if (run?.isStale()) return false;
+      await write();
+      return true;
+    });
+    const tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.writeTails.set(key, tail);
+    // Forget the key once its last queued write settles.
+    void tail.then(() => {
+      if (this.writeTails.get(key) === tail) this.writeTails.delete(key);
+    });
+    return result;
   }
 
   /**
@@ -855,7 +1031,7 @@ export class MetapromptExecutor {
       return;
     }
 
-    await this.enqueue('Self-reflection', () => this.runSelfReflectionCycle(reflectionMetaPromptDef));
+    await this.enqueue('Self-reflection', (run) => this.runSelfReflectionCycle(reflectionMetaPromptDef, run));
   }
 
   /**
@@ -865,7 +1041,10 @@ export class MetapromptExecutor {
    *
    * @param reflectionMetaPromptDef - The `gmi_self_trait_adjustment` definition.
    */
-  private async runSelfReflectionCycle(reflectionMetaPromptDef: MetaPromptDefinition): Promise<void> {
+  private async runSelfReflectionCycle(
+    reflectionMetaPromptDef: MetaPromptDefinition,
+    run?: MetapromptRun,
+  ): Promise<void> {
     this.config.addTraceEntry('SELF_REFLECTION_START', 'Starting self-reflection cycle.');
 
     try {
@@ -914,6 +1093,11 @@ export class MetapromptExecutor {
         );
       }
 
+      if (run?.isStale()) {
+        this.config.addTraceEntry('WARNING', "Discarded late results of metaprompt 'gmi_self_trait_adjustment'.");
+        return;
+      }
+
       const llmResponse = await provider.generateCompletion(
         modelId,
         [{ role: 'user', content: metaPromptText }],
@@ -921,6 +1105,7 @@ export class MetapromptExecutor {
           maxTokens: reflectionMetaPromptDef.maxOutputTokens || 512,
           temperature: reflectionMetaPromptDef.temperature || 0.3,
           responseFormat: { type: 'json_object' },
+          requestTimeout: this.runTimeoutMs,
         },
       );
 
@@ -937,6 +1122,13 @@ export class MetapromptExecutor {
         'LLM response for reflection received.',
         { preview: responseContent.substring(0, 100) },
       );
+
+      // A cycle that went stale while the provider answered is discarded
+      // anyway, so no JSON repair call is made on its behalf.
+      if (run?.isStale()) {
+        this.config.addTraceEntry('WARNING', "Discarded late results of metaprompt 'gmi_self_trait_adjustment'.");
+        return;
+      }
 
       const parseOptions: ParseJsonOptions = {
         attemptFixWithLLM: true,
@@ -969,14 +1161,15 @@ export class MetapromptExecutor {
       );
 
       // Apply updates via callbacks
-      await this.applyMetapromptUpdates(parsedUpdates, 'gmi_self_trait_adjustment');
+      const storedImprintKeys = await this.applyMetapromptUpdates(parsedUpdates, 'gmi_self_trait_adjustment', run);
 
-      // Handle memory imprints specifically for the trace
-      if (parsedUpdates.newMemoryImprints && parsedUpdates.newMemoryImprints.length > 0) {
+      // Trace only the imprints that were stored: a late or stale run
+      // stores none, and later reflections read this trace as evidence.
+      if (storedImprintKeys.length > 0) {
         this.config.addTraceEntry(
           'STATE_CHANGE',
           'New memory imprints added from self-reflection.',
-          { imprints: parsedUpdates.newMemoryImprints.map((i) => i.key) },
+          { imprints: storedImprintKeys },
         );
       }
 

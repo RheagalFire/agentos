@@ -25,6 +25,7 @@ import {
   ReasoningTraceEntry,
 } from '../IGMI';
 import type { IPersonaDefinition, MetaPromptDefinition } from '../personas/IPersonaDefinition';
+import { GMIEventType } from '../GMIEvent';
 import { getBuiltInPersona } from '../personas/definitions';
 import { InMemoryWorkingMemory } from '../memory/InMemoryWorkingMemory';
 import { PromptEngine } from '../../../core/llm/PromptEngine';
@@ -61,6 +62,8 @@ interface Harness {
   generateCompletion: Mock<CompletionFn>;
   /** Metaprompt calls waiting for a result, in call order. Stays empty when auto-replying. */
   pending: PendingCompletion[];
+  /** The utility AI's JSON parser; in production it repairs bad JSON with an LLM call. */
+  parseJsonSafe: Mock<(text: string) => Promise<unknown>>;
 }
 
 /** A manual metaprompt, served by the executor's generic handler. */
@@ -182,15 +185,14 @@ async function createHarness(persona: IPersonaDefinition, autoReply?: string): P
     }),
   } as unknown as AIModelProviderManager;
 
-  const utilityAI = {
-    parseJsonSafe: async (text: string) => {
-      try {
-        return JSON.parse(text);
-      } catch {
-        return null;
-      }
-    },
-  } as unknown as IUtilityAI;
+  const parseJsonSafe = vi.fn(async (text: string): Promise<unknown> => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  });
+  const utilityAI = { parseJsonSafe } as unknown as IUtilityAI;
 
   const toolOrchestrator = {
     listAvailableTools: async () => [],
@@ -210,7 +212,7 @@ async function createHarness(persona: IPersonaDefinition, autoReply?: string): P
 
   const gmi = new GMI();
   await gmi.initialize(persona, config);
-  return { gmi, workingMemory, generateCompletion, pending };
+  return { gmi, workingMemory, generateCompletion, pending, parseJsonSafe };
 }
 
 function createPersona(metaPrompts: MetaPromptDefinition[]): IPersonaDefinition {
@@ -460,6 +462,260 @@ describe('GMI shutdown with metaprompt work in flight', () => {
 
     expect(closeSpy).toHaveBeenCalledTimes(1);
     expect(h.gmi.getCurrentState()).toBe(GMIPrimeState.SHUTDOWN);
+  });
+});
+
+describe('metaprompt work that runs late', () => {
+  /** The executor behind a harness, to shorten its per-run deadline. */
+  function executorOf(h: Harness): { runTimeoutMs: number } {
+    return (h.gmi as unknown as { metapromptExecutor: { runTimeoutMs: number } }).metapromptExecutor;
+  }
+
+  it('moves on from a metaprompt call that never answers and discards its late result', async () => {
+    const h = await createHarness(createPersona([MANUAL_REFLECTION]));
+    executorOf(h).runTimeoutMs = 20;
+    await arm(h);
+    await runTurn(h.gmi, 'turn-1');
+    await vi.waitFor(() => expect(h.pending).toHaveLength(1));
+    // The running batch keeps its 20 ms deadline; later batches get enough
+    // time to be answered between waitFor's polls.
+    executorOf(h).runTimeoutMs = 60_000;
+
+    // The first call stalls; past its deadline the queue runs the next batch.
+    await arm(h);
+    await runTurn(h.gmi, 'turn-2');
+    await vi.waitFor(() => expect(h.pending).toHaveLength(2));
+    h.pending[1].resolve(JSON.stringify({ updatedGmiMood: GMIMood.FOCUSED }));
+    await vi.waitFor(async () => expect(await currentMood(h)).toBe(GMIMood.FOCUSED));
+
+    // The stalled call answers at last; its result must not land.
+    h.pending[0].resolve(JSON.stringify({ updatedGmiMood: GMIMood.CREATIVE }));
+    await vi.waitFor(() => expect(warningsMentioning(h.gmi, 'Discarded late results')).toHaveLength(1));
+    expect(await currentMood(h)).toBe(GMIMood.FOCUSED);
+  });
+
+  /** The executor's update step, called directly with a controllable run. */
+  function applyUpdatesOf(h: Harness) {
+    return (h.gmi as unknown as {
+      metapromptExecutor: {
+        applyMetapromptUpdates(updates: unknown, id: string, run?: { isStale(): boolean }): Promise<string[]>;
+      };
+    }).metapromptExecutor;
+  }
+
+  it('stops writing memory imprints once its run goes stale mid-write', async () => {
+    const h = await createHarness(createPersona([MANUAL_REFLECTION]));
+    let stale = false;
+    const setSpy = vi.spyOn(h.workingMemory, 'set').mockImplementation(async (key: string) => {
+      // The run's deadline passes while this write is pending.
+      if (key === 'first_imprint') stale = true;
+    });
+
+    const stored = await applyUpdatesOf(h).applyMetapromptUpdates(
+      { newMemoryImprints: [{ key: 'first_imprint', value: 1 }, { key: 'second_imprint', value: 2 }] },
+      MANUAL_REFLECTION.id,
+      { isStale: () => stale },
+    );
+
+    expect(setSpy.mock.calls.map(([key]) => key)).toEqual(['first_imprint']);
+    expect(stored).toEqual(['first_imprint']);
+    expect(warningsMentioning(h.gmi, 'Discarded late results')).toHaveLength(1);
+  });
+
+  it('lets a stale unit\'s write already underway finish before a later unit writes', async () => {
+    const h = await createHarness(createPersona([MANUAL_REFLECTION]));
+    const executor = applyUpdatesOf(h);
+    const write = h.workingMemory.set.bind(h.workingMemory);
+    let releaseOldWrite!: () => void;
+    const oldWriteHeld = new Promise<void>((resolve) => {
+      releaseOldWrite = resolve;
+    });
+    const setSpy = vi.spyOn(h.workingMemory, 'set').mockImplementation(async (key: string, value: unknown) => {
+      if (value === 'old') await oldWriteHeld;
+      return write(key, value);
+    });
+    let firstStale = false;
+
+    const first = executor.applyMetapromptUpdates(
+      { newMemoryImprints: [{ key: 'topic', value: 'old' }] },
+      MANUAL_REFLECTION.id,
+      { isStale: () => firstStale },
+    );
+    await vi.waitFor(() => expect(setSpy).toHaveBeenCalledWith('topic', 'old'));
+    // The first unit passes its deadline mid-write and the queue runs the next.
+    firstStale = true;
+    const second = executor.applyMetapromptUpdates(
+      { newMemoryImprints: [{ key: 'topic', value: 'new' }] },
+      MANUAL_REFLECTION.id,
+      { isStale: () => false },
+    );
+    releaseOldWrite();
+    await Promise.all([first, second]);
+
+    expect(await h.workingMemory.get('topic')).toBe('new');
+  });
+
+  it('does not hold back writes to other keys behind a stalled write', async () => {
+    const h = await createHarness(createPersona([MANUAL_REFLECTION]));
+    const executor = applyUpdatesOf(h);
+    const write = h.workingMemory.set.bind(h.workingMemory);
+    vi.spyOn(h.workingMemory, 'set').mockImplementation(async (key: string, value: unknown) => {
+      if (key === 'stuck') return new Promise<void>(() => {});
+      return write(key, value);
+    });
+
+    void executor.applyMetapromptUpdates(
+      { newMemoryImprints: [{ key: 'stuck', value: 1 }] },
+      MANUAL_REFLECTION.id,
+      { isStale: () => false },
+    );
+    const stored = await executor.applyMetapromptUpdates(
+      { newMemoryImprints: [{ key: 'topic', value: 'new' }] },
+      MANUAL_REFLECTION.id,
+      { isStale: () => false },
+    );
+
+    expect(stored).toEqual(['topic']);
+    expect(await h.workingMemory.get('topic')).toBe('new');
+  });
+
+  it('makes no JSON repair call for a result that arrives after its deadline', async () => {
+    const h = await createHarness(createPersona([MANUAL_REFLECTION]));
+    executorOf(h).runTimeoutMs = 20;
+    await arm(h);
+    await runTurn(h.gmi, 'turn-1');
+    await vi.waitFor(() => expect(h.pending).toHaveLength(1));
+    await vi.waitFor(() => expect(warningsMentioning(h.gmi, 'did not finish within')).toHaveLength(1));
+
+    h.pending[0].resolve('{"updatedGmiMood": "creative"');
+    await vi.waitFor(() => expect(warningsMentioning(h.gmi, 'Discarded late results')).toHaveLength(1));
+
+    expect(h.parseJsonSafe).not.toHaveBeenCalled();
+  });
+
+  it('starts no provider call for a run that went stale while reading memory', async () => {
+    const h = await createHarness(createPersona([MANUAL_REFLECTION]));
+    const executor = (h.gmi as unknown as {
+      metapromptExecutor: {
+        executeMetapromptWithVariables(
+          metaPrompt: unknown,
+          variables: Record<string, string>,
+          run?: { isStale(): boolean },
+        ): Promise<unknown>;
+      };
+    }).metapromptExecutor;
+
+    const result = await executor.executeMetapromptWithVariables(MANUAL_REFLECTION, {}, { isStale: () => true });
+
+    expect(result).toBeNull();
+    expect(h.generateCompletion).not.toHaveBeenCalled();
+    expect(warningsMentioning(h.gmi, 'Discarded late results')).toHaveLength(1);
+  });
+
+  it('counts a memory write still running as work that shutdown waits for', async () => {
+    const h = await createHarness(createPersona([MANUAL_REFLECTION]));
+    const executor = (h.gmi as unknown as {
+      metapromptExecutor: {
+        applyMetapromptUpdates(updates: unknown, id: string, run?: { isStale(): boolean }): Promise<string[]>;
+        drain(timeoutMs?: number): Promise<boolean>;
+      };
+    }).metapromptExecutor;
+    const write = h.workingMemory.set.bind(h.workingMemory);
+    let releaseWrite!: () => void;
+    const writeHeld = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const setSpy = vi.spyOn(h.workingMemory, 'set').mockImplementation(async (key: string, value: unknown) => {
+      if (key === 'slow_fact') await writeHeld;
+      return write(key, value);
+    });
+
+    void executor.applyMetapromptUpdates(
+      { newMemoryImprints: [{ key: 'slow_fact', value: 1 }] },
+      MANUAL_REFLECTION.id,
+      { isStale: () => false },
+    );
+    await vi.waitFor(() => expect(setSpy).toHaveBeenCalledWith('slow_fact', 1));
+
+    expect(await executor.drain(20)).toBe(false);
+    releaseWrite();
+    expect(await executor.drain(1000)).toBe(true);
+    expect(await h.workingMemory.get('slow_fact')).toBe(1);
+  });
+
+  it('keeps imprints away from the keys that hold GMI state', async () => {
+    const h = await createHarness(createPersona([MANUAL_REFLECTION]));
+    const moodBefore = await currentMood(h);
+
+    const stored = await applyUpdatesOf(h).applyMetapromptUpdates(
+      {
+        newMemoryImprints: [
+          { key: 'currentGmiMood', value: 'creative' },
+          { key: `manual_trigger_${MANUAL_REFLECTION.id}`, value: true },
+          { key: 'favorite_topic', value: 'astronomy' },
+        ],
+      },
+      MANUAL_REFLECTION.id,
+      { isStale: () => false },
+    );
+
+    expect(stored).toEqual(['favorite_topic']);
+    expect(await currentMood(h)).toBe(moodBefore);
+    expect(await h.workingMemory.get(`manual_trigger_${MANUAL_REFLECTION.id}`)).toBeUndefined();
+    expect(warningsMentioning(h.gmi, 'the key holds GMI state')).toHaveLength(2);
+  });
+
+  it('shutdown skips a batch still waiting in the queue and drops the running one\'s late result', async () => {
+    const h = await createHarness(createPersona([MANUAL_REFLECTION]));
+    const setSpy = vi.spyOn(h.workingMemory, 'set');
+    await arm(h);
+    await runTurn(h.gmi, 'turn-1');
+    await vi.waitFor(() => expect(h.pending).toHaveLength(1));
+    await arm(h);
+    await runTurn(h.gmi, 'turn-2'); // queued behind turn-1's batch
+
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const shuttingDown = h.gmi.shutdown();
+      await vi.advanceTimersByTimeAsync(5000);
+      await shuttingDown;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    h.pending[0].resolve(JSON.stringify({ updatedGmiMood: GMIMood.FOCUSED }));
+    await settle();
+    await settle();
+    expect(h.generateCompletion).toHaveBeenCalledTimes(1);
+    expect(setSpy.mock.calls.some(([key]) => key === 'currentGmiMood')).toBe(false);
+  });
+
+  it('drops a queued event-based metaprompt once a newer user turn has passed', async () => {
+    const FRUSTRATION_PROBE: MetaPromptDefinition = {
+      id: 'frustration_probe',
+      promptTemplate: 'Recover from {{recent_conversation}} and reply with JSON.',
+      trigger: { type: 'event_based', eventName: GMIEventType.USER_FRUSTRATED },
+      modelId: MODEL_ID,
+      providerId: PROVIDER_ID,
+    };
+    const h = await createHarness(createPersona([MANUAL_REFLECTION, FRUSTRATION_PROBE]));
+    await arm(h);
+    await runTurn(h.gmi, 'turn-1'); // a slow batch holds the queue
+    await vi.waitFor(() => expect(h.pending).toHaveLength(1));
+
+    (h.gmi as unknown as { sentimentTracker: { pendingEvents: Set<string> } }).sentimentTracker.pendingEvents.add(
+      GMIEventType.USER_FRUSTRATED,
+    );
+    await runTurn(h.gmi, 'turn-2'); // raises the frustration batch behind it
+    await runTurn(h.gmi, 'turn-3'); // the user has moved on before it starts
+
+    h.pending[0].resolve('{}');
+    await vi.waitFor(() =>
+      expect(
+        traceOf(h.gmi, ReasoningEntryType.DEBUG).filter((e) => e.message.includes('triggering turn has passed')),
+      ).toHaveLength(1),
+    );
+    expect(h.generateCompletion).toHaveBeenCalledTimes(1);
   });
 });
 
