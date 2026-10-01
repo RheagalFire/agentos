@@ -14,19 +14,19 @@ A dedicated provider is warranted when:
 
 ## What you implement
 
-Concrete providers implement the `IProvider` interface and live next to the others:
+Concrete providers implement the [`IProvider`](https://github.com/framerslab/agentos/blob/master/src/core/llm/providers/IProvider.ts) interface and live next to the others:
 
-- Interface: [`/src/core/llm/providers/IProvider.ts`](/src/core/llm/providers/IProvider.ts)
-- Implementations: [`/src/core/llm/providers/implementations/`](/src/core/llm/providers/implementations/). Use `OpenAIProvider.ts` as the reference for OpenAI-shaped APIs, `OpenRouterProvider.ts` for an aggregator, and `GroqProvider.ts` or `TogetherProvider.ts` for OpenAI-compatible hosts.
-- Registration and routing: [`/src/core/llm/providers/AIModelProviderManager.ts`](/src/core/llm/providers/AIModelProviderManager.ts)
-- Provider id, default model, and the env-var auto-detect order: [`/src/api/runtime/provider-defaults.ts`](/src/api/runtime/provider-defaults.ts)
+- Interface: [`/src/core/llm/providers/IProvider.ts`](https://github.com/framerslab/agentos/blob/master/src/core/llm/providers/IProvider.ts)
+- Implementations: [`/src/core/llm/providers/implementations/`](https://github.com/framerslab/agentos/tree/master/src/core/llm/providers/implementations). Use `OpenAIProvider.ts` as the reference for OpenAI-shaped APIs, `OpenRouterProvider.ts` for an aggregator, and `GroqProvider.ts` or `TogetherProvider.ts` for OpenAI-compatible hosts.
+- Registration and routing: [`/src/core/llm/providers/AIModelProviderManager.ts`](https://github.com/framerslab/agentos/blob/master/src/core/llm/providers/AIModelProviderManager.ts)
+- Provider id, default model, and the env-var auto-detect order: [`/src/api/runtime/provider-defaults.ts`](https://github.com/framerslab/agentos/blob/master/src/api/runtime/provider-defaults.ts)
 
 Model your implementation on the closest existing provider rather than starting from scratch.
 
 ## Acceptance checklist
 
 - [ ] Implements `IProvider` in full: text generation, streaming, structured output, and embeddings where the API supports them. Capabilities the API lacks fail clearly, not silently.
-- [ ] Registered in `AIModelProviderManager` with a stable provider id.
+- [ ] Registered in [`AIModelProviderManager`](https://github.com/framerslab/agentos/blob/master/src/core/llm/providers/AIModelProviderManager.ts) with a stable provider id.
 - [ ] Default model and env-var detection added to `provider-defaults.ts`, placed in the auto-detect chain.
 - [ ] Unit tests for request building, response parsing, and error mapping.
 - [ ] Integration tests against the real API, mocked in CI. No live keys run in CI.
@@ -34,16 +34,14 @@ Model your implementation on the closest existing provider rather than starting 
 - [ ] A streaming test if the API streams.
 - [ ] Documentation: a short usage section and the default model.
 - [ ] No new required dependency on the core. A provider SDK must be optional or a peer dependency, loaded lazily, so users who do not use the provider do not pay for it.
-- [ ] A named maintainer. Provider integrations break when upstream APIs change, so each needs an owner. Add yourself to [`/.github/CODEOWNERS`](/.github/CODEOWNERS) for the provider file.
+- [ ] A named maintainer. Provider integrations break when upstream APIs change, so each needs an owner. Add yourself to [`/.github/CODEOWNERS`](https://github.com/framerslab/agentos/blob/master/.github/CODEOWNERS) for the provider file.
 - [ ] Conventional Commit title and green CI.
 
-## Neutrality and disclosure
+## Sponsorship and disclosure
 
-Merging a provider grants no placement, ordering, or prominence in the README or docs. The provider list is neutral and stays that way.
+Integration is free and open to any quality provider on technical merit. Partners and sponsors may also be featured prominently (top of the provider list, in examples, or with a partner badge), labeled as a sponsor or partner wherever they appear. See [`/SPONSORS.md`](https://github.com/framerslab/agentos/blob/master/SPONSORS.md).
 
-If a provider relationship involves credits, payment, discounts, or cross-promotion, that is a sponsorship. It is handled separately, and it is disclosed wherever the sponsor appears. See [`/SPONSORS.md`](/SPONSORS.md).
-
-Describe an integration as a "supported provider." "Partner" is a relationship claim, used only where a written agreement exists.
+Describe an integration as a "supported provider." "Partner" is a relationship claim, used where an agreement exists.
 
 ## Questions
 

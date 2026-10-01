@@ -4,8 +4,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { AgentMemory } from '../../src/memory/AgentMemory.js';
-import type { MemoryTrace } from '../../src/memory/types.js';
+import { AgentMemory } from '../../src/cognition/memory/AgentMemory.js';
+import type { MemoryTrace } from '../../src/cognition/memory/core/types.js';
 
 function createManager(overrides: Record<string, unknown> = {}) {
   return {
@@ -295,6 +295,22 @@ describe('AgentMemory', () => {
     expect(standalone.feedback).toHaveBeenCalledWith('trace-1', 'used', 'dark mode');
     expect(standalone.close).toHaveBeenCalledTimes(1);
     expect(memory.isInitialized).toBe(false);
+  });
+
+  it('does not reopen a standalone backend after shutdown', async () => {
+    const standalone = createStandaloneMemory();
+    const memory = AgentMemory.wrapMemory(standalone);
+
+    await memory.shutdown();
+
+    await expect(memory.initialize({} as any)).rejects.toThrow(
+      'cannot reopen a closed standalone memory backend',
+    );
+    expect(memory.isInitialized).toBe(false);
+    await expect(memory.remember('after shutdown')).rejects.toThrow(
+      'AgentMemory not initialized',
+    );
+    expect(standalone.close).toHaveBeenCalledTimes(1);
   });
 
   it('throws a helpful error when cognitive-only APIs are used on standalone memory', async () => {

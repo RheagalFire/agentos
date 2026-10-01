@@ -18,12 +18,12 @@ export default defineConfig({
   server: {
     deps: {
       // Native C++ addons must not be transformed by Vite
-      external: ['better-sqlite3'],
+      external: ['better-sqlite3', 'sharp'],
     },
   },
   ssr: {
     // Mark native modules as external for SSR/Node transforms
-    external: ['better-sqlite3'],
+    external: ['better-sqlite3', 'sharp'],
   },
   resolve: {
     // Prefer TypeScript sources over any co-located compiled JS artifacts.
@@ -36,22 +36,52 @@ export default defineConfig({
     ],
   },
   test: {
+    // Vitest 3 reads dep-externalization from test.server.deps (the root
+    // server.deps block above is the Vite-level home Vitest 1 read).
+    // Keep both so native C++ addons stay untransformed across majors.
+    server: {
+      deps: {
+        external: ['better-sqlite3', 'sharp'],
+      },
+    },
     globals: true,
     environment: 'node',
     testTimeout: 120000, // 2 minutes — Memory facade tests take 45s+ for SQLite ops
     hookTimeout: 30000,
+    // Generate the (gitignored) knowledge corpus before tests so corpus-dependent
+    // tests can read it in standalone CI.
+    globalSetup: ['./scripts/vitest-global-setup.mjs'],
     include: ['tests/**/*.{test,spec}.ts', 'src/**/*.{test,spec}.ts'],
     exclude: [
       'dist', 'coverage', 'node_modules',
       // onnxruntime-node native binary fails to self-register in CI (ERR_DLOPEN_FAILED)
-      'src/media/audio/__tests__/MusicGenLocalProvider.test.ts',
-      'src/media/audio/__tests__/AudioGenLocalProvider.test.ts',
+      'src/io/media/audio/__tests__/MusicGenLocalProvider.test.ts',
+      'src/io/media/audio/__tests__/AudioGenLocalProvider.test.ts',
       'src/api/runtime/__tests__/generateMusic.test.ts',
       'src/api/runtime/__tests__/generateSFX.test.ts',
+      // sharp's native binary is not built in standalone CI (pnpm ignores its
+      // build script), so segmentation tests that generate masks via sharp
+      // cannot load it there. Excluded in CI only; they still run locally
+      // where sharp is available.
+      ...(process.env.CI
+        ? [
+            'src/io/segmentation/__tests__/ReplicateSegmentationProvider.test.ts',
+            'src/io/segmentation/__tests__/maskGeometry.test.ts',
+            'src/io/segmentation/__tests__/maskToEditMask.test.ts',
+            'src/io/segmentation/__tests__/cropRegion.test.ts',
+            'src/io/segmentation/__tests__/roundtrip.test.ts',
+            // Cross-package integration tests that import sibling-package sources
+            // (agentos-extensions, sql-storage-adapter internals) by relative path.
+            // Those siblings are absent in standalone agentos CI, so the files cannot
+            // load there. Excluded in CI only; they still run in the monorepo.
+            'tests/extensions/WildsMemoryExtensions.spec.ts',
+            'tests/e2e/external-tool-resume-persistence.e2e.spec.ts',
+          ]
+        : []),
     ],
     server: {
       deps: {
-        external: ['better-sqlite3'],
+        external: ['better-sqlite3', 'sharp'],
       },
     },
     coverage: {

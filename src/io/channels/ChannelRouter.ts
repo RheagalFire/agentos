@@ -14,6 +14,7 @@
  */
 
 import type { IChannelAdapter } from './IChannelAdapter.js';
+import { evaluateGroupPolicy } from './group-policy.js';
 import type {
   ChannelBindingConfig,
   ChannelInfo,
@@ -358,6 +359,15 @@ export class ChannelRouter {
     this.messageHandlers.clear();
   }
 
+  /**
+   * @internal Route one inbound message through binding resolution + group
+   * policy + handler dispatch. Adapter 'message' events flow through the same
+   * path; exposed publicly for hosts and tests that inject messages directly.
+   */
+  public async routeInboundMessage(message: ChannelMessage): Promise<void> {
+    return this.handleInboundMessage(message);
+  }
+
   // ── Private ──
 
   private async handleInboundMessage(message: ChannelMessage): Promise<void> {
@@ -370,6 +380,28 @@ export class ChannelRouter {
 
     // Dispatch to all matching bindings (usually 1, but multi-agent groups are possible)
     for (const binding of bindings) {
+      // Group policy gate: drops are silent to the sender (unprobeable) and
+      // skip session bookkeeping so dropped traffic leaves no footprint.
+      const policyResult = evaluateGroupPolicy(binding.groupPolicy, {
+        isGroup: message.conversationType !== 'direct',
+        senderId: message.sender.id,
+        senderIsBot: message.sender.isBot === true,
+        mentions: message.mentions,
+        supportsMentions: message.supportsMentions === true,
+        botUserId: binding.platformConfig?.botUserId as string | undefined,
+        bindingOwnerUserId: binding.ownerUserId,
+      });
+      if (policyResult.verdict === 'drop') {
+        // Audit at info level WITHOUT raw sender / conversation identifiers:
+        // mention-gated groups drop most traffic, so this fires often and must
+        // not become a high-volume PII sink. bindingId locates the group config;
+        // per-sender detail belongs behind a debug/redacted channel.
+        console.info(
+          `[ChannelRouter] group-policy drop reason=${policyResult.reason} platform=${message.platform} binding=${binding.bindingId}`,
+        );
+        continue;
+      }
+
       const session = this.getOrCreateSession(
         binding.seedId,
         message.platform,

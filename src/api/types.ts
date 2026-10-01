@@ -603,11 +603,19 @@ export interface ObservabilityConfig {
  * The `onLimitReached` policy determines whether a breach is fatal.
  */
 export interface ResourceControls {
-  /** Maximum total tokens (prompt + completion) across all agents and steps. */
+  /**
+   * Maximum total tokens (prompt + completion) across all agents and steps.
+   * The lightweight `agent()` helper maps this to a per-call completion-token
+   * cap (`maxTokens`) instead of the run total.
+   */
   maxTotalTokens?: number;
   /** Maximum USD cost cap across the entire run. */
   maxCostUSD?: number;
-  /** Wall-clock time budget for the run in milliseconds. */
+  /**
+   * Wall-clock time budget for the run in milliseconds. The lightweight
+   * `agent()` helper maps this to a per-call request timeout
+   * (`requestTimeout`) instead of the whole-run budget.
+   */
   maxDurationMs?: number;
   /** Maximum number of agent invocations (across all agents). */
   maxAgentCalls?: number;
@@ -1256,6 +1264,9 @@ export interface BaseAgentConfig {
   /**
    * HEXACO-inspired personality trait overrides (0–1 scale).
    * Encoded as a human-readable trait string appended to the system prompt.
+   * The SOUL.md spellings `honestyHumility` / `honesty_humility` and
+   * `opennessToExperience` are accepted for `honesty` and `openness`; when
+   * both spellings are given, the canonical key wins.
    */
   personality?: Partial<{
     honesty: number;
@@ -1264,6 +1275,9 @@ export interface BaseAgentConfig {
     agreeableness: number;
     conscientiousness: number;
     openness: number;
+    honestyHumility: number;
+    honesty_humility: number;
+    opennessToExperience: number;
   }>;
   /**
    * Tools available to the agent on every call.
@@ -1310,6 +1324,52 @@ export interface BaseAgentConfig {
    */
   maxTokens?: number;
   /**
+   * Extended-thinking switch forwarded to Claude models on every
+   * `generate()` / `stream()` / session call this agent makes. Any positive
+   * `budgetTokens` turns adaptive thinking on (the number itself is not
+   * sent). `false` turns thinking off with the model's own off shape; Opus
+   * 5.5, Fable and Mythos always think. Omitted keeps the model's default:
+   * thinking on for Opus 5 and later, Sonnet 5 and later, Fable and Mythos,
+   * off for older models. Other providers ignore it.
+   *
+   * @example
+   * ```ts
+   * const codegen = agent({
+   *   provider: 'anthropic',
+   *   model: 'claude-opus-5',
+   *   tools: { GenerateCode, RunTests, JudgeOutput },
+   *   maxTokens: 24000,
+   *   thinking: { budgetTokens: 8000 },
+   * });
+   * ```
+   */
+  thinking?: { budgetTokens: number } | false;
+  /**
+   * Reasoning-effort control forwarded to every generate/stream/session call.
+   * On effort-capable Claude models (Opus 4.5+, Sonnet 4.6, Fable/Mythos 5) the
+   * provider sends `output_config.effort` (low|medium|high|xhigh|max). On
+   * OpenAI reasoning models (o-series, GPT-5.x) the provider sends
+   * `reasoning_effort` (chat) / `reasoning.effort` (Responses), with `max`
+   * clamping to `xhigh` — OpenAI's ceiling — and a model-aware guard capping
+   * `xhigh` → `high` on ids not probe-verified for xhigh (gpt-5.5/5.6 families
+   * are verified). Independent of `thinking`; ignored on unsupported
+   * models/values. Works per-agent in `agency()` rosters — each sub-agent may
+   * pin its own depth.
+   */
+  effort?: string;
+  /**
+   * Provider-specific TOP-LEVEL request-payload parameters forwarded verbatim
+   * on every generate/stream/session call via
+   * `ModelCompletionOptions.customModelParams`. Providers spread these onto
+   * the outgoing request body — the escape hatch for params the typed options
+   * don't model, e.g. OpenRouter provider-routing preferences:
+   *
+   * ```ts
+   * customModelParams: { provider: { sort: 'throughput' } }
+   * ```
+   */
+  customModelParams?: Record<string, unknown>;
+  /**
    * Memory configuration.
    * - `true` — enable in-memory conversation history with default settings.
    * - `false` — disable memory; every call is stateless.
@@ -1355,7 +1415,15 @@ export interface BaseAgentConfig {
   observability?: ObservabilityConfig;
   /** Event callbacks fired at various lifecycle points during the run. */
   on?: AgencyCallbacks;
-  /** Resource limits (tokens, cost, time) applied to the entire run. */
+  /**
+   * Resource limits (tokens, cost, time). `agency()` and the full runtime
+   * enforce every field against the entire run. The lightweight `agent()`
+   * helper forwards two of them per call: `maxTotalTokens` caps each LLM
+   * call's completion output (mapped to `maxTokens` when no explicit
+   * `maxTokens` is set, NOT the prompt+completion run total) and
+   * `maxDurationMs` bounds each LLM request (mapped to `requestTimeout`).
+   * The remaining fields stay agency()-only.
+   */
   controls?: ResourceControls;
   /**
    * Names of other agents in the agency that must complete before this agent runs.
@@ -1536,6 +1604,18 @@ export interface AgencyOptions extends BaseAgentConfig {
    */
   agents: Record<string, BaseAgentConfig | Agent>;
   /**
+   * Minimum viable panel for the `parallel` strategy, checked AFTER the
+   * fan-out against the agents that actually SUCCEEDED (HITL-rejected and
+   * errored agents don't count): `minAgents` = successful agents required;
+   * `minProviders` = distinct providers among them — provider diversity is
+   * what makes a multi-model panel meaningful, and a panel that quietly
+   * collapsed to one vendor must not synthesize a false consensus.
+   * Shortfall throws {@link AgencyQuorumError} by default; set
+   * `onShortfall: 'proceed'` to log a warning and synthesize anyway.
+   * Ignored by strategies other than `parallel`.
+   */
+  quorum?: AgencyQuorumConfig;
+  /**
    * Orchestration strategy for coordinating sub-agents.
    * Defaults to `"sequential"` when omitted.
    */
@@ -1594,5 +1674,37 @@ export class AgencyConfigError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'AgencyConfigError';
+  }
+}
+
+/**
+ * Quorum requirements for a `parallel` panel run.
+ * @see AgencyOptions.quorum
+ */
+export interface AgencyQuorumConfig {
+  /** Minimum number of agents that must SUCCEED (default 0 = no floor). */
+  minAgents?: number;
+  /**
+   * Minimum number of DISTINCT providers among the successful agents
+   * (default 0 = no floor). Counted from each result's resolved `provider`.
+   */
+  minProviders?: number;
+  /**
+   * What a shortfall does: `'error'` (default) throws
+   * {@link AgencyQuorumError} before synthesis; `'proceed'` logs a warning
+   * and synthesizes anyway.
+   */
+  onShortfall?: 'error' | 'proceed';
+}
+
+/**
+ * Thrown by the `parallel` strategy when the post-fan-out panel falls below
+ * the configured {@link AgencyQuorumConfig} — too few surviving agents or
+ * too little provider diversity to synthesize an honest consensus.
+ */
+export class AgencyQuorumError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AgencyQuorumError';
   }
 }

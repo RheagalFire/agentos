@@ -846,6 +846,12 @@ export interface StreamingTTSConfig {
    * Pass-through options forwarded to the underlying provider SDK.
    */
   providerOptions?: Record<string, unknown>;
+
+  /**
+   * Optional prosody controls. Streaming providers consume the subset
+   * they support and ignore the rest; see {@link TTSExpressiveness}.
+   */
+  expressiveness?: TTSExpressiveness;
 }
 
 /**
@@ -922,6 +928,42 @@ export interface IStreamingTTS {
  * Configuration for a batch (one-shot) TTS synthesis request.
  * Used by {@link IBatchTTS.synthesize} for non-streaming narration.
  */
+/**
+ * Optional prosody / expressiveness controls for TTS synthesis.
+ *
+ * Providers apply the SUBSET of knobs their API supports and silently
+ * ignore the rest — callers can pass one object regardless of which
+ * provider ends up serving the request:
+ * - ElevenLabs: stability, similarityBoost, style, useSpeakerBoost, speed.
+ * - OpenAI: speed only.
+ * - Deepgram Aura: none (no prosody parameters exist on the API).
+ *
+ * Batch providers report the knobs they actually consumed on
+ * {@link BatchTTSResult.appliedExpressiveness} so callers can avoid
+ * double-applying (e.g. a client-side playback-rate speed on top of a
+ * provider-rendered speed).
+ */
+export interface TTSExpressiveness {
+  /** Voice steadiness, 0-1. Lower is more variable/expressive. */
+  stability?: number;
+  /** How closely the voice tracks its reference, 0-1. */
+  similarityBoost?: number;
+  /** Style exaggeration, 0-1. */
+  style?: number;
+  /** Speaking-rate multiplier (provider-dependent range; ~0.7-1.2 on ElevenLabs, 0.25-4 on OpenAI). */
+  speed?: number;
+  /** ElevenLabs speaker-boost toggle. */
+  useSpeakerBoost?: boolean;
+  /**
+   * Natural-language acting direction (e.g. "whisper, urgent, on the verge
+   * of tears"). Rendered only by providers with an instruction surface —
+   * Hume Octave maps it to `utterances[].description`. Providers without
+   * such a surface ignore it, and per the appliedExpressiveness contract it
+   * is reported ONLY when the serving provider actually consumed it.
+   */
+  instructions?: string;
+}
+
 export interface BatchTTSConfig {
   /** Provider-specific voice identifier. */
   voice?: string;
@@ -931,6 +973,12 @@ export interface BatchTTSConfig {
   format?: 'mp3' | 'opus' | 'pcm';
   /** Playback speed multiplier (provider-dependent range, typically 0.25-4.0). */
   speed?: number;
+  /**
+   * Optional prosody controls. Providers consume the subset they support
+   * and ignore the rest; see {@link TTSExpressiveness}. A top-level
+   * `speed` takes precedence over `expressiveness.speed`.
+   */
+  expressiveness?: TTSExpressiveness;
   /** Pass-through options forwarded to the underlying provider SDK. */
   providerOptions?: Record<string, unknown>;
 }
@@ -947,6 +995,13 @@ export interface BatchTTSResult {
   durationMs: number;
   /** Provider ID that served this request. */
   provider: string;
+  /**
+   * Names of the {@link TTSExpressiveness} knobs the serving provider
+   * actually consumed from CALLER-provided values (silent provider
+   * defaults are not reported). Unset when the provider applied none —
+   * e.g. Deepgram Aura, which has no prosody parameters.
+   */
+  appliedExpressiveness?: string[];
 }
 
 /**
@@ -963,6 +1018,53 @@ export interface IBatchTTS {
   readonly providerId: string;
   /** Synthesize complete text into audio. */
   synthesize(text: string, config?: BatchTTSConfig): Promise<BatchTTSResult>;
+}
+
+/**
+ * Configuration for a batch (one-shot) STT transcription request.
+ * Used by {@link IBatchSTT.transcribe} for pre-recorded audio (voice notes,
+ * uploaded clips).
+ */
+export interface BatchSTTConfig {
+  /** Source audio MIME type (e.g. 'audio/webm', 'audio/mp4'). Sent as the
+   *  request Content-Type / used to name the multipart part. @default 'audio/webm' */
+  mimeType?: string;
+  /** BCP-47 language hint (e.g. 'en'). @default 'en' */
+  language?: string;
+  /** Provider-specific model override (e.g. 'nova-3', 'whisper-1'). */
+  model?: string;
+  /** Pass-through options forwarded to the underlying provider SDK. */
+  providerOptions?: Record<string, unknown>;
+}
+
+/**
+ * Result of a batch STT transcription operation.
+ */
+export interface BatchSTTResult {
+  /** Recognized transcript text (trimmed). */
+  transcript: string;
+  /** Estimated source audio duration in milliseconds. */
+  durationMs: number;
+  /** Provider ID that served this request. */
+  provider: string;
+}
+
+/**
+ * Factory interface for batch (one-shot) speech-to-text providers.
+ *
+ * Unlike {@link IStreamingSTT} which recognizes audio incrementally over a live
+ * session, batch STT accepts a complete audio buffer and returns a finished
+ * transcript. Suitable for voice notes, uploaded clips, and offline
+ * transcription.
+ *
+ * A provider signals a silent clip by throwing `EmptyTranscriptError` (from the
+ * batch STT providers module) — a determinate result, not a provider failure.
+ */
+export interface IBatchSTT {
+  /** Unique, stable identifier for this provider (e.g. 'deepgram-prerecorded', 'openai-whisper'). */
+  readonly providerId: string;
+  /** Transcribe a complete audio buffer into text. */
+  transcribe(audio: Buffer, config?: BatchSTTConfig): Promise<BatchSTTResult>;
 }
 
 // ============================================================================
@@ -1264,6 +1366,13 @@ export interface VoicePipelineConfig {
    * Provider-level TTS options merged into `StreamingTTSConfig.providerOptions`.
    */
   ttsOptions?: Record<string, unknown>;
+
+  /**
+   * Optional prosody controls forwarded to the streaming TTS session as
+   * {@link StreamingTTSConfig.expressiveness}. Providers consume the
+   * subset they support (ElevenLabs: all knobs; Deepgram Aura: none).
+   */
+  ttsExpressiveness?: TTSExpressiveness;
 }
 
 /**

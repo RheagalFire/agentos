@@ -33,6 +33,7 @@ const SECTION_ORDER = [
   'Benchmarks',
   'Paracosm',
   'Wunderland',
+  'Contributing',
 ];
 
 function entry(config) {
@@ -157,7 +158,7 @@ const publicationManifest = [
   // Cognitive deep-dive
   agentosDoc('COGNITIVE_MEMORY.md', 'features/cognitive-memory.md', 'Cognitive Memory', 'Memory', 3),
   agentosDoc('HEXACO_PERSONALITY.md', 'features/hexaco-personality.md', 'HEXACO Personality', 'Personas', 4),
-  agentosDoc('SOUL_FILES.md', 'features/soul-files.md', 'Soul Files (per-agent identity in markdown)', 'Personas', 5),
+  agentosDoc('SOUL_FILES.md', 'features/soul-files.md', 'Soul Files & the Markdown Memory Wiki', 'Personas', 5),
   agentosDoc('ADAPTIVE_PROMPT_INTELLIGENCE.md', 'features/adaptive-prompt-intelligence.md', 'Adaptive Prompt Intelligence', 'Personas', 5.5),
   agentosDoc('WORKING_MEMORY.md', 'features/working-memory.md', 'Working Memory', 'Memory', 6),
 
@@ -214,6 +215,7 @@ const publicationManifest = [
   agentosDoc('CHARACTER_CONSISTENCY.md', 'features/character-consistency.md', 'Character Consistency', 'Media Generation', 2.5),
   agentosDoc('STYLE_TRANSFER.md', 'features/style-transfer.md', 'Style Transfer', 'Media Generation', 2.6),
   agentosDoc('VISION_PIPELINE.md', 'features/vision-pipeline.md', 'Vision Pipeline (OCR & Image Understanding)', 'Media Generation', 3),
+  agentosDoc('IMAGE_SEGMENTATION.md', 'features/image-segmentation.md', 'Image Segmentation (SAM2 / GroundedSAM)', 'Media Generation', 3.5),
   staticDoc('features/audio-generation.md', 'features/audio-generation.md', 'Audio Generation', 'Media Generation', 4),
   staticDoc('features/provider-preferences.md', 'features/provider-preferences.md', 'Provider Preferences', 'Media Generation', 5),
   staticDoc('features/video-pipeline.md', 'features/video-pipeline.md', 'Video Pipeline', 'Media Generation', 6),
@@ -224,6 +226,8 @@ const publicationManifest = [
   agentosDoc('STRUCTURED_OUTPUT.md', 'features/structured-output.md', 'Structured Output', 'Tools & Capabilities', 1),
   siteDoc('features/llm-output-validation.md', 'features/llm-output-validation.md', 'LLM Output Validation', 'Model Quality & Cost', 1.5),
   agentosDoc('EVALUATION.md', 'features/evaluation-guide.md', 'Evaluation Guide', 'Model Quality & Cost', 2),
+  agentosDoc('features/PROMPT_CACHING.md', 'features/prompt-caching.md', 'Prompt Caching', 'Model Quality & Cost', 2.5),
+  agentosDoc('features/CACHE_DIAGNOSTICS.md', 'features/cache-diagnostics.md', 'Cache Diagnostics', 'Model Quality & Cost', 2.6),
   agentosDoc('COST_OPTIMIZATION.md', 'features/cost-optimization.md', 'Cost Optimization', 'Model Quality & Cost', 3),
   agentosDoc('UNCENSORED_CONTENT.md', 'features/uncensored-content.md', 'Uncensored Content & Policy-Tier Routing', 'Model Quality & Cost', 3.5),
   agentosDoc('EVALUATION_FRAMEWORK.md', 'features/evaluation-framework.md', 'Evaluation Framework', 'Model Quality & Cost', 4, {
@@ -359,6 +363,8 @@ const publicationManifest = [
   siteDoc('wunderland/index.md', 'wunderland/index.md', 'Wunderland — Getting Started', 'Wunderland', 1, {
     categoryIndex: true,
   }),
+
+  agentosDoc('contributing/new-provider.md', 'contributing/new-provider.md', 'Adding an LLM Provider', 'Contributing', 1),
 ];
 
 function resolvePublicationSourcePath(monoRoot, entryConfig) {

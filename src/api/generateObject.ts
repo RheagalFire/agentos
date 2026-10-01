@@ -18,7 +18,7 @@ import type { Message, SystemContentBlock, TokenUsage } from './generateText.js'
 import { resolveModelOption } from './model.js';
 import { lowerZodToJsonSchema } from '../orchestration/compiler/SchemaLowering.js';
 import { estimateMaxTokensForZodSchema } from './runtime/schemaTokenEstimate.js';
-import { canUseStrictJsonSchema, buildOpenAIJsonSchemaResponseFormat } from './runtime/openaiResponseFormat.js';
+import { buildResponseFormatForProvider } from './runtime/responseFormatForProvider.js';
 import { buildResponseFormat } from '../core/llm/providers/structuredOutputFormat.js';
 
 /**
@@ -219,6 +219,64 @@ export interface GenerateObjectOptions<T extends ZodType> {
    * non-OpenAI providers).
    */
   policyTier?: 'safe' | 'standard' | 'mature' | 'private-adult';
+  /**
+   * Per-call request timeout in milliseconds, forwarded to
+   * {@link import('./generateText.js').GenerateTextOptions.requestTimeout}.
+   * Structured-output callers that emit long strings (e.g. codegen TSX) raise
+   * the abort window for this call without slowing the provider's default
+   * failover for chat / narration traffic.
+   */
+  requestTimeout?: number;
+
+  /**
+   * Reasoning-depth / token-spend control, forwarded to
+   * {@link import('./generateText.js').GenerateTextOptions.effort}. On
+   * effort-capable models the provider emits it as `output_config.effort`
+   * (Anthropic) or `reasoning_effort` (OpenAI o-series / GPT-5). Dropped on
+   * models that don't support it.
+   */
+  effort?: string;
+
+  /**
+   * Per-call prompt-cache control, forwarded to
+   * {@link import('./generateText.js').GenerateTextOptions.cache}.
+   * `false` opts this call out of ALL cache marking (the schema block's
+   * marker included — right for one-shot extractions); `{ ttl: '1h' }` puts
+   * a 1-hour TTL on the provider's auto markers (the moving message-tail).
+   */
+  cache?: { ttl?: '5m' | '1h' } | false;
+
+  /**
+   * TTL for the schema block's own cache marker (the block this call appends
+   * after the caller's system). The schema bytes are stable per call SITE, so
+   * sites whose calls gap more than 5 minutes (human-paced pipelines, slow
+   * loops) should set `'1h'` — otherwise the entry expires between calls and
+   * every call re-writes the prefix at the write premium. Defaults to the
+   * 5-minute marker (previous behavior). Ignored when `cache` is `false`.
+   */
+  schemaCacheTtl?: '5m' | '1h';
+
+  /**
+   * Per-conversation affinity key, forwarded to
+   * {@link import('./generateText.js').GenerateTextOptions.sessionId}.
+   * OpenRouter emits it as `session_id` for provider sticky routing —
+   * upstream prompt caches are host-scoped, so a load-balanced multi-call
+   * pipeline otherwise cold-misses the cache a prior call wrote on a
+   * different host. Pass a stable id per logical session (blueprint/build
+   * id for codegen loops, conversation id for chat extraction). Providers
+   * without an affinity concept ignore the field.
+   */
+  sessionId?: string;
+
+  /**
+   * Opt-in source label forwarded to
+   * {@link import('./generateText.js').GenerateTextOptions.source} and
+   * surfaced on the global LLM usage observer event. Hosts tag their
+   * cost/telemetry rows with it (e.g. 'codegen_tool',
+   * 'narrator_state_extractor') — without it every structured-output
+   * call rolls up under the generic surface bucket.
+   */
+  source?: string;
 }
 
 /**
@@ -247,18 +305,19 @@ export interface GenerateObjectResult<T> {
 
   /** Resolved model identifier used for the run. */
   model: string;
+
+  /**
+   * Provider-fallback trail aggregated across all attempts. `fired` is true
+   * when any attempt used or tried a non-primary provider — including a
+   * fallback on a failed attempt that a later attempt recovered from on the
+   * primary. Callers use this to flag a degraded run.
+   */
+  fallback?: import('./generateText.js').FallbackSignal;
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Set of provider identifiers known to support OpenAI-compatible
- * `response_format: { type: 'json_object' }` in their completion API.
- * This hint prevents the model from wrapping JSON in markdown fences.
- */
-const JSON_MODE_PROVIDERS = new Set(['openai', 'openrouter']);
 
 /**
  * Builds the schema-specific instruction text appended to every
@@ -296,11 +355,39 @@ function buildSchemaSystemPrompt(
   jsonSchema: Record<string, unknown>,
   schemaName?: string,
   schemaDescription?: string,
+  schemaCacheTtl?: '5m' | '1h',
 ): string | SystemContentBlock[] {
   const schemaText = buildSchemaInstructionText(jsonSchema, schemaName, schemaDescription);
 
   if (Array.isArray(userSystem)) {
-    return [...userSystem, { text: schemaText, cacheBreakpoint: true }];
+    return [
+      ...userSystem,
+      {
+        text: schemaText,
+        cacheBreakpoint: true,
+        // Per-call-site TTL: schema bytes are stable per site, so sites whose
+        // calls gap past the 5m default (human-paced pipelines) pass '1h' to
+        // keep the entry alive between calls instead of re-writing it.
+        ...(schemaCacheTtl === '1h' ? { cacheTtl: '1h' as const } : {}),
+      },
+    ];
+  }
+
+  // A string (or omitted) system normally takes the legacy joined-string
+  // branch below, which carries no cache marker at all — a schemaCacheTtl
+  // there would be silently ignored. Honor ANY explicit value ('5m' rides
+  // the default-TTL marker; '1h' carries the ttl) by upgrading to the
+  // block emission — opt-in only: callers without schemaCacheTtl keep the
+  // exact legacy string shape.
+  if (schemaCacheTtl !== undefined) {
+    return [
+      ...(userSystem ? [{ text: userSystem }] : []),
+      {
+        text: schemaText,
+        cacheBreakpoint: true,
+        ...(schemaCacheTtl === '1h' ? { cacheTtl: '1h' as const } : {}),
+      },
+    ];
   }
 
   const parts: string[] = [];
@@ -350,12 +437,107 @@ function extractJson(text: string): unknown {
   throw new SyntaxError(`No valid JSON found in LLM response: ${trimmed.slice(0, 200)}`);
 }
 
+/**
+ * Re-parses string-encoded containers where the schema expects an array or
+ * object but the model produced a JSON STRING containing one.
+ *
+ * Models on the tool-use / structured-output path intermittently
+ * double-encode a nested container — `{"verdicts": "[{...}]"}` instead of
+ * `{"verdicts": [{...}]}` — most often on long, deeply nested payloads. The
+ * raw text extracts as valid JSON, so only Zod sees the defect
+ * (`invalid_type: expected array, received string`), and a retry re-rolls
+ * the same dice with the same prompt.
+ *
+ * Driven strictly by the validation issues: for each `invalid_type` issue
+ * expecting a container whose actual value is a string that syntactically
+ * starts like that container, `JSON.parse` the string in place on a clone.
+ * One pass, no recursion; anything that does not parse is left untouched so
+ * the caller's normal retry/feedback path still applies.
+ *
+ * @param value - The extracted-but-invalid candidate value.
+ * @param error - The Zod error from the failed validation.
+ * @returns The (possibly repaired) value and whether any repair applied.
+ * @internal
+ */
+function repairStringEncodedContainers(
+  value: unknown,
+  error: ZodError,
+): { value: unknown; repaired: boolean } {
+  type ContainerIssue = { code?: string; expected?: string; path?: PropertyKey[] };
+  const targets = (error.issues as unknown as ContainerIssue[]).filter(
+    issue =>
+      issue.code === 'invalid_type' &&
+      (issue.expected === 'array' || issue.expected === 'object'),
+  );
+  if (targets.length === 0) return { value, repaired: false };
+
+  let root: unknown;
+  try {
+    root = structuredClone(value);
+  } catch {
+    // Non-cloneable input (should never happen for JSON-derived data) —
+    // repair is best-effort, never a new failure mode.
+    return { value, repaired: false };
+  }
+
+  let repaired = false;
+  for (const issue of targets) {
+    const path = issue.path ?? [];
+    // Resolve the offending node and its parent inside the clone.
+    let parent: Record<PropertyKey, unknown> | null = null;
+    let node: unknown = root;
+    for (const key of path) {
+      if (node === null || typeof node !== 'object') {
+        node = undefined;
+        break;
+      }
+      parent = node as Record<PropertyKey, unknown>;
+      node = parent[key];
+    }
+    if (typeof node !== 'string') continue;
+    const trimmed = node.trim();
+    const expectsArray = issue.expected === 'array';
+    if (expectsArray ? !trimmed.startsWith('[') : !trimmed.startsWith('{')) continue;
+    let inner: unknown;
+    try {
+      inner = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (path.length === 0) {
+      // The root itself was string-encoded.
+      root = inner;
+      repaired = true;
+      continue;
+    }
+    if (parent) {
+      parent[path[path.length - 1] as PropertyKey] = inner;
+      repaired = true;
+    }
+  }
+  return { value: root, repaired };
+}
 // ---------------------------------------------------------------------------
 // Retry feedback truncation
 // ---------------------------------------------------------------------------
 
 const MAX_FEEDBACK_BAD_RESPONSE_CHARS = 500;
 const MAX_FEEDBACK_VALIDATION_ISSUES = 5;
+
+/**
+ * Ceiling for the truncation-aware budget escalation (see the retry loop).
+ * When an attempt stops with `finishReason: 'length'` the output was cut off
+ * by the token limit, so the next attempt is retried with `maxTokens` grown by
+ * {@link TRUNCATION_ESCALATION_FACTOR} up to this ceiling. The provider layer
+ * (`clampMaxOutputTokens`) reshapes it down to each model's real ceiling, so
+ * this is a safe upper bound across providers (Sonnet ~64K, Opus 128K).
+ */
+const TRUNCATION_RETRY_MAX_TOKENS = 64000;
+const TRUNCATION_ESCALATION_FACTOR = 1.5;
+const TRUNCATION_RETRY_FEEDBACK =
+  'Your previous response was cut off before the JSON was complete (the output hit the token limit). ' +
+  'The token budget has been increased — respond again with ONLY the complete JSON object, ' +
+  'keeping any long string fields as concise as the schema allows.';
 
 /**
  * Truncates a bad LLM response for retry feedback to avoid prompt-token bloat.
@@ -377,6 +559,17 @@ function summarizeZodErrors(error: ZodError): string {
     lines.push(`(${error.issues.length - MAX_FEEDBACK_VALIDATION_ISSUES} more issues omitted)`);
   }
   return lines.join('\n');
+}
+
+/**
+ * Grows the output-token budget after a truncated attempt, capped at
+ * {@link TRUNCATION_RETRY_MAX_TOKENS}. The provider layer clamps the result to
+ * the target model's real ceiling, so this can never produce a request the
+ * model rejects.
+ * @internal
+ */
+function escalateForTruncation(current: number): number {
+  return Math.min(TRUNCATION_RETRY_MAX_TOKENS, Math.ceil(current * TRUNCATION_ESCALATION_FACTOR));
 }
 
 // ---------------------------------------------------------------------------
@@ -455,39 +648,52 @@ export async function generateObject<T extends ZodType>(
     jsonSchema,
     effectiveSchemaName,
     opts.schemaDescription,
+    opts.schemaCacheTtl,
   );
 
-  // Detect provider-native JSON output paths. OpenAI gets the strongest
-  // guarantee via `response_format: json_schema` (strict mode, supported on
-  // gpt-4o-2024-08-06 and later) when the schema lowers cleanly.
-  // Anthropic routes through forced `tool_use` with the schema as
-  // `input_schema` — same gold-standard reliability tier as OpenAI strict
-  // mode. Gemini uses `responseSchema`. OpenAI-compatible providers that
-  // lack native structured output (OpenRouter, etc.) fall back to the
-  // looser `json_object` mode, which suppresses markdown fences but
-  // doesn't enforce the schema.
-  const { providerId } = resolveModelOption(opts, 'text');
-  const useStrictJsonSchema = providerId === 'openai' && canUseStrictJsonSchema(jsonSchema);
-  const supportsJsonObjectMode = JSON_MODE_PROVIDERS.has(providerId);
-  let responseFormat: Record<string, unknown> | undefined;
-  if (useStrictJsonSchema) {
-    responseFormat = buildOpenAIJsonSchemaResponseFormat(jsonSchema, effectiveSchemaName);
-  } else if (providerId === 'anthropic' || providerId === 'gemini' || providerId === 'gemini-cli') {
-    // Route through the provider-specific structured-output helper.
-    // Anthropic gets forced tool_use (single tool with input_schema +
-    // tool_choice: { type: 'tool', name }), Gemini gets responseSchema.
-    // Pre-2026-05-28 these providers fell through to prompt-only
-    // enforcement; complex Zod schemas with .refine() invariants failed
-    // structured output ~100% of the time even with retries because the
-    // model wasn't actually constrained.
+  // Provider-native structured-output payload for the PRIMARY provider —
+  // built by the same shared function the fallback legs use, so the
+  // (provider, model, schema) -> payload logic lives exactly once. See
+  // runtime/responseFormatForProvider.ts for the per-provider behavior
+  // (OpenAI strict json_schema gate, Anthropic forced tool + Fable
+  // prompt-only degrade, Gemini responseSchema, OpenRouter strict gate,
+  // json_object fallbacks).
+  const { providerId, modelId } = resolveModelOption(opts, 'text');
+  let responseFormat = buildResponseFormatForProvider({
+    providerId,
+    modelId,
+    jsonSchema,
+    effectiveSchema,
+    schemaName: effectiveSchemaName,
+  });
+  if (providerId === 'gemini-cli') {
+    // gemini-cli primary: keep emitting the legacy Gemini marker so the
+    // primary path stays byte-stable this pass. GeminiCLIProvider never
+    // reads options.responseFormat (bridge options + text return only), so
+    // the marker is dead weight either way — the per-leg builder reports
+    // `undefined` honestly; remove this carve-out when the provider grows a
+    // responseFormat consumer.
     responseFormat = buildResponseFormat({
       provider: providerId,
       schema: effectiveSchema,
       schemaName: effectiveSchemaName ?? 'response',
     });
-  } else if (supportsJsonObjectMode) {
-    responseFormat = { type: 'json_object' as const };
   }
+  // Per-leg rebuild callback: a fallback hop onto a foreign provider gets a
+  // payload shaped for THAT provider instead of the primary's (which the
+  // leg provider's guard would silently drop, running the leg with zero
+  // provider-side enforcement — the 2026-07-07 gpt-4o-mini freestyle bug).
+  const responseFormatBuilder = (
+    legProviderId: string,
+    legModelId: string,
+  ): Record<string, unknown> | undefined =>
+    buildResponseFormatForProvider({
+      providerId: legProviderId,
+      modelId: legModelId,
+      jsonSchema,
+      effectiveSchema,
+      schemaName: effectiveSchemaName,
+    });
 
   // Build the messages array, accumulating retry feedback as needed.
   const messages: Message[] = [];
@@ -508,7 +714,17 @@ export async function generateObject<T extends ZodType>(
   // (256-512 tokens) and JSON.parse fails on the unfinished output. The
   // estimate scales with field count and array nesting depth so simple
   // schemas don't pay for tokens they won't use.
-  const effectiveMaxTokens = opts.maxTokens ?? estimateMaxTokensForZodSchema(opts.schema);
+  //
+  // `let`, not `const`: a truncated attempt (finishReason 'length') escalates
+  // this for the next attempt so a cut-off structured-output call self-heals
+  // instead of re-truncating with the same budget (see the retry loop below).
+  let currentMaxTokens = opts.maxTokens ?? estimateMaxTokensForZodSchema(opts.schema);
+
+  // Accumulate the provider-fallback signal across every attempt so a fallback
+  // that fired on a failed attempt is still reported even when a later attempt
+  // recovers on the primary.
+  let anyFallbackFired = false;
+  const accumulatedFallbackHops: import('./generateText.js').FallbackSignal['hops'] = [];
 
   // Attempt generation up to 1 + maxRetries times (initial + retries)
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -518,7 +734,7 @@ export async function generateObject<T extends ZodType>(
       system: systemPrompt,
       messages,
       temperature: opts.temperature,
-      maxTokens: effectiveMaxTokens,
+      maxTokens: currentMaxTokens,
       apiKey: opts.apiKey,
       baseUrl: opts.baseUrl,
       fallbackProviders: opts.fallbackProviders,
@@ -529,7 +745,28 @@ export async function generateObject<T extends ZodType>(
       // most-moderated route on the platform — single most common
       // structured-output failure mode for mature callers).
       policyTier: opts.policyTier,
+      // Forward per-call requestTimeout to the underlying generateText so
+      // large-output structured-output callers (codegen TSX) get a longer
+      // abort window than the provider default.
+      requestTimeout: opts.requestTimeout,
+      // Forward reasoning effort so reasoning-capable models (gpt-5.x ->
+      // reasoning_effort, effort-capable Claude -> output_config.effort) run at
+      // the requested depth instead of their default.
+      effort: opts.effort,
+      // Forward per-call cache control: `false` = zero cache_control on the
+      // wire (one-shot extractions, schema block included); `{ ttl: '1h' }`
+      // = 1h TTL on the provider's auto markers (moving message-tail).
+      ...(opts.cache !== undefined ? { cache: opts.cache } : {}),
+      // Per-conversation affinity key (OpenRouter session_id sticky
+      // routing; other providers ignore it).
+      ...(opts.sessionId !== undefined ? { sessionId: opts.sessionId } : {}),
+      // Observer source label (see GenerateObjectOptions.source).
+      ...(opts.source !== undefined ? { source: opts.source } : {}),
       _responseFormat: responseFormat,
+      // Fallback legs rebuild the payload for THEIR provider via this
+      // callback (see generateText's fallback loop) instead of inheriting
+      // the primary-shaped payload verbatim.
+      _responseFormatBuilder: responseFormatBuilder,
     });
 
     // Accumulate token usage across attempts
@@ -539,6 +776,10 @@ export async function generateObject<T extends ZodType>(
     if (typeof result.usage.costUSD === 'number') {
       totalUsage.costUSD = (totalUsage.costUSD ?? 0) + result.usage.costUSD;
     }
+
+    // Accumulate the fallback trail across attempts (see anyFallbackFired above).
+    if (result.fallback?.fired) anyFallbackFired = true;
+    if (result.fallback?.hops?.length) accumulatedFallbackHops.push(...result.fallback.hops);
     // Prompt-cache metrics. generateText propagates these from the
     // provider layer (Anthropic's cache_read_input_tokens /
     // cache_creation_input_tokens); without this accumulation every
@@ -563,26 +804,62 @@ export async function generateObject<T extends ZodType>(
     try {
       parsed = extractJson(result.text);
     } catch (parseErr) {
-      // JSON extraction failed — append truncated feedback and retry
+      // JSON extraction failed — retry. A truncated attempt (finishReason
+      // 'length') is a BUDGET problem, not malformed content: grow the budget
+      // instead of telling the model its JSON was invalid (which would mislead
+      // it into "fixing" correct-but-cut-off output).
       if (attempt < maxRetries) {
         messages.push({ role: 'assistant', content: summarizeBadResponse(result.text) });
-        messages.push({
-          role: 'user',
-          content: `Your response was not valid JSON. Error: ${(parseErr as Error).message}\n\nPlease respond with ONLY a valid JSON object matching the schema. No markdown, no code fences.`,
-        });
+        if (result.finishReason === 'length') {
+          currentMaxTokens = escalateForTruncation(currentMaxTokens);
+          messages.push({ role: 'user', content: TRUNCATION_RETRY_FEEDBACK });
+        } else {
+          messages.push({
+            role: 'user',
+            content: `Your response was not valid JSON. Error: ${(parseErr as Error).message}\n\nPlease respond with ONLY a valid JSON object matching the schema. No markdown, no code fences.`,
+          });
+        }
         continue;
       }
       throw new ObjectGenerationError(
-        `Failed to extract valid JSON after ${maxRetries + 1} attempts: ${(parseErr as Error).message}`,
+        `Failed to extract valid JSON after ${maxRetries + 1} attempts${
+          result.finishReason === 'length'
+            ? ' (output was truncated at the token limit — the schema may need a smaller output or an explicit maxTokens)'
+            : ''
+        }: ${(parseErr as Error).message}`,
         result.text,
       );
     }
 
     // Step 2: Validate against the Zod schema
     // Use safeParse to capture structured validation errors for retry feedback
-    const validation = effectiveSchema.safeParse(parsed) as
+    let validation = effectiveSchema.safeParse(parsed) as
       | { success: true; data: { items: z.infer<T> } | z.infer<T> }
       | { success: false; error: ZodError };
+
+    if (!validation.success) {
+      // Models on the tool-use / structured-output path intermittently
+      // DOUBLE-ENCODE a nested container — `{"verdicts": "[{...}]"}` instead
+      // of `{"verdicts": [{...}]}` — most often on long, deeply nested
+      // payloads. The JSON extracts fine, so only validation sees it, and a
+      // retry re-rolls the same dice with the same prompt: the 2026-07-10..16
+      // outage where every wilds visual-judge call exhausted its retries was
+      // exactly this. Repair the string-encoded containers the validation
+      // issues point at and re-validate once before spending a retry.
+      const repair = repairStringEncodedContainers(parsed, validation.error);
+      if (repair.repaired) {
+        const revalidation = effectiveSchema.safeParse(repair.value) as typeof validation;
+        // Adopt the repaired candidate even when it STILL fails validation:
+        // the unwrap succeeded, so the real defect lives inside the container
+        // (a bad enum, a missing field, out-of-range value). Keeping the
+        // pre-repair error here fed the model — and the terminal
+        // ObjectGenerationError — the misleading "expected array, received
+        // string" issue instead of the true one, so retries fixed the wrong
+        // thing and the failure log masked the actual cause.
+        parsed = repair.value;
+        validation = revalidation;
+      }
+    }
 
     if (validation.success) {
       // Unwrap the synthetic envelope when we wrapped a top-level
@@ -599,6 +876,14 @@ export async function generateObject<T extends ZodType>(
         finishReason: result.finishReason,
         provider: result.provider,
         model: result.model,
+        fallback: {
+          fired: anyFallbackFired,
+          finalProvider: result.provider,
+          finalModel: result.model,
+          hops: accumulatedFallbackHops.length
+            ? accumulatedFallbackHops
+            : [{ provider: result.provider, model: result.model, ok: true }],
+        },
       };
     }
 
@@ -608,10 +893,33 @@ export async function generateObject<T extends ZodType>(
     if (attempt < maxRetries) {
       // Append truncated feedback to avoid prompt-token bloat on retries
       messages.push({ role: 'assistant', content: summarizeBadResponse(result.text) });
-      messages.push({
-        role: 'user',
-        content: `The JSON you produced does not match the required schema. Validation errors:\n${summarizeZodErrors(validation.error)}\n\nPlease fix the JSON and respond with ONLY a valid JSON object.`,
-      });
+      if (result.finishReason === 'length') {
+        // Parsed but incomplete because the output was cut off mid-object
+        // (e.g. a required field never emitted) — grow the budget rather than
+        // ask the model to "fix" a schema mismatch it didn't cause.
+        currentMaxTokens = escalateForTruncation(currentMaxTokens);
+        messages.push({ role: 'user', content: TRUNCATION_RETRY_FEEDBACK });
+      } else {
+        // When a container came back as a quoted string whose CONTENTS did
+        // not parse (the repair above declines those), the generic schema
+        // feedback tends to re-roll the exact same shape — name the mistake
+        // so the retry emits the container inline (observed: the visual
+        // judge's residual ~1-in-5 failed rounds after the repair shipped).
+        const stringContainerPaths = validation.error.issues
+          .filter(issue => {
+            if (issue.code !== 'invalid_type') return false;
+            const expected = (issue as { expected?: string }).expected;
+            return expected === 'array' || expected === 'object';
+          })
+          .map(issue => issue.path.join('.') || '<root>');
+        const stringContainerNote = stringContainerPaths.length
+          ? `\nIMPORTANT: ${stringContainerPaths.join(', ')} must be raw inline JSON (an actual array/object in the output), NEVER a quoted or stringified JSON value.`
+          : '';
+        messages.push({
+          role: 'user',
+          content: `The JSON you produced does not match the required schema. Validation errors:\n${summarizeZodErrors(validation.error)}${stringContainerNote}\n\nPlease fix the JSON and respond with ONLY a valid JSON object.`,
+        });
+      }
       continue;
     }
   }

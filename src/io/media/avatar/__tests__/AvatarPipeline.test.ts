@@ -58,11 +58,11 @@ function makeDifferentVector(): number[] {
 
 function createMockFaceService(): IFaceEmbeddingService {
   return {
-    extractEmbedding: vi.fn<[string], Promise<FaceEmbedding>>().mockResolvedValue({
+    extractEmbedding: vi.fn<(imageUrl: string) => Promise<FaceEmbedding>>().mockResolvedValue({
       vector: makeSimilarVector(),
       confidence: 0.99,
     }),
-    compareFaces: vi.fn<[number[], number[], number?], FaceComparisonResult>().mockReturnValue({
+    compareFaces: vi.fn<(a: number[], b: number[], threshold?: number) => FaceComparisonResult>().mockReturnValue({
       similarity: 0.95,
       match: true,
     }),
@@ -71,7 +71,7 @@ function createMockFaceService(): IFaceEmbeddingService {
 
 function createMockImageGenerator(): ImageGeneratorFn {
   let counter = 0;
-  return vi.fn<Parameters<ImageGeneratorFn>, ReturnType<ImageGeneratorFn>>().mockImplementation(
+  return vi.fn<ImageGeneratorFn>().mockImplementation(
     async (_prompt, _options) => {
       counter++;
       return `https://images.test/generated-${counter}.png`;
@@ -191,6 +191,34 @@ describe('AvatarPipeline', () => {
       expect(generateImage).toHaveBeenCalledTimes(7);
     });
 
+    it('generates the expression images concurrently, not one-at-a-time', async () => {
+      // Track how many generateImage calls overlap. A sequential loop can
+      // never exceed 1 in flight; the bounded-parallel version overlaps.
+      let inFlight = 0;
+      let maxInFlight = 0;
+      generateImage.mockImplementation(async () => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        inFlight--;
+        return 'https://images.test/expr.png';
+      });
+
+      const result = await pipeline.generate(
+        makeRequest({
+          stages: ['neutral_portrait', 'face_embedding', 'expression_sheet'],
+        }),
+      );
+
+      // The 6 non-neutral expressions must run in parallel.
+      expect(maxInFlight).toBeGreaterThanOrEqual(2);
+      // All emotions still present, none dropped by the concurrency change.
+      const sheet = result.identityPackage.anchors.expressionSheet!;
+      for (const emotion of AVATAR_EMOTIONS) {
+        expect(sheet[emotion]).toBeDefined();
+      }
+    });
+
     it('records drift scores for each expression', async () => {
       const result = await pipeline.generate(
         makeRequest({
@@ -235,11 +263,15 @@ describe('AvatarPipeline', () => {
         }),
       );
 
-      // The first expression (happy) should have been regenerated
-      const happyJob = result.jobs.find((j) => j.label === 'expression:happy');
-      expect(happyJob).toBeDefined();
-      expect(happyJob!.attempts).toBe(3); // 2 failed + 1 passed
-      expect(happyJob!.status).toBe('completed');
+      // The first two drift comparisons fail, so exactly two expressions are
+      // regenerated once. Expression images render concurrently, so WHICH two
+      // retry is not deterministic — assert the aggregate rather than a single
+      // emotion's attempt count. 1 portrait + 6 expressions + 2 retries = 9.
+      expect(generateImage).toHaveBeenCalledTimes(9);
+      const expressionJobs = result.jobs.filter((j) => j.stage === 'expression_sheet');
+      const totalAttempts = expressionJobs.reduce((sum, j) => sum + (j.attempts ?? 0), 0);
+      expect(totalAttempts).toBe(8); // 6 base attempts + 2 regenerations
+      expect(expressionJobs.every((j) => j.status === 'completed')).toBe(true);
     });
 
     it('records rejected labels when all attempts drift too far', async () => {
@@ -428,6 +460,49 @@ describe('AvatarPipeline', () => {
       expect(result.jobs[0].status).toBe('completed');
       expect(result.jobs[1].status).toBe('failed');
       expect(result.jobs[1].error).toBe('API timeout');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Incremental job-completion callback
+  // -------------------------------------------------------------------------
+
+  describe('onJobComplete callback', () => {
+    it('fires once per settled job with the job record', async () => {
+      const seen: Array<{ stage: string; label: string; status: string }> = [];
+      const result = await pipeline.generate(
+        makeRequest({
+          stages: ['neutral_portrait', 'face_embedding', 'expression_sheet'],
+          onJobComplete: (job) => {
+            seen.push({ stage: job.stage, label: job.label, status: job.status });
+          },
+        }),
+      );
+
+      expect(seen).toHaveLength(result.jobs.length);
+      // Every non-neutral expression surfaced through the callback, each
+      // settled as completed (neutral reuses the portrait — no job).
+      const expressionLabels = seen
+        .filter((j) => j.stage === 'expression_sheet')
+        .map((j) => j.label);
+      for (const emotion of AVATAR_EMOTIONS.filter((e) => e !== 'neutral')) {
+        expect(expressionLabels).toContain(`expression:${emotion}`);
+      }
+      expect(seen.every((j) => j.status === 'completed')).toBe(true);
+    });
+
+    it('swallows callback errors without failing jobs or the pipeline', async () => {
+      const result = await pipeline.generate(
+        makeRequest({
+          stages: ['neutral_portrait', 'expression_sheet'],
+          onJobComplete: () => {
+            throw new Error('caller persistence exploded');
+          },
+        }),
+      );
+
+      expect(result.jobs.every((j) => j.status === 'completed')).toBe(true);
+      expect(result.identityPackage.anchors.neutralPortrait).toBeTruthy();
     });
   });
 });

@@ -58,6 +58,17 @@ export type MessageContent = string | Array<MessageContentPart>;
  * Represents a single message in a conversation, conforming to a structure
  * widely adopted by chat-based LLM APIs.
  */
+/**
+ * An Anthropic extended-thinking block, captured from a response and replayed
+ * verbatim on the next tool-loop turn. `signature` (standard) and `data`
+ * (redacted) are opaque, provider-issued tokens that MUST be replayed exactly,
+ * in order — never strip, reorder, or regenerate them, or the Messages API
+ * rejects the turn.
+ */
+export type ThinkingBlock =
+  | { type: 'thinking'; thinking: string; signature: string }
+  | { type: 'redacted_thinking'; data: string };
+
 export interface ChatMessage {
   /** The role of the entity sending the message. */
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -75,7 +86,31 @@ export interface ChatMessage {
       name: string;
       arguments: string;
     };
+    /**
+     * Gemini thought signature for this call. Gemini 3 rejects a replayed
+     * function call without one (HTTP 400), so GeminiProvider captures it from
+     * the response and sends it back on the next turn. Other providers ignore
+     * it.
+     */
+    thoughtSignature?: string;
   }>;
+  /**
+   * Anthropic extended-thinking blocks emitted on this assistant turn.
+   * Captured from the response and replayed verbatim (signatures intact) on
+   * the next tool-loop turn — Anthropic 400s a tool turn whose prior thinking
+   * blocks aren't replayed. Present ONLY when the request enabled extended
+   * thinking; undefined on every non-thinking turn (the existing path is
+   * unchanged).
+   */
+  thinkingBlocks?: ThinkingBlock[];
+  /**
+   * The model's reasoning summary for this assistant turn, as plain text,
+   * when the provider returns one (Gemini returns thought summaries only with
+   * `customModelParams.thinkingConfig.includeThoughts`). Output only: no
+   * provider sends it back. It is separate from `thinkingBlocks`, which carry
+   * Anthropic's signed blocks for replay.
+   */
+  reasoningText?: string;
 }
 
 // ... (rest of IProvider.ts remains the same as provided by user initially)
@@ -103,6 +138,111 @@ export interface ModelCompletionOptions {
    * The maximum number of tokens to generate in the completion.
    */
   maxTokens?: number;
+  /**
+   * Per-call request timeout in milliseconds. Overrides the provider's default
+   * request timeout for this single completion only. Large-output callers
+   * (e.g. structured-output generation that emits long strings) can raise the
+   * abort window without slowing the provider's default failover for chat or
+   * narration traffic. Providers that don't implement a request timeout ignore
+   * this field.
+   */
+  requestTimeout?: number;
+  /**
+   * Anthropic extended-thinking switch. `{ budgetTokens }` turns thinking on:
+   * on a thinking-capable Claude model the provider sends
+   * `thinking: { type: 'adaptive' }` (the budget number is not sent and
+   * max_tokens passes through unchanged). `false` turns it off with the shape
+   * the model takes (`between_tools` on Sonnet 5.5, `disabled` on Opus 5 and
+   * Sonnet 5, capping effort at `high` where the model requires it); Opus
+   * 5.5, Fable and Mythos always think. Omitted keeps the model's default,
+   * which is thinking on for Opus 5 and later, Sonnet 5 and later, Fable and
+   * Mythos, and off for older models. Other providers ignore the field.
+   */
+  thinking?: { budgetTokens: number } | false;
+  /**
+   * Reasoning-effort control. On effort-capable Claude models (Opus 4.5+,
+   * Sonnet 4.6, Fable/Mythos 5) the provider sends `output_config.effort`
+   * (low|medium|high|xhigh|max). Independent of `thinking` and tool_choice;
+   * dropped on unsupported models or invalid values.
+   */
+  effort?: string;
+  /**
+   * Anthropic prompt-cache diagnostics (beta `cache-diagnosis-2026-04-07`).
+   * When set, the provider sends `diagnostics: { previous_message_id }` plus
+   * the beta header, and the API compares this request against the referenced
+   * one to explain any cache miss. Pass `previousMessageId: null` on the first
+   * call of a conversation to opt in; thread the previous response's `id`
+   * (`msg_...`) on subsequent calls. The verdict comes back on
+   * {@link ModelCompletionResponse.cacheDiagnostics}. Anthropic-only —
+   * other providers ignore the field. Never affects request processing:
+   * diagnostics are best-effort observability.
+   */
+  cacheDiagnostics?: { previousMessageId: string | null };
+  /**
+   * Per-call prompt-cache control (Anthropic; other providers ignore it).
+   *
+   * - `false` — this request emits NO `cache_control` at all: the automatic
+   *   markers (request-level marker, thinking-mode block markers, the moving
+   *   message-tail) are suppressed AND caller-placed system/message/tool
+   *   markers are stripped before the wire. Hard guarantee for true
+   *   one-shots, where a cache write (1.25x at 5m, 2x at 1h) can never be
+   *   read back.
+   * - `{ ttl: '1h' }` — the automatic markers (including the moving
+   *   message-tail) carry `ttl: '1h'` instead of the 5-minute default, and
+   *   the auto path uses explicit block placement so the TTL reaches the
+   *   wire. For slow loops whose step gaps exceed 5 minutes (codegen
+   *   orchestrator/tool calls, human-paced conversation turns).
+   *   Caller-placed markers keep their own TTLs untouched.
+   * - `{ ttl: '5m' }` or omitted — default behavior (5-minute auto markers).
+   */
+  cache?: { ttl?: '5m' | '1h' } | false;
+  /**
+   * Per-conversation affinity key. OpenRouter forwards it as `session_id`
+   * to pin provider sticky routing: upstream prompt caches are host-scoped,
+   * so load-balanced conversations otherwise cold-miss the cache a prior
+   * turn wrote on a different host. Pass a stable id per conversation
+   * (game session id, companion conversation id). Providers without an
+   * affinity concept ignore the field.
+   */
+  sessionId?: string;
+  /**
+   * OpenAI prompt-cache shard key (spec batch-1 C2; other providers ignore
+   * it). `'auto'` derives `agentos:<first 16 hex of sha256(sessionId)>` from
+   * {@link sessionId} — omitted when no session id is available; raw ids
+   * never leave the process. An explicit string is sent verbatim after
+   * trimming (empty → omitted). `false` omits the field. Absent defaults
+   * to `'auto'` on the native OpenAI endpoint (api.openai.com) unless the
+   * call carries `cache: false`; OpenAI-compatible gateways (custom
+   * baseURL) keep the omit default — some reject unknown request fields.
+   * OpenAI recommends ≤~15 requests/min per key; sharding beyond
+   * that is caller policy.
+   */
+  promptCacheKey?: string | 'auto' | false;
+  /**
+   * Cache-key derivation source ONLY (spec batch-1 review fold): the session
+   * id used by `promptCacheKey: 'auto'` when the affinity {@link sessionId}
+   * is absent (e.g. it came from `usageLedger.sessionId` at the api layer).
+   * Never emitted on the wire itself and never used for OpenRouter
+   * `session_id` sticky routing — that stays {@link sessionId}'s job.
+   */
+  promptCacheSessionId?: string;
+  /**
+   * OpenAI prompt-cache retention request (other providers ignore it).
+   * Emitted only when the fail-closed capability table allows the
+   * model/value combination (see `openai-cache-params.ts`): `'30m'` →
+   * `prompt_cache_options.ttl` on GPT-5.6+ families; `'24h'`/`'in_memory'`
+   * → `prompt_cache_retention` on the enumerated allow-list. Unsupported
+   * combinations are omitted with a debug log, never a hard error.
+   */
+  promptCacheRetention?: 'in_memory' | '24h' | '30m';
+  /**
+   * OpenAI service tier, emitted verbatim as `service_tier` (other
+   * providers ignore it). No default. `'flex'` bills at ~batch rates but
+   * can return 429 `resource_unavailable` under load — the existing retry
+   * path retries the same tier; automatic tier fallback is deliberately
+   * not implemented.
+   */
+  serviceTier?: 'auto' | 'default' | 'flex' | 'priority';
   /**
    * Positive values penalize new tokens based on whether they appear in the text so far,
    * increasing the model's likelihood to talk about new topics.
@@ -160,6 +300,32 @@ export interface ModelCompletionOptions {
 }
 
 /**
+ * The first point of divergence between this request and the one referenced
+ * by `cacheDiagnostics.previousMessageId`, as reported by Anthropic's
+ * cache-diagnostics beta. `type` is one of the API's discriminants
+ * (`model_changed` | `system_changed` | `tools_changed` | `messages_changed`
+ * | `previous_message_not_found` | `unavailable`) — kept as an open string so
+ * new discriminants pass through without a library update. The `*_changed`
+ * types also carry `cacheMissedInputTokens`, an estimate of how many input
+ * tokens fell after the divergence point (magnitude indicator, not a billing
+ * number).
+ */
+export interface CacheMissReason {
+  type: string;
+  cacheMissedInputTokens?: number;
+}
+
+/**
+ * Cache-diagnostics verdict for one call. `cacheMissReason: null` means the
+ * comparison was still running when the response serialized (inconclusive —
+ * check the next turn). A populated reason identifies the earliest divergence;
+ * fix it first, later ones may be hidden behind it.
+ */
+export interface CacheDiagnostics {
+  cacheMissReason: CacheMissReason | null;
+}
+
+/**
  * Represents token usage information from a model call, including cost estimation.
  */
 export interface ModelUsage {
@@ -167,10 +333,18 @@ export interface ModelUsage {
   completionTokens?: number;
   totalTokens: number;
   costUSD?: number;
-  /** Tokens written to the prompt cache on this call (Anthropic: 25% surcharge). */
+  /** Tokens written to the prompt cache on this call (Anthropic: 25% surcharge at 5m TTL; OpenAI GPT-5.6+: 25% surcharge, from `cache_write_tokens`). */
   cacheCreationInputTokens?: number;
   /** Tokens read from the prompt cache on this call (Anthropic: 90% discount). */
   cacheReadInputTokens?: number;
+  /**
+   * Provider-independent total input tokens INCLUDING cached reads/writes
+   * (spec batch-1 C1). Anthropic: `input_tokens + cache_read + cache_creation`
+   * (its `input_tokens` excludes cache). OpenAI/OpenRouter: `prompt_tokens`
+   * as-is (already inclusive). Tri-state: undefined = the provider did not
+   * report enough to compute; a reported 0 is meaningful and preserved.
+   */
+  inclusiveInputTokens?: number;
 }
 
 /**
@@ -196,10 +370,34 @@ export interface ModelCompletionResponse {
   created: number;
   /** Resolved model identifier actually used (may differ from requested if routing / aliasing applied). */
   modelId: string;
+  /**
+   * Upstream host that actually served the request when the provider is an
+   * aggregator/router (e.g. OpenRouter returns `provider: 'Groq'` in the
+   * completion body). Undefined for direct providers and on aggregators
+   * that omit it. Latency telemetry: identical model + token counts can be
+   * 4s on Groq vs 10s+ on a price-biased host, so attribution needs this.
+   */
+  servingProvider?: string;
+  /**
+   * Provider-reported service tier the call actually ran at (OpenAI
+   * `service_tier` on the response body; spec batch-1 C2). Can differ from
+   * the requested tier (e.g. flex spill-over to default). Undefined on
+   * providers/responses without a tier concept.
+   */
+  serviceTier?: string;
   /** One or more choices; for multi‑choice inference some providers return >1. */
   choices: ModelCompletionChoice[];
   /** Token usage & optional cost metrics (present on final chunk; may be partial/omitted on deltas). */
   usage?: ModelUsage;
+  /**
+   * Anthropic cache-diagnostics verdict (beta). Present only when the request
+   * opted in via {@link ModelCompletionOptions.cacheDiagnostics} AND the API
+   * returned a verdict. `null` = a comparison ran and found no divergence (or
+   * this was the opt-in first turn with nothing to compare). An object with
+   * `cacheMissReason` identifies the earliest divergence — see
+   * {@link CacheDiagnostics}.
+   */
+  cacheDiagnostics?: CacheDiagnostics | null;
   /** Unified error envelope; present ONLY if an error occurred for this request/chunk. */
   error?: {
     /** Human readable message suitable for UI display or logging. */
@@ -213,6 +411,11 @@ export interface ModelCompletionResponse {
   };
   /** Incremental append‑only text delta for streaming; NOT cumulative. Undefined on non‑streaming final response. */
   responseTextDelta?: string;
+  /**
+   * Incremental append-only reasoning-summary text for streaming (see
+   * `ChatMessage.reasoningText`). Never part of `responseTextDelta`.
+   */
+  reasoningTextDelta?: string;
   /** Array of incremental tool/function call argument deltas building up tool invocation payloads. */
   toolCallsDeltas?: Array<{
     /** Choice index if multiple parallel choices produce tool calls. */
@@ -228,6 +431,8 @@ export interface ModelCompletionResponse {
       /** Partial argument JSON fragment (streamed). Concatenate & then parse when final. */
       arguments_delta?: string;
     };
+    /** Gemini thought signature for this call; see ChatMessage tool_calls. */
+    thoughtSignature?: string;
   }>;
   /** Indicates terminal chunk in a stream. MUST be true on last emission (success or error). */
   isFinal?: boolean;
@@ -289,6 +494,11 @@ export interface ModelInfo {
   outputTokenLimit?: number;
   pricePer1MTokensInput?: number;
   pricePer1MTokensOutput?: number;
+  /**
+   * USD per 1M prompt-cache read tokens. Absent means the provider's standard
+   * ratio applies (Anthropic: 0.1 x {@link pricePer1MTokensInput}).
+   */
+  pricePer1MTokensCacheRead?: number;
   pricePer1MTokensTotal?: number;
   supportsStreaming?: boolean;
   defaultTemperature?: number;

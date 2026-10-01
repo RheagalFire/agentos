@@ -55,6 +55,19 @@ import { ApiKeyPool } from '../../../../core/providers/ApiKeyPool.js';
  * };
  * ```
  */
+/**
+ * Named fal image_size presets for the FLUX.2 endpoints, keyed by the
+ * provider-agnostic aspect-ratio strings callers pass. FLUX.2 has no
+ * aspect_ratio field; kontext does and takes the string verbatim.
+ */
+const FAL_ASPECT_PRESETS: Record<string, string> = {
+  '16:9': 'landscape_16_9',
+  '4:3': 'landscape_4_3',
+  '1:1': 'square_hd',
+  '9:16': 'portrait_16_9',
+  '3:4': 'portrait_4_3',
+};
+
 export interface FalImageProviderConfig {
   /**
    * Fal.ai API key. Sent as `Authorization: Key ${apiKey}`.
@@ -98,6 +111,15 @@ export interface FalImageProviderConfig {
 interface FalSubmitResponse {
   /** Unique request ID for polling. */
   request_id: string;
+  /**
+   * Absolute status-polling URL Fal returns on submit. Authoritative over a
+   * reconstructed `${base}/${model}/requests/${id}/status` path: multi-segment
+   * model slugs (e.g. image-to-image edit endpoints) reconstruct to an invalid
+   * route and 405. Always prefer this when present.
+   */
+  status_url?: string;
+  /** Absolute result URL Fal returns on submit. Authoritative over a reconstructed path (same 405 reason as `status_url`). */
+  response_url?: string;
 }
 
 /**
@@ -319,26 +341,59 @@ export class FalImageProvider implements IImageProvider {
     if (providerOpts?.guidance_scale !== undefined) body.guidance_scale = providerOpts.guidance_scale;
     if (providerOpts?.enable_safety_checker !== undefined) body.enable_safety_checker = providerOpts.enable_safety_checker;
 
-    // --- Character consistency via IP-Adapter ---
+    // --- Reference image mapping, per model family ---
+    // FLUX.2 endpoints (fal-ai/flux-2-pro / -max / -flex) are txt2img; their
+    // reference-anchored variants live at `<model>/edit` and take an
+    // `image_urls` ARRAY. Kontext endpoints take `image_url` (singular).
+    // Everything else keeps the legacy IP-Adapter fields.
     const FAL_CONSISTENCY_SCALES: Record<string, number> = {
       strict: 0.9,
       balanced: 0.6,
       loose: 0.3,
     };
 
+    let resolvedModel = model;
     if (request.referenceImageUrl) {
-      body.ip_adapter_image = request.referenceImageUrl;
-      body.ip_adapter_scale = FAL_CONSISTENCY_SCALES[request.consistencyMode ?? 'balanced'];
+      if (model.includes('flux-2')) {
+        if (!resolvedModel.endsWith('/edit')) {
+          resolvedModel = `${resolvedModel}/edit`;
+        }
+        if (body.image_urls === undefined) {
+          body.image_urls = [request.referenceImageUrl];
+        }
+        // /edit endpoints reject the txt2img-only object image_size shape
+        // less predictably than named presets; leave whatever the caller
+        // set and never add ip_adapter fields.
+      } else if (model.includes('kontext')) {
+        if (body.image_url === undefined) {
+          body.image_url = request.referenceImageUrl;
+        }
+      } else {
+        body.ip_adapter_image = request.referenceImageUrl;
+        body.ip_adapter_scale = FAL_CONSISTENCY_SCALES[request.consistencyMode ?? 'balanced'];
+      }
+    }
+
+    // Aspect ratio: kontext takes aspect_ratio verbatim; FLUX.2 uses named
+    // image_size presets. Only applied when the caller didn't already set
+    // an explicit image_size / aspect_ratio.
+    if (request.aspectRatio) {
+      if (resolvedModel.includes('kontext') && body.aspect_ratio === undefined) {
+        body.aspect_ratio = request.aspectRatio;
+      } else if (resolvedModel.includes('flux-2') && body.image_size === undefined) {
+        const preset = FAL_ASPECT_PRESETS[request.aspectRatio];
+        if (preset) body.image_size = preset;
+      }
     }
 
     // Step 1: Submit to the queue
-    const requestId = await this._submitTask(model, body);
+    const { requestId, statusUrl, responseUrl } = await this._submitTask(resolvedModel, body);
 
-    // Step 2: Poll until complete
-    await this._pollStatus(model, requestId);
+    // Step 2: Poll until complete (use the URLs Fal returns, not reconstructed paths)
+    await this._pollStatus(resolvedModel, requestId, statusUrl);
 
     // Step 3: Fetch the result
-    const result = await this._fetchResult(model, requestId);
+    const result = await this._fetchResult(resolvedModel, requestId, responseUrl);
 
     if (!result.images || result.images.length === 0) {
       throw new Error('Fal.ai generation completed but returned no images.');
@@ -402,22 +457,32 @@ export class FalImageProvider implements IImageProvider {
     const imageDataUrl = `data:image/png;base64,${request.image.toString('base64')}`;
     const body: Record<string, unknown> = {
       prompt: request.prompt,
-      image: imageDataUrl,
     };
+
+    // Source-image field is model-specific: kontext takes image_url
+    // (singular, no strength); the FLUX.2 /edit endpoints take an
+    // image_urls ARRAY (no strength); the legacy flux/dev img2img path
+    // keeps image + strength. Fal accepts data: URIs in all of them.
+    if (model.includes('kontext')) {
+      body.image_url = imageDataUrl;
+    } else if (model.includes('flux-2')) {
+      body.image_urls = [imageDataUrl];
+    } else {
+      body.image = imageDataUrl;
+      body.strength = request.strength ?? 0.75;
+    }
 
     if (hasMask) {
       body.mask = `data:image/png;base64,${request.mask!.toString('base64')}`;
     }
 
-    body.strength = request.strength ?? 0.75;
-
     if (request.negativePrompt) body.negative_prompt = request.negativePrompt;
     if (request.seed !== undefined) body.seed = request.seed;
     if (request.n) body.num_images = request.n;
 
-    const requestId = await this._submitTask(model, body);
-    await this._pollStatus(model, requestId);
-    const result = await this._fetchResult(model, requestId);
+    const { requestId, statusUrl, responseUrl } = await this._submitTask(model, body);
+    await this._pollStatus(model, requestId, statusUrl);
+    const result = await this._fetchResult(model, requestId, responseUrl);
 
     if (!result.images || result.images.length === 0) {
       throw new Error('Fal.ai edit completed but returned no images.');
@@ -464,7 +529,10 @@ export class FalImageProvider implements IImageProvider {
    * @throws {Error} If the submission request fails.
    * @internal
    */
-  private async _submitTask(model: string, body: Record<string, unknown>): Promise<string> {
+  private async _submitTask(
+    model: string,
+    body: Record<string, unknown>
+  ): Promise<{ requestId: string; statusUrl?: string; responseUrl?: string }> {
     const url = `${this._config.baseURL}/${model}`;
 
     const response = await fetch(url, {
@@ -486,7 +554,7 @@ export class FalImageProvider implements IImageProvider {
       throw new Error('Fal.ai submission response missing request_id.');
     }
 
-    return data.request_id;
+    return { requestId: data.request_id, statusUrl: data.status_url, responseUrl: data.response_url };
   }
 
   /**
@@ -498,11 +566,11 @@ export class FalImageProvider implements IImageProvider {
    * @throws {Error} If the generation fails or times out.
    * @internal
    */
-  private async _pollStatus(model: string, requestId: string): Promise<void> {
+  private async _pollStatus(model: string, requestId: string, statusUrl?: string): Promise<void> {
     const startedAt = Date.now();
 
     while (Date.now() - startedAt < this._config.timeoutMs) {
-      const url = `${this._config.baseURL}/${model}/requests/${requestId}/status`;
+      const url = statusUrl ?? `${this._config.baseURL}/${model}/requests/${requestId}/status`;
 
       const response = await fetch(url, {
         headers: {
@@ -522,7 +590,23 @@ export class FalImageProvider implements IImageProvider {
       }
 
       if (data.status === 'FAILED') {
-        throw new Error(`Fal.ai image generation failed for request ${requestId}.`);
+        // Surface the provider's failure detail (safety refusal, invalid
+        // input, ...) instead of a bare request id. Callers classify
+        // refusals from the error text — a detail-less message made every
+        // Fal failure look identical and unclassifiable. Best-effort: the
+        // response endpoint carries the error payload for failed requests.
+        let detail = '';
+        try {
+          const resultUrl = `${this._config.baseURL}/${model}/requests/${requestId}`;
+          const resultResponse = await fetch(resultUrl, {
+            headers: { Authorization: `Key ${this.keyPool.next()}` },
+          });
+          const bodyText = await resultResponse.text();
+          if (bodyText) detail = `: ${bodyText.slice(0, 500)}`;
+        } catch {
+          // Detail fetch is best-effort; fall through to the bare message.
+        }
+        throw new Error(`Fal.ai image generation failed for request ${requestId}${detail}`);
       }
 
       // 'IN_QUEUE' or 'IN_PROGRESS' — wait before next poll
@@ -546,8 +630,8 @@ export class FalImageProvider implements IImageProvider {
    * @throws {Error} If the result fetch fails.
    * @internal
    */
-  private async _fetchResult(model: string, requestId: string): Promise<FalResultResponse> {
-    const url = `${this._config.baseURL}/${model}/requests/${requestId}`;
+  private async _fetchResult(model: string, requestId: string, responseUrl?: string): Promise<FalResultResponse> {
+    const url = responseUrl ?? `${this._config.baseURL}/${model}/requests/${requestId}`;
 
     const response = await fetch(url, {
       headers: {

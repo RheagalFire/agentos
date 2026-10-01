@@ -27,9 +27,10 @@ import { VoiceTransportAdapter } from '../runtime/VoiceTransportAdapter.js';
 
 let lastPipelineMock: any = null;
 
-vi.mock('../../voice-pipeline/VoicePipelineOrchestrator.js', () => {
+vi.mock('../../io/voice-pipeline/VoicePipelineOrchestrator.js', () => {
   return {
-    VoicePipelineOrchestrator: vi.fn().mockImplementation(() => {
+    // Must be a regular function (not an arrow) so the adapter can `new` it.
+    VoicePipelineOrchestrator: vi.fn().mockImplementation(function () {
       lastPipelineMock = {
         startSession: vi.fn().mockResolvedValue(undefined),
         stopSession: vi.fn().mockResolvedValue(undefined),

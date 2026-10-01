@@ -30,6 +30,7 @@ import {
 | `performOCR()` | Extract text from images | `await performOCR({ imagePath: './doc.png' })` |
 | `embedText()` | Generate embeddings | `await embedText({ input: ['hello'] })` |
 | `agent()` | Multi-turn sessions with memory | `const a = agent({ provider: 'openai' })` |
+| `souledAgent()` | Soul-file agent whose long-term memory is its `memory/` wiki | `await souledAgent({ provider: 'anthropic', soul: '~/.agentos/agents/aria' })` |
 | `agency()` | Multi-agent teams | `const team = agency({ agents: {...}, strategy: 'parallel' })` |
 
 All functions accept `provider` as a top-level key.
@@ -60,7 +61,7 @@ for the requested task automatically:
 | `gemini`                 | Cloud | `gemini-2.5-flash`         | —                                | —                        | `GEMINI_API_KEY`                  |
 | `openrouter`             | Cloud | `openai/gpt-4o`            | —                                | —                        | `OPENROUTER_API_KEY`              |
 | `claude-code-cli`        | Local | `claude-sonnet-4-5-20250929` | —                                | —                        | `which claude`                    |
-| `gemini-cli`             | Local | `gemini-2.5-flash`         | —                                | —                        | `which gemini`                    |
+| `gemini-cli`             | Local | `gemini-3.5-flash`         | —                                | —                        | `which gemini`                    |
 | `stability`              | Cloud | —                          | `stable-diffusion-xl-1024-v1-0`  | —                        | `STABILITY_API_KEY`               |
 | `replicate`              | Cloud | —                          | `black-forest-labs/flux-1.1-pro` | —                        | `REPLICATE_API_TOKEN`             |
 | `ollama`                 | Local | `llama3.2`                 | `stable-diffusion`               | `nomic-embed-text`       | `OLLAMA_BASE_URL`                 |
@@ -522,7 +523,7 @@ and `streamText({ tools })`: named tool maps, [`ExternalToolRegistry`](https://g
 Pass a `soul:` option to load identity, voice, hard limits, and HEXACO scores from a markdown workspace. The runtime injects `SOUL.md` body as the FIRST system message (before `instructions`, `chainOfThought`, or skills) and parses YAML frontmatter into structured persona config.
 
 ```ts
-// Workspace path — loads SOUL.md + companion files (STYLE.md, IDENTITY.md, AGENTS.md, MEMORY.md)
+// Workspace path — loads SOUL.md + companion files (STYLE.md, IDENTITY.md, AGENTS.md, memory/)
 agent({ provider: 'anthropic', soul: '~/.agentos/agents/aria' });
 
 // Direct file path — loads only SOUL.md
@@ -533,6 +534,28 @@ agent({ provider: 'openai', soul: { content: SOUL_MARKDOWN_STRING } });
 ```
 
 The HEXACO frontmatter (`hexaco: { honestyHumility, emotionality, ... }`) flows into the same `PersonaDriftMechanism` and [`PersonaOverlayManager`](https://github.com/framerslab/agentos/blob/master/src/cognition/substrate/persona_overlays/PersonaOverlayManager.ts) as inline `personality:` config. See [SOUL_FILES.md](../SOUL_FILES.md) for the full 6-file workspace spec.
+
+### `souledAgent()`: soul plus a `memory/` wiki
+
+`agent({ soul })` loads identity but leaves long-term memory to you. `souledAgent()` is the async factory that wires the whole loop in one call: it loads the soul, opens one `Memory` store under the workspace's `memory/.store/`, and attaches the soul's `memory/` markdown wiki as the agent's long-term memory.
+
+```ts
+import { souledAgent } from '@framers/agentos';
+
+const aria = await souledAgent({
+  provider: 'anthropic',
+  model: 'claude-sonnet-4-6',
+  soul: '~/.agentos/agents/aria',
+});
+```
+
+What it wires:
+
+- **Read:** the `memory/index.md` catalog is injected into the system prelude, and the agent opens any page on demand with the `read_memory_page` tool.
+- **Capture:** conversation the agent observes is written to the same store as episodic traces.
+- **Fold:** those traces are merged into entity/concept pages when memory consolidates. `souledAgent` runs this on the agent's `close()`; call `await aria.memory.compileWiki()` to fold mid-session. Merges integrate new facts without clobbering human edits.
+
+One `Memory` facade backs both the live memory and the wiki, so the markdown stays the source of truth and the vector/graph index is rebuilt from it. `souledAgent()` accepts every `agent()` option and returns the same `Agent`, plus `agent.memory` (the store) when the soul resolves to a workspace directory. An inline soul (`{ content }`) has no workspace, so it falls back to a plain `agent()`. Closing the agent also closes the store.
 
 Runnable examples in the package source:
 
@@ -578,7 +601,7 @@ for await (const chunk of agent.processRequest({
 ```
 
 `AgentOSConfig.tools` now accepts the same three forms as the high-level
-helpers: named tool maps, `ExternalToolRegistry` (`Record`, `Map`, or
+helpers: named tool maps, [`ExternalToolRegistry`](https://github.com/framerslab/agentos/blob/master/src/api/runtime/externalToolRegistry.ts) (`Record`, `Map`, or
 iterable), and prompt-only `ToolDefinitionForLLM[]`. AgentOS normalizes those
 inputs during `initialize(...)` and registers them into the shared
 [`ToolOrchestrator`](https://github.com/framerslab/agentos/blob/master/src/core/tools/ToolOrchestrator.ts), so direct `processRequest()` turns can plan against and

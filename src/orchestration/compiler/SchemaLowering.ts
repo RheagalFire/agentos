@@ -4,7 +4,8 @@
  *
  * Intentionally hand-rolled to avoid adding `zod-to-json-schema` as a dependency.
  * Handles the subset of Zod types used in node input/output schemas across the codebase:
- * z.string, z.number, z.boolean, z.null, z.object, z.array, z.enum, z.optional, z.default.
+ * z.string, z.number, z.boolean, z.null, z.object, z.array, z.enum, z.optional, z.default,
+ * z.nullable, z.union/z.discriminatedUnion, z.literal, z.record, z.tuple.
  *
  * Targets Zod v4 `_def` internals:
  * - Discriminant field: `_def.type` (string literal, e.g. `"string"`, `"object"`)
@@ -101,6 +102,93 @@ export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
     case 'default':
       // Unwrap; defaults are runtime concerns, not JSON Schema concerns for our use case.
       return lowerZodToJsonSchema(def.innerType as ZodType);
+
+    case 'nullable': {
+      // z.foo().nullable() — lower the inner schema and widen it with null.
+      // A bare-primitive inner collapses into a JSON Schema type array
+      // (`{ type: ['string', 'null'] }`), which OpenAI strict mode accepts
+      // natively; composite inners (objects, arrays, enums, unions) ride an
+      // `anyOf` pair instead. Previously nullable fell through to `{}`
+      // (untyped), and OpenAI strict mode rejects any node without a `type`
+      // key — one `.nullable()` field anywhere in a schema 400'd the whole
+      // structured-output call. Note nullable is NOT optional: the field
+      // stays in the parent object's `required` array and the model must
+      // emit it (possibly as null) — exactly the OpenAI-recommended shape
+      // for strict-mode "optional-ish" fields.
+      const inner = lowerZodToJsonSchema(def.innerType as ZodType);
+      const innerKeys = Object.keys(inner);
+      if (innerKeys.length === 0) {
+        // Inner type itself is unsupported — stay untyped rather than
+        // inventing a shape; the strict-mode gate degrades the call.
+        return {};
+      }
+      if (innerKeys.length === 1 && typeof inner.type === 'string') {
+        return { type: [inner.type, 'null'] };
+      }
+      return { anyOf: [inner, { type: 'null' }] };
+    }
+
+    case 'union': {
+      // z.union AND z.discriminatedUnion both surface as `union` in Zod v4 (the
+      // discriminated variant only adds `_def.discriminator`). Lower each option
+      // and expose them via `anyOf`. The result intentionally has no top-level
+      // `type`: the Anthropic structured-output adapter injects `{ type: 'object' }`
+      // (its tool input_schema requires a type), and OpenAI strict mode declines a
+      // typeless root (`canUseStrictJsonSchema`) and degrades to json_object — so a
+      // typeless `anyOf` is safe across providers while still giving the model the
+      // real variant shapes (previously a union lowered to `{}`, leaving the model
+      // unguided and structured output validation failing).
+      const options = (def.options as ZodType[] | undefined) ?? [];
+      return { anyOf: options.map((opt) => lowerZodToJsonSchema(opt)) };
+    }
+
+    case 'literal': {
+      // Zod v4: def.values is an array of allowed literal constants (a literal may
+      // carry more than one). Model it as a single-value enum so discriminants in a
+      // discriminated union read correctly.
+      const values = (def.values as unknown[] | undefined) ?? [];
+      return { enum: values };
+    }
+
+    case 'record': {
+      // Open-ended string-keyed map → JSON Schema object whose value shape is
+      // described by additionalProperties.
+      return {
+        type: 'object',
+        additionalProperties: lowerZodToJsonSchema(def.valueType as ZodType),
+      };
+    }
+
+    case 'tuple': {
+      // Zod v4: def.items is the array of member schemas; def.rest is the
+      // optional rest-element schema. Lowered as a fixed-length array rather
+      // than draft-2020 `prefixItems` because OpenAI strict structured
+      // outputs rejects any node without a `type` key AND does not support
+      // `prefixItems` — a tuple previously fell through to `{}` here, which
+      // made the WHOLE schema unusable in strict mode ("schema must have a
+      // 'type' key" on the tuple path). Positional member types collapse
+      // into `items` (deduped anyOf when heterogeneous); exact arity rides
+      // minItems/maxItems (no maxItems when a rest element exists). This is
+      // deliberately looser than true tuple validation — the caller's Zod
+      // schema still validates the parsed output, so correctness holds; the
+      // JSON schema only needs to guide the model.
+      const members = ((def.items as ZodType[] | undefined) ?? []).map((m) =>
+        lowerZodToJsonSchema(m),
+      );
+      const rest = def.rest ? lowerZodToJsonSchema(def.rest as ZodType) : undefined;
+      const candidates = [...members, ...(rest ? [rest] : [])];
+      const unique = candidates.filter(
+        (c, i) => candidates.findIndex((o) => JSON.stringify(o) === JSON.stringify(c)) === i,
+      );
+      const items =
+        unique.length === 0 ? {} : unique.length === 1 ? unique[0] : { anyOf: unique };
+      return {
+        type: 'array',
+        items,
+        minItems: members.length,
+        ...(rest ? {} : { maxItems: members.length }),
+      };
+    }
 
     default:
       // Unknown / unsupported Zod type — return empty schema (treat as untyped).

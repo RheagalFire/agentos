@@ -38,6 +38,7 @@ async function _getOs(): Promise<typeof import('node:os')> {
 }
 
 import type { MemoryTrace } from '../../core/types.js';
+import type { CompileResult } from '../../../substrate/memory/wiki/types.js';
 import type { ITool } from '../../../../core/tools/ITool.js';
 import type {
   MemoryConfig,
@@ -820,6 +821,113 @@ export class Memory {
     );
   }
 
+  /**
+   * List traces created strictly after `sinceMs` (Unix-ms). Newest-first by
+   * default; pass `order: 'asc'` for oldest-first (used by the wiki compiler to
+   * drain the window in chronological batches).
+   *
+   * Unlike {@link recall}, this performs no FTS match — it is a time-window scan,
+   * used by the wiki compiler to fold recent activity into pages.
+   *
+   * @param sinceMs - Exclusive lower bound on `created_at` (Unix ms). Use 0 for "all".
+   * @param options - Optional scope filter, result cap (default 200), and sort order.
+   */
+  async recentTraces(
+    sinceMs: number,
+    options?: { limit?: number; scope?: string; order?: 'asc' | 'desc' },
+  ): Promise<MemoryTrace[]> {
+    await this._initPromise;
+    const limit = options?.limit ?? 200;
+    // Whitelisted literal — never interpolate user input into SQL.
+    const direction = options?.order === 'asc' ? 'ASC' : 'DESC';
+    const conditions = ['brain_id = ?', 'deleted = 0', 'created_at > ?'];
+    const params: unknown[] = [this._brain.brainId, sinceMs];
+    if (options?.scope) {
+      conditions.push('scope = ?');
+      params.push(options.scope);
+    }
+    params.push(limit);
+
+    const rows = await this._brain.all<TraceRow>(
+      `SELECT id, type, scope, content, embedding, strength, created_at,
+              last_accessed, retrieval_count, tags, emotions, metadata, deleted
+       FROM memory_traces
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY created_at ${direction}
+       LIMIT ?`,
+      params,
+    );
+    return rows.map((row) => this._buildTrace(row));
+  }
+
+  /** Optional markdown wiki store + compiler, attached by the agent at boot. */
+  private _wiki?: {
+    store: {
+      index: (o?: { force?: boolean }) => Promise<unknown>;
+      readMetaWatermark: () => Promise<string | null>;
+      writeMetaWatermark: (iso: string) => Promise<void>;
+    };
+    compiler: {
+      compile: (input: {
+        traces: MemoryTrace[];
+        reason: 'consolidation' | 'session-end' | 'explicit';
+      }) => Promise<CompileResult>;
+    };
+  };
+
+  /**
+   * Attach a markdown wiki store + compiler. Called by the agent at boot once
+   * the memory/ workspace directory is known. Idempotent (last call wins).
+   */
+  attachWiki(wiki: NonNullable<Memory['_wiki']>): void {
+    this._wiki = wiki;
+  }
+
+  /**
+   * Compile recent (non-wiki) traces into the markdown wiki, then re-index.
+   * Reads the wiki's watermark, folds every trace created since into pages, and
+   * advances the watermark. No-op when no wiki is attached.
+   *
+   * @param opts.reason - What triggered this compile (telemetry + compiler hint).
+   */
+  async compileWiki(opts?: {
+    reason?: 'consolidation' | 'session-end' | 'explicit';
+  }): Promise<CompileResult> {
+    await this._initPromise;
+    const empty: CompileResult = { pagesWritten: [], tracesConsumed: 0, conflicts: [] };
+    if (!this._wiki) return empty;
+
+    const reason = opts?.reason ?? 'explicit';
+    const BATCH = 500;
+    const watermarkIso = await this._wiki.store.readMetaWatermark();
+    let sinceMs = watermarkIso ? Date.parse(watermarkIso) : 0;
+    const aggregate: CompileResult = { pagesWritten: [], tracesConsumed: 0, conflicts: [] };
+
+    // Drain the window oldest-first in batches, advancing the watermark to the
+    // newest created_at actually processed (not wall-clock now). This avoids
+    // dropping traces beyond a single batch and avoids racing traces inserted
+    // between the query and the watermark write.
+    for (;;) {
+      const traces = await this.recentTraces(sinceMs, { limit: BATCH, order: 'asc' });
+      if (traces.length === 0) break;
+
+      const result = await this._wiki.compiler.compile({ traces, reason });
+      aggregate.pagesWritten.push(...result.pagesWritten);
+      aggregate.tracesConsumed += result.tracesConsumed;
+      aggregate.conflicts.push(...result.conflicts);
+
+      sinceMs = Math.max(...traces.map((t) => t.createdAt));
+      await this._wiki.store.writeMetaWatermark(new Date(sinceMs).toISOString());
+
+      if (traces.length < BATCH) break;
+    }
+
+    if (aggregate.pagesWritten.length > 0) {
+      await this._wiki.store.index();
+    }
+    return aggregate;
+  }
+
   // =========================================================================
   // Document ingestion
   // =========================================================================
@@ -1055,7 +1163,11 @@ export class Memory {
       );
     }
 
-    return this._consolidationLoop.run(this._config.consolidation);
+    const consolidation = await this._consolidationLoop.run(this._config.consolidation);
+    if (this._wiki) {
+      await this.compileWiki({ reason: 'consolidation' });
+    }
+    return consolidation;
   }
 
   /**

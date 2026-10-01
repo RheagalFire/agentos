@@ -144,6 +144,36 @@ export {
 } from './cognition/rag/unified/policy.js';
 // Cognitive Memory System
 export * from './cognition/memory';
+// Memory Wiki — markdown-first long-term memory for soul-file agents
+export {
+  WikiMemoryStore,
+  WikiCompiler,
+  ensureMemoryDir,
+  parsePage,
+  serializePage,
+  renderCatalog,
+  extractWikiLinks,
+  WIKI_PAGE_TYPES,
+  isWikiPageType,
+} from './cognition/substrate/memory/wiki/index.js';
+export type {
+  WikiPage,
+  WikiPageType,
+  MetaIndex,
+  IndexResult as WikiIndexResult,
+  CompileResult as WikiCompileResult,
+  MemoryIndexPort,
+  WikiMemoryStoreOptions,
+  WikiCompilerOptions,
+  WikiCompilerStorePort,
+} from './cognition/substrate/memory/wiki/index.js';
+export { attachMemoryWiki } from './cognition/memory/io/attachMemoryWiki.js';
+export type {
+  AttachMemoryWikiOptions,
+  AttachMemoryWikiResult,
+  WikiAttachableMemory,
+} from './cognition/memory/io/attachMemoryWiki.js';
+export { ReadMemoryPageTool } from './cognition/memory/io/tools/ReadMemoryPageTool.js';
 // Query Router (classification, retrieval dispatch, grounded answer generation)
 export {
   QueryClassifier,
@@ -223,10 +253,16 @@ export type {
   TokenUsage,
   SystemContentBlock,
 } from './api/generateText.js';
+export type {
+  CacheDiagnostics,
+  CacheMissReason,
+} from './core/llm/providers/IProvider.js';
 export { normalizeHostLLMPolicy } from './api/runtime/hostPolicy.js';
-export { streamText } from './api/streamText.js';
-export type { StreamTextResult, StreamPart } from './api/streamText.js';
+export { streamText, normalizeStreamFinishReason } from './api/streamText.js';
+export type { StreamTextResult, StreamPart, StreamFinishReason } from './api/streamText.js';
 export { agent } from './api/agent.js';
+export { souledAgent } from './api/souledAgent.js';
+export type { SouledAgentOptions, SouledAgent } from './api/souledAgent.js';
 export type {
   Agent,
   AgentSession,
@@ -235,6 +271,7 @@ export type {
   SessionSendOptions,
   SessionSendStructuredResult,
 } from './api/agent.js';
+export type { MemoryProviderHookOptions } from './api/runtime/memoryProviderHooks.js';
 export type {
   IModelRouter,
   ModelRouteParams,
@@ -285,6 +322,31 @@ export { upscaleImage } from './api/upscaleImage.js';
 export type { UpscaleImageOptions, UpscaleImageResult } from './api/upscaleImage.js';
 export { variateImage } from './api/variateImage.js';
 export type { VariateImageOptions, VariateImageResult } from './api/variateImage.js';
+export { segment } from './api/segment.js';
+export {
+  maskToEditMask,
+  cropRegion,
+  ReplicateSegmentationProvider,
+  registerSegmentationProvider,
+  resolveSegmentationProvider,
+  resetSegmentationProviders,
+  SegmentationModeNotSupportedError,
+  InvalidSegmentationPromptError,
+  SegmentationProviderError,
+} from './io/segmentation/index.js';
+export type {
+  SegmentOptions,
+  SegmentationResult,
+  SegmentMask,
+  SegmentationMode,
+  SegmentationBox,
+  SegmentationPoint,
+  SegmentationRequest,
+  ISegmentationProvider,
+  SegmentationProviderId,
+  SegmentationProviderOptionBag,
+  ReplicateSegmentationOptions,
+} from './io/segmentation/index.js';
 export { generateVideo } from './api/generateVideo.js';
 export type { GenerateVideoOptions, GenerateVideoResult } from './api/generateVideo.js';
 export { generateMusic } from './api/generateMusic.js';
@@ -316,7 +378,12 @@ export {
   clearDefaultProvider,
   type GlobalDefaultProvider,
 } from './api/runtime/global-default.js';
-export { parseModelString, resolveProvider, resolveModelOption } from './api/model.js';
+export {
+  parseModelString,
+  resolveProvider,
+  resolveModelOption,
+  ProviderInitializationError,
+} from './api/model.js';
 export { PROVIDER_DEFAULTS, autoDetectProvider } from './api/runtime/provider-defaults.js';
 export type { ProviderDefaults } from './api/runtime/provider-defaults.js';
 export {

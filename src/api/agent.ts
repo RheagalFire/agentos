@@ -21,13 +21,19 @@ import {
   type MessageContent,
   type ToolCallHookInfo,
 } from './generateText.js';
-import { buildResponseFormat } from '../core/llm/providers/structuredOutputFormat.js';
+import { buildResponseFormatForProvider } from './runtime/responseFormatForProvider.js';
+import { resolveModelOption } from './model.js';
+import { lowerZodToJsonSchema } from '../orchestration/compiler/SchemaLowering.js';
 import { ObjectGenerationError } from './generateObject.js';
 import { streamText, type StreamTextResult } from './streamText.js';
 import type { HostLLMPolicy } from './runtime/hostPolicy.js';
 import type { IModelRouter } from '../core/llm/routing/IModelRouter.js';
 import type { SkillEntry } from '../cognition/skills/types.js';
 import { loadSoulSync, parseSoul } from '../cognition/substrate/personas/SoulLoader.js';
+import {
+  normalizeHexacoTraits,
+  type HexacoTraitKey,
+} from '../cognition/substrate/personas/hexaco.js';
 import { CitationVerifier } from '../cognition/rag/citation/CitationVerifier.js';
 import type { VerifyCitationsConfig } from './types.js';
 import type {
@@ -42,7 +48,14 @@ import {
 import { warnOnDeferredLightweightAgentCapabilities } from './runtime/lightweightAgentDiagnostics.js';
 import type { BaseAgentConfig } from './types.js';
 import { exportAgentConfig, exportAgentConfigJSON, type AgentExportConfig } from './agentExportCore.js';
-import { applyMemoryProvider } from './runtime/memoryProviderHooks.js';
+import { applyMemoryProvider, type MemoryProviderHookOptions } from './runtime/memoryProviderHooks.js';
+import {
+  SessionHistoryBuffer,
+  SESSION_HISTORY_DEFAULTS,
+  type HistoryEvent,
+  type SessionHistoryConfig,
+} from './sessionHistory.js';
+import type { SessionTranscriptMessage } from './sessionTranscript.js';
 
 /**
  * Provider hook interface consumed by `agent()` for memory integration.
@@ -134,6 +147,18 @@ export interface AgentOptions extends BaseAgentConfig {
   /** Host-level routing hints forwarded to the high-level generation helpers. */
   hostPolicy?: HostLLMPolicy;
   /**
+   * Caller's intended content policy tier, forwarded to every `generate()` /
+   * `stream()` / session call this agent makes (same contract as
+   * {@link GenerateTextOptions.policyTier}): on `'mature'` / `'private-adult'`
+   * with no explicit `fallbackProviders`, the auto-built fallback chain
+   * prepends uncensored legs so a content-policy refusal from the primary
+   * re-routes to a model that can complete the request, and the model router
+   * receives the tier as a routing hint. Unset keeps the availability-only
+   * chain and tier-agnostic routing. A per-call `policyTier` in `extra`
+   * overrides this value.
+   */
+  policyTier?: GenerateTextOptions['policyTier'];
+  /**
    * Routing hints passed to the model router's `selectModel()` call.
    *
    * Useful for declaring capability requirements up-front so the router
@@ -193,6 +218,14 @@ export interface AgentOptions extends BaseAgentConfig {
    */
   memoryProvider?: AgentMemoryProvider;
   /**
+   * Optional tunables for the automatic {@link memoryProvider} hooks.
+   * `timeoutMs` bounds each `getContext` call before the turn ships without
+   * memory (default `MEMORY_TIMEOUT_MS`, 5000); `tokenBudget` is forwarded to
+   * `getContext` as the recall ceiling (default `DEFAULT_MEMORY_TOKEN_BUDGET`,
+   * 2000). Both fall back to the historical module constants when omitted.
+   */
+  memoryProviderOptions?: MemoryProviderHookOptions;
+  /**
    * Optional skill entries to inject into the system prompt.
    * Skill content is appended to the system prompt as markdown sections.
    */
@@ -204,6 +237,27 @@ export interface AgentOptions extends BaseAgentConfig {
    * Use this for prompt caching support with Anthropic.
    */
   systemBlocks?: import('./generateText.js').SystemContentBlock[];
+  /**
+   * Per-call prompt-cache control forwarded to every generate / stream /
+   * session call this agent makes (same contract as
+   * {@link GenerateTextOptions.cache}): `false` sends zero cache markers;
+   * `{ ttl: '1h' }` re-times the auto markers — including the moving
+   * conversation-history tail — onto the 1-hour cache. Set `'1h'` for agent
+   * loops whose steps gap past the 5-minute default cache TTL (multi-minute
+   * tool executions between LLM steps), where the default-paced history
+   * marker expires between steps and every step re-writes the whole prefix.
+   * Unset -> the provider's default marker pacing.
+   */
+  cache?: import('./generateText.js').GenerateTextOptions['cache'];
+  /**
+   * Session conversation-history policy (spec 2026-07-20 §1a/§1c). Sessions
+   * maintain a lossless transcript by default — independent of the memory
+   * subsystem — bounded past `maxTokens` (default 120K estimated) by
+   * chunk-amortized whole-block eviction. `false` restores stateless
+   * sessions (the pre-0.10 `memory: false` behavior). Partial objects
+   * override individual bounds.
+   */
+  history?: false | Partial<SessionHistoryConfig>;
   /**
    * Per-agent identity loaded from a SOUL.md workspace (the OpenClaw / aaronjmars-soul.md
    * convention). Three forms are accepted:
@@ -261,6 +315,23 @@ export interface SessionSendOptions<S extends ZodType | undefined = undefined> {
    * Sanitized to /[a-zA-Z0-9_]/ and truncated to 64 chars.
    */
   schemaName?: string;
+  /**
+   * Telemetry + eviction-boundary label for this send's transcript block
+   * (spec §1c(iv)). Labels are markers, not pins.
+   */
+  blockLabel?: string;
+  /**
+   * Per-send generation overrides, merged over the agent's baseOpts with
+   * send-level precedence — the same contract `generate(prompt, extra)`
+   * gives `extra` (spec §1f). Long tool-driving loops rely on these
+   * (toolChoice, requestTimeout, cacheDiagnostics); without send-level
+   * carriage a caller migrating from generate() silently loses them.
+   */
+  toolChoice?: GenerateTextOptions['toolChoice'];
+  requestTimeout?: number;
+  cacheDiagnostics?: GenerateTextOptions['cacheDiagnostics'];
+  cache?: GenerateTextOptions['cache'];
+  maxTokens?: number;
 }
 
 /**
@@ -281,7 +352,8 @@ export interface AgentSession {
   readonly id: string;
   /**
    * Sends a user message and returns the complete assistant reply.
-   * Appends both turns to the session history when `memory` is enabled.
+   * Appends the send's lossless transcript delta to the session history
+   * (disable with `history: false` on the agent config).
    * Accepts plain text or multimodal content (text + image parts).
    *
    * @param input - User message as text string or MessageContent array.
@@ -317,8 +389,24 @@ export interface AgentSession {
    * @returns A {@link StreamTextResult} with async iterables and awaitable aggregates.
    */
   stream(input: MessageContent): StreamTextResult;
-  /** Returns a snapshot of the current conversation history for this session. */
-  messages(): Message[];
+  /**
+   * Returns a snapshot of the current conversation transcript for this
+   * session in provider-replayable shape (assistant tool_calls, tool
+   * results with ids, thinking blocks). Suitable as checkpoint material
+   * for {@link AgentSession.reseed}.
+   */
+  messages(): SessionTranscriptMessage[];
+  /**
+   * Atomically replaces the session history with a caller-built compact
+   * snapshot — the divergence-reset primitive (spec §1d). Bumps the
+   * history epoch: an in-flight send that began under an older epoch
+   * still returns to its caller, but its history append is discarded.
+   * Throws when the snapshot violates tool_use/tool_result pairing.
+   */
+  reseed(snapshot: SessionTranscriptMessage[]): void;
+  /** Returns accumulated history telemetry events (evictions, reseeds,
+   *  stale-append discards) and clears the queue. */
+  drainHistoryEvents(): HistoryEvent[];
   /** Returns persisted usage totals for this session when the usage ledger is enabled. */
   usage(): Promise<AgentOSUsageAggregate>;
   /** Clears all messages from this session's history. */
@@ -378,26 +466,6 @@ export interface Agent {
   setAvatarBindingOverrides(overrides: Record<string, unknown>): void;
 }
 
-/**
- * Resolve the provider id from agentos baseOpts for structured-output
- * adapter routing. Reads `opts.provider` first, then parses the
- * `'<provider>:<model>'` form from `opts.model`. Falls back to 'openai'
- * to match the legacy default elsewhere in agentos.
- *
- * Used only by {@link AgentSession.send} when a `responseSchema` is set,
- * to pick the right native structured-output payload shape per provider.
- */
-function resolveProviderForStructuredOutput(opts: Partial<GenerateTextOptions>): string {
-  if (opts.provider) return opts.provider;
-  if (typeof opts.model === 'string' && opts.model.includes(':')) {
-    // Trim handles inputs like ":openai" / "  openai:gpt-4". Empty after
-    // trim falls back to the default.
-    const head = opts.model.split(':', 1)[0]?.trim();
-    if (head) return head;
-  }
-  return 'openai';
-}
-
 function mergeUsageLedgerOptions(
   ...parts: Array<AgentOSUsageLedgerOptions | undefined>
 ): AgentOSUsageLedgerOptions | undefined {
@@ -419,12 +487,15 @@ async function loadRecordedAgentOSUsage(
  * Each trait produces a directive when it deviates from the neutral midpoint (0.5).
  * High values (>0.65) and low values (<0.35) produce distinct behavioral instructions.
  * Moderate values (0.35-0.65) are omitted to avoid over-constraining the model.
+ * Trait keys are normalized first, so the SOUL.md spelling `honestyHumility`
+ * reads as `honesty`.
  */
 function buildPersonalityDescription(
   traits: Partial<Record<string, number>>
 ): string | null {
   const lines: string[] = [];
-  const v = (key: string) => typeof traits[key] === 'number' ? traits[key]! : 0.5;
+  const normalized = normalizeHexacoTraits(traits);
+  const v = (key: HexacoTraitKey) => normalized[key] ?? 0.5;
 
   const h = v('honesty');
   const e = v('emotionality');
@@ -462,7 +533,7 @@ function buildPersonalityDescription(
   return `## Personality & Communication Style\n\n${lines.join('\n')}`;
 }
 
-function buildSystemPrompt(opts: AgentOptions): string | undefined {
+export function buildSystemPrompt(opts: AgentOptions): string | undefined {
   const sections: string[] = [];
 
   // SOUL.md content first — the agent's identity comes before everything else.
@@ -474,6 +545,18 @@ function buildSystemPrompt(opts: AgentOptions): string | undefined {
     }
     if (loaded?.styleContent) {
       sections.push(`## Style\n\n${loaded.styleContent}`);
+    }
+    // The memory wiki's index.md catalog. The agent reads it to know what it
+    // remembers, then pulls full pages via the read_memory_page tool. Skip the
+    // empty catalog (a bare "# Memory Index") so agents with no memory yet keep
+    // a clean prompt.
+    if (loaded?.wikiIndex?.trim() && loaded.wikiIndex.trim() !== '# Memory Index') {
+      sections.push(
+        '## Long-Term Memory (index)\n\n' +
+          'You maintain a memory wiki. This is its index. ' +
+          'Use the `read_memory_page` tool to open any page by id.\n\n' +
+          loaded.wikiIndex.trim(),
+      );
     }
   }
 
@@ -589,7 +672,7 @@ async function runCitationVerification(
   }
 }
 
-function loadSoulFromOption(
+export function loadSoulFromOption(
   soul: NonNullable<AgentOptions['soul']>,
 ): import('../cognition/substrate/personas/SoulLoader.js').LoadedSoul | null {
   try {
@@ -637,8 +720,25 @@ function loadSoulFromOption(
  *
  * @category Core
  */
+/**
+ * Copies only the defined per-send generation overrides off SessionSendOptions
+ * (spec §1f) so undefined keys never clobber agent-level baseOpts via spread.
+ */
+function pickSendGenerationOverrides(
+  sendOpts?: SessionSendOptions<ZodType>,
+): Partial<GenerateTextOptions> {
+  if (!sendOpts) return {};
+  const out: Partial<GenerateTextOptions> = {};
+  if (sendOpts.toolChoice !== undefined) out.toolChoice = sendOpts.toolChoice;
+  if (sendOpts.requestTimeout !== undefined) out.requestTimeout = sendOpts.requestTimeout;
+  if (sendOpts.cacheDiagnostics !== undefined) out.cacheDiagnostics = sendOpts.cacheDiagnostics;
+  if (sendOpts.cache !== undefined) out.cache = sendOpts.cache;
+  if (sendOpts.maxTokens !== undefined) out.maxTokens = sendOpts.maxTokens;
+  return out;
+}
+
 export function agent(opts: AgentOptions): Agent {
-  const sessions = new Map<string, Message[]>();
+  const sessionBuffers = new Map<string, SessionHistoryBuffer | null>();
   // In-memory usage tally per session and per agent. Populated synchronously
   // after every generate/send/stream call so `agent.usage()` and
   // `session.usage()` work even when the persisted ledger is disabled (the
@@ -681,9 +781,37 @@ export function agent(opts: AgentOptions): Agent {
     tools: opts.tools,
     maxSteps: opts.maxSteps ?? 5,
     // Per-call completion-token cap applied to every generate /
-    // session.send / stream invocation this agent makes. Unset means
-    // the underlying generateText falls back to the provider default.
-    maxTokens: opts.maxTokens,
+    // session.send / stream invocation this agent makes. Falls back to
+    // controls.maxTotalTokens when no top-level maxTokens is set: on the
+    // lightweight agent() surface the token control caps each call's
+    // completion output (mapped here to maxTokens), NOT the agency()-level
+    // prompt+completion run total, which stays a full-runtime enforcement.
+    // Unset means the underlying generateText falls back to the provider
+    // default. A per-call maxTokens in `extra` overrides both.
+    maxTokens: opts.maxTokens ?? opts.controls?.maxTotalTokens,
+    // Per-call request timeout (ms) derived from the declared
+    // controls.maxDurationMs budget: on the lightweight agent() surface the
+    // duration control bounds each individual LLM request (generateText
+    // requestTimeout), not the whole run's wall clock, which stays an
+    // agency()-level enforcement. Unset keeps the provider's default
+    // failover pacing. A per-call requestTimeout in `extra` overrides this.
+    requestTimeout: opts.controls?.maxDurationMs,
+    // Extended-thinking switch forwarded to Claude models on every generate /
+    // stream / session call (both spread baseOpts): `{ budgetTokens }` turns
+    // thinking on, `false` turns it off, unset keeps the model's default.
+    thinking: opts.thinking,
+    // Reasoning-effort control forwarded the same way as thinking (both spread
+    // into baseOpts -> every generate/stream/session call). Unset -> provider
+    // default; the provider ignores it on models that don't support effort.
+    effort: opts.effort,
+    // Provider-specific top-level payload params (e.g. OpenRouter
+    // provider-routing preferences) forwarded to every generate / stream /
+    // session call this agent makes. Unset adds no payload keys.
+    customModelParams: opts.customModelParams,
+    // Per-call prompt-cache disposition forwarded like thinking/effort (both
+    // spread baseOpts -> every generate/stream/session call this agent
+    // makes). Unset keeps the provider's default marker pacing.
+    cache: opts.cache,
     chainOfThought: opts.chainOfThought ?? true,
     apiKey: opts.apiKey,
     baseUrl: opts.baseUrl,
@@ -693,6 +821,10 @@ export function agent(opts: AgentOptions): Agent {
     router: opts.router,
     hostPolicy: opts.hostPolicy,
     routerParams: opts.routerParams,
+    // Agent-level content policy tier forwarded to every generate / stream /
+    // session call (both spread baseOpts). Unset keeps the availability-only
+    // auto fallback chain and tier-agnostic routing.
+    policyTier: opts.policyTier,
     onBeforeGeneration: opts.onBeforeGeneration,
     onAfterGeneration: opts.onAfterGeneration,
     onBeforeToolExecution: opts.onBeforeToolExecution,
@@ -714,6 +846,7 @@ export function agent(opts: AgentOptions): Agent {
         },
         opts.memoryProvider,
         userText,
+        opts.memoryProviderOptions,
       );
       if (typeof prompt === 'string') {
         genOpts.prompt = prompt;
@@ -744,6 +877,7 @@ export function agent(opts: AgentOptions): Agent {
         },
         opts.memoryProvider,
         userText,
+        opts.memoryProviderOptions,
       );
       if (typeof prompt === 'string') {
         streamOpts.prompt = prompt;
@@ -759,11 +893,21 @@ export function agent(opts: AgentOptions): Agent {
 
     session(id?: string): AgentSession {
       const sessionId = id ?? crypto.randomUUID();
-      if (!sessions.has(sessionId)) sessions.set(sessionId, []);
+      if (!sessionBuffers.has(sessionId)) {
+        // History is independent of the memory subsystem (spec §1a): every
+        // session keeps a lossless transcript unless the agent opts out via
+        // `history: false`. Bounded by default — unbounded growth was the
+        // latent failure mode for every long-lived consumer.
+        const historyCfg =
+          opts.history === false
+            ? null
+            : { ...SESSION_HISTORY_DEFAULTS, ...(opts.history ?? {}) };
+        sessionBuffers.set(sessionId, historyCfg ? new SessionHistoryBuffer(historyCfg) : null);
+      }
       if (!sessionUsageTallies.has(sessionId)) {
         sessionUsageTallies.set(sessionId, createEmptyUsageAggregate(sessionId));
       }
-      const history = sessions.get(sessionId)!;
+      const historyBuffer = sessionBuffers.get(sessionId)!;
       const sessionUsageTally = sessionUsageTallies.get(sessionId)!;
 
       const session = {
@@ -775,24 +919,59 @@ export function agent(opts: AgentOptions): Agent {
         ): Promise<GenerateTextResult | SessionSendStructuredResult<unknown>> {
           const textForMemory = typeof input === 'string' ? input : extractTextFromContent(input);
           const userMessage: Message = { role: 'user', content: input };
-          const requestMessages = useMemory
-            ? [...history, userMessage]
-            : [userMessage];
+          // History epoch at entry: a reseed() during this send makes the
+          // append below a stale no-op (the caller still gets its result).
+          const epochAtStart = historyBuffer?.epoch();
+          const priorHistory = historyBuffer
+            ? (historyBuffer.messages() as unknown as Message[])
+            : [];
+          // String input rides `prompt` so generateText's transcript delta
+          // captures the user turn positionally; parts input rides the tail
+          // of `messages` with the internal trailing-caller marker.
+          const inputIsString = typeof input === 'string';
+          const requestMessages = inputIsString ? priorHistory : [...priorHistory, userMessage];
 
           // Schema-driven structured output: when responseSchema is set,
-          // route through the provider's native enforcement API. The
-          // adapter at structuredOutputFormat.ts maps the Zod schema to
-          // the per-provider payload shape; generateText passes it
-          // through to the provider via _responseFormat (see
-          // generateText.ts:931 for the plumbing).
+          // route through the provider's native enforcement API via the
+          // same per-provider builder generateObject uses; generateText
+          // passes the payload through to the provider via _responseFormat.
           let responseFormat: Record<string, unknown> | undefined;
+          let responseFormatBuilder: GenerateTextOptions['_responseFormatBuilder'];
           if (sendOpts?.responseSchema) {
-            const providerId = resolveProviderForStructuredOutput(baseOpts);
-            responseFormat = buildResponseFormat({
-              provider: providerId,
-              schema: sendOpts.responseSchema,
-              schemaName: sendOpts.schemaName ?? 'response',
+            // Resolve the primary the same way generateText will (explicit
+            // provider/model fields, then env auto-detect) so the payload is
+            // shaped for the provider that actually serves the call. The old
+            // local resolver defaulted to 'openai', so a no-provider agent
+            // whose env resolution picked e.g. Anthropic sent an OpenAI
+            // json_schema payload the provider silently ignores — schema
+            // unenforced, ObjectGenerationError on prose. Routing through
+            // buildResponseFormatForProvider also applies the strict gates
+            // (record schemas degrade to json_object; Fable degrades to the
+            // prompt-only JSON path) exactly like generateObject's primary.
+            const { providerId, modelId } = resolveModelOption(baseOpts, 'text');
+            const schema = sendOpts.responseSchema;
+            const schemaName = sendOpts.schemaName ?? 'response';
+            const jsonSchema = lowerZodToJsonSchema(schema);
+            responseFormat = buildResponseFormatForProvider({
+              providerId,
+              modelId,
+              jsonSchema,
+              effectiveSchema: schema,
+              schemaName,
             });
+            // Per-leg rebuild (same contract as generateObject): a fallback
+            // hop onto a foreign provider gets a payload shaped for THAT
+            // provider instead of this primary-shaped one, which the leg
+            // provider's guard would silently drop — leaving the leg with
+            // zero provider-side enforcement.
+            responseFormatBuilder = (legProviderId, legModelId) =>
+              buildResponseFormatForProvider({
+                providerId: legProviderId,
+                modelId: legModelId,
+                jsonSchema,
+                effectiveSchema: schema,
+                schemaName,
+              });
           }
 
           // Schema-aware calls disable tools. Mixing native structured
@@ -819,15 +998,23 @@ export function agent(opts: AgentOptions): Agent {
           const wrappedOpts = applyMemoryProvider(
             {
               ...baseForRequest,
+              ...pickSendGenerationOverrides(sendOpts),
               messages: requestMessages,
+              ...(inputIsString
+                ? { prompt: input as string }
+                : { _transcriptIncludeTrailingCallerMessages: 1 }),
               usageLedger: mergeUsageLedgerOptions(baseOpts.usageLedger, {
                 sessionId,
                 source: 'agent.session.send',
               }),
               ...(responseFormat ? { _responseFormat: responseFormat } : {}),
+              ...(responseFormatBuilder
+                ? { _responseFormatBuilder: responseFormatBuilder }
+                : {}),
             },
             opts.memoryProvider,
             textForMemory,
+            opts.memoryProviderOptions,
           );
 
           const result = await generateText(wrappedOpts as GenerateTextOptions);
@@ -860,9 +1047,18 @@ export function agent(opts: AgentOptions): Agent {
             }
           }
 
-          if (useMemory) {
-            history.push(userMessage);
-            history.push({ role: 'assistant', content: result.text });
+          if (historyBuffer) {
+            // Lossless delta when the call carried one; minimal user/assistant
+            // pair otherwise (legacy generateText wrappers and test doubles
+            // predating transcriptDelta keep the pre-0.10 history shape).
+            historyBuffer.appendSendDelta(
+              result.transcriptDelta ?? [
+                userMessage as unknown as SessionTranscriptMessage,
+                { role: 'assistant', content: result.text },
+              ],
+              sendOpts?.blockLabel,
+              epochAtStart,
+            );
           }
 
           // Backwards-compat: when no schema, return plain GenerateTextResult.
@@ -881,8 +1077,8 @@ export function agent(opts: AgentOptions): Agent {
           const wrappedOpts = applyMemoryProvider(
             {
               ...baseOpts,
-              messages: useMemory
-                ? [...history, userMessage]
+              messages: historyBuffer
+                ? [...(historyBuffer.messages() as unknown as Message[]), userMessage]
                 : [userMessage],
               usageLedger: mergeUsageLedgerOptions(baseOpts.usageLedger, {
                 sessionId,
@@ -891,6 +1087,7 @@ export function agent(opts: AgentOptions): Agent {
             },
             opts.memoryProvider,
             textForMemory,
+            opts.memoryProviderOptions,
           );
 
           const result = streamText(wrappedOpts as GenerateTextOptions);
@@ -904,21 +1101,55 @@ export function agent(opts: AgentOptions): Agent {
           // Capture text for history when done. Memory observe runs inside
           // applyMemoryProvider's onAfterGeneration wrapper so it's not
           // re-fired here.
-          if (useMemory) {
-            history.push(userMessage);
-            void result.text
-              .then((replyText) => {
-                history.push({ role: 'assistant', content: replyText });
-              })
-              .catch(() => {
-                /* history update failed, non-critical */
-              });
+          if (historyBuffer) {
+            // Streaming has no lossless delta yet (v1 limitation, documented):
+            // append the minimal user/assistant text pair, epoch-guarded so a
+            // reseed during the stream discards the stale append.
+            const epochAtStreamStart = historyBuffer.epoch();
+            const recorded = Promise.all([result.text, result.finishReason]).then(([replyText, finishReason]) => {
+              // A stream that ended in an error (a refusal, a dropped
+              // connection) is left out, as send() leaves out a call that
+              // throws. An empty reply is not recorded as a turn: Anthropic
+              // rejects a request whose history has an empty assistant
+              // message.
+              if (finishReason === 'error') return;
+              historyBuffer.appendSendDelta(
+                [
+                  { role: 'user', content: input } as SessionTranscriptMessage,
+                  ...(replyText
+                    ? [{ role: 'assistant', content: replyText } as SessionTranscriptMessage]
+                    : []),
+                ],
+                undefined,
+                epochAtStreamStart,
+              );
+            });
+            // The text settles once the turn is recorded, so a caller that
+            // awaits it and sends again finds the turn in the history. A
+            // failed history update is not the caller's error.
+            const text = recorded.then(
+              () => result.text,
+              () => result.text,
+            );
+            void text.catch(() => undefined);
+            return { ...result, text };
           }
           return result;
         },
 
-        messages(): Message[] {
-          return [...history];
+        messages(): SessionTranscriptMessage[] {
+          return historyBuffer ? historyBuffer.messages() : [];
+        },
+
+        reseed(snapshot: SessionTranscriptMessage[]): void {
+          if (!historyBuffer) {
+            throw new Error('reseed requires session history (history: false is set on this agent)');
+          }
+          historyBuffer.reseed(snapshot);
+        },
+
+        drainHistoryEvents(): HistoryEvent[] {
+          return historyBuffer?.drainHistoryEvents() ?? [];
         },
 
         async usage(): Promise<AgentOSUsageAggregate> {
@@ -927,11 +1158,17 @@ export function agent(opts: AgentOptions): Agent {
             path: baseOpts.usageLedger?.path,
             sessionId,
           });
-          return mergeAggregates(sessionUsageTally, persisted);
+          // When the persisted ledger is enabled it already records every
+          // send, so it is authoritative; merging the in-memory tally would
+          // double-count. The in-memory tally is only the fallback used when
+          // the ledger is disabled.
+          return baseOpts.usageLedger?.enabled
+            ? persisted
+            : mergeAggregates(sessionUsageTally, persisted);
         },
 
         clear() {
-          history.length = 0;
+          historyBuffer?.reseed([]);
         },
       };
       // The send() implementation returns a union (GenerateTextResult |
@@ -952,11 +1189,15 @@ export function agent(opts: AgentOptions): Agent {
       const inMemory = sessionId
         ? sessionUsageTallies.get(sessionId) ?? createEmptyUsageAggregate(sessionId)
         : agentUsageTally;
-      return mergeAggregates(inMemory, persisted);
+      // The enabled persisted ledger is authoritative; merging the in-memory
+      // tally would double-count (the tally is only a disabled-ledger fallback).
+      return baseOpts.usageLedger?.enabled
+        ? persisted
+        : mergeAggregates(inMemory, persisted);
     },
 
     async close() {
-      sessions.clear();
+      sessionBuffers.clear();
     },
 
     /**

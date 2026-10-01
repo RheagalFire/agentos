@@ -20,7 +20,7 @@ import { generateText } from '../../../api/generateText.js';
 // Mock generateText
 // ---------------------------------------------------------------------------
 
-vi.mock('../../api/generateText.js', () => ({
+vi.mock('../../../api/generateText.js', () => ({
   generateText: vi.fn().mockResolvedValue({
     text: JSON.stringify({
       relevance: 0.9,
@@ -160,12 +160,15 @@ describe('SelfEvaluateTool', () => {
     );
 
     expect(storeMemory).toHaveBeenCalledOnce();
+    // The execution context rides along so the host stores the trace for the
+    // calling agent and session.
     expect(storeMemory).toHaveBeenCalledWith(
       expect.objectContaining({
         type: 'self-evaluation',
         scope: 'session',
         tags: ['evaluation', 'quality'],
       }),
+      ctx,
     );
   });
 

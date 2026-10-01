@@ -30,6 +30,7 @@ import {
   ProviderEmbeddingResponse,
   EmbeddingObject,
 } from '../IProvider';
+import { stripForeignVendorParams } from '../openrouter-only-params';
 import { OllamaProviderError } from '../errors/OllamaProviderError';
 
 /**
@@ -162,7 +163,6 @@ const extractBase64ImagePayload = (url: string): string | null => {
   return payload.length > 0 ? payload : null;
 };
 
-// @ts-nocheck
 /**
  * Represents a model listed by Ollama's /api/tags endpoint.
  */
@@ -363,14 +363,16 @@ export class OllamaProvider implements IProvider {
         ...(options.presencePenalty !== undefined && { presence_penalty: options.presencePenalty }),
         ...(options.frequencyPenalty !== undefined && { frequency_penalty: options.frequencyPenalty }),
         ...(options.stopSequences !== undefined && { stop: options.stopSequences }),
-        ...(options.customModelParams || {}),
+        // OpenRouter routing controls and Gemini request fields never reach Ollama's options bag.
+        ...(stripForeignVendorParams(options.customModelParams) || {}),
       },
       format: options.responseFormat?.type === 'json_object' ? 'json' : undefined,
       ...(ollamaTools.length > 0 && { tools: ollamaTools }),
     };
 
     try {
-      const response = await this.client.post('/chat', payload);
+      // CR8: honor a per-call requestTimeout override over the client default.
+      const response = await this.client.post('/chat', payload, { timeout: options.requestTimeout ?? this.config.requestTimeout });
       const data = response.data as OllamaChatResponseChunk;
 
       if (data.error) {
@@ -446,7 +448,8 @@ export class OllamaProvider implements IProvider {
         ...(options.presencePenalty !== undefined && { presence_penalty: options.presencePenalty }),
         ...(options.frequencyPenalty !== undefined && { frequency_penalty: options.frequencyPenalty }),
         ...(options.stopSequences !== undefined && { stop: options.stopSequences }),
-        ...(options.customModelParams || {}),
+        // OpenRouter routing controls and Gemini request fields never reach Ollama's options bag.
+        ...(stripForeignVendorParams(options.customModelParams) || {}),
       },
       format: options.responseFormat?.type === 'json_object' ? 'json' : undefined,
       ...(ollamaTools.length > 0 && { tools: ollamaTools }),
@@ -454,7 +457,8 @@ export class OllamaProvider implements IProvider {
 
     let responseStream;
     try {
-      responseStream = await this.client.post('/chat', payload, { responseType: 'stream' });
+      // CR8: honor a per-call requestTimeout override over the client default.
+      responseStream = await this.client.post('/chat', payload, { responseType: 'stream', timeout: options.requestTimeout ?? this.config.requestTimeout });
     } catch (error: unknown) {
       const axiosError = error as AxiosError;
       const status = axiosError.response?.status;
@@ -594,7 +598,8 @@ export class OllamaProvider implements IProvider {
       const payload: OllamaEmbeddingRequest = {
         model: modelId,
         prompt: text,
-        options: options?.customModelParams, // Pass through any custom model options
+        // Pass through custom model options minus OpenRouter routing controls and Gemini request fields.
+        options: stripForeignVendorParams(options?.customModelParams),
       };
 
       try {

@@ -22,6 +22,8 @@ import {
 import { OpenRouterProviderError } from '../errors/OpenRouterProviderError';
 import { ApiKeyPool } from '../../../providers/ApiKeyPool.js';
 import { createGMIErrorFromError, GMIErrorCode } from '../../../utils/errors.js'; // Corrected import path
+import { clampMaxOutputTokens } from '../model-output-limits.js';
+import { stripGeminiOnlyParams } from '../openrouter-only-params';
 
 /**
  * Configuration specific to the OpenRouterProvider.
@@ -62,12 +64,110 @@ interface OpenRouterChatCompletionAPIResponse {
   object: string;
   created: number;
   model: string;
+  /**
+   * Upstream host that served this completion (e.g. 'Groq', 'DeepInfra').
+   * OpenRouter includes it on both non-stream responses and stream chunks.
+   */
+  provider?: string;
   choices: OpenRouterChatChoice[];
   usage?: {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
     cost?: number;
+    /**
+     * Present when the request sets `usage: { include: true }` — prompt
+     * tokens served from the upstream host's prompt cache. 0 or absent on
+     * hosts without prompt-caching support.
+     */
+    prompt_tokens_details?: { cached_tokens?: number };
+  };
+}
+
+/**
+ * Default OpenRouter provider-routing preferences from the environment.
+ *
+ * `OPENROUTER_PROVIDER_ORDER` (comma-separated upstream host names, e.g.
+ * `Groq,DeepInfra`) pins an explicit host preference — tried in order with
+ * `allow_fallbacks: true` so an unavailable pin falls through to the rest of
+ * the pool. `OPENROUTER_PROVIDER_SORT` (`price` | `throughput` | `latency`)
+ * sets the routing sort, and acts as the tiebreak when both are set; a value
+ * outside that set is ignored with a one-time warning rather than sent to the
+ * API, where an unknown sort fails every request routed through the default.
+ * Returns `undefined` when neither env yields a usable value so default
+ * routing stays byte-identical.
+ *
+ * Why this lives in the provider: routing consistency is a prerequisite for
+ * upstream prompt-cache hits (caches are per-host, so price-variance routing
+ * cold-misses even cache-capable hosts), and callers that resolve their
+ * provider through a router cannot gate `customModelParams` on "openrouter"
+ * themselves — every provider spreads those params onto its own payload, and
+ * non-OpenRouter APIs reject the unknown `provider` key. Caller-supplied
+ * `provider` preferences (via `customModelParams`) win field-by-field over
+ * these defaults.
+ */
+const OPENROUTER_PROVIDER_SORTS = new Set(['price', 'throughput', 'latency']);
+
+let warnedInvalidProviderSort = false;
+
+export function defaultOpenRouterProviderPrefs(
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, unknown> | undefined {
+  const sortRaw = env.OPENROUTER_PROVIDER_SORT?.trim();
+  let sort: string | undefined;
+  if (sortRaw) {
+    if (OPENROUTER_PROVIDER_SORTS.has(sortRaw)) {
+      sort = sortRaw;
+    } else if (!warnedInvalidProviderSort) {
+      // Warn once per process: this helper runs on every request payload.
+      warnedInvalidProviderSort = true;
+      console.warn(
+        `OpenRouterProvider: Ignoring OPENROUTER_PROVIDER_SORT='${sortRaw}' — expected one of price, throughput, latency.`,
+      );
+    }
+  }
+  const orderRaw = env.OPENROUTER_PROVIDER_ORDER?.trim();
+  const order = orderRaw
+    ? orderRaw
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  if (order.length > 0) {
+    return { order, allow_fallbacks: true, ...(sort ? { sort } : {}) };
+  }
+  if (sort) return { sort };
+  return undefined;
+}
+
+/**
+ * Map OpenRouter usage accounting onto the normalized {@link ModelUsage}
+ * shape. With `usage: { include: true }` on the request, OpenRouter reports
+ * `cost` and `prompt_tokens_details.cached_tokens` (prompt tokens served
+ * from the upstream host's prompt cache). The cached count is surfaced as
+ * `cacheReadInputTokens` — the same normalized field AnthropicProvider
+ * populates — so the api layer's `cacheReadTokens` accounting and every
+ * downstream cache log light up for OpenRouter turns without caller changes.
+ */
+export function mapOpenRouterUsage(
+  apiUsage: OpenRouterChatCompletionAPIResponse['usage'],
+): ModelUsage | undefined {
+  if (!apiUsage) return undefined;
+  const cachedTokens = apiUsage.prompt_tokens_details?.cached_tokens;
+  return {
+    promptTokens: apiUsage.prompt_tokens,
+    completionTokens: apiUsage.completion_tokens,
+    totalTokens: apiUsage.total_tokens,
+    costUSD: apiUsage.cost,
+    // OpenRouter's prompt_tokens (like OpenAI's) already INCLUDES cached
+    // tokens, so the provider-independent inclusive input total is the
+    // prompt count as-is (Anthropic computes input + cache_read + cache_creation).
+    ...(typeof apiUsage.prompt_tokens === 'number'
+      ? { inclusiveInputTokens: apiUsage.prompt_tokens }
+      : {}),
+    ...(typeof cachedTokens === 'number' && cachedTokens >= 0
+      ? { cacheReadInputTokens: cachedTokens }
+      : {}),
   };
 }
 
@@ -145,8 +245,10 @@ export class OpenRouterProvider implements IProvider {
     this.keyPool = new ApiKeyPool(config.apiKey);
     this.defaultModelId = this.config.defaultModelId; // Store the potentially undefined value
 
+    // NOTE: no Authorization header here — the key is drawn from the pool
+    // PER ATTEMPT inside makeApiRequest, so a 429/402 on one key fails over
+    // to the next instead of reusing a throttled key baked at init.
     const headers: Record<string, string> = {
-      'Authorization': `Bearer ${this.keyPool.next()}`,
       'Content-Type': 'application/json',
       'User-Agent': `AgentOS/1.0 (OpenRouterProvider; ${this.config.appName || 'UnknownApp'})`,
     };
@@ -240,11 +342,148 @@ export class OpenRouterProvider implements IProvider {
     }
   }
 
+  /**
+   * Zero-config prompt caching for Anthropic models routed through
+   * OpenRouter. OpenRouter forwards Anthropic `cache_control` blocks
+   * unchanged, and Anthropic caches ONLY when a request carries them — an
+   * `anthropic/*` slug without markers can never hit cache. Direct
+   * Anthropic traffic gets markers from AnthropicProvider's auto path;
+   * this applies the same default to the OpenRouter leg.
+   *
+   * Marks two breakpoints, mirroring the direct auto path:
+   * - the first system message (stable prefix — later system messages can
+   *   be volatile per-turn recall appended by memory hooks), and
+   * - the last text block of the final message (moving tail, so multi-turn
+   *   history is read back on the next turn).
+   *
+   * Stands down entirely when the caller already placed any cache_control
+   * marker on messages or tool definitions (caller placement wins), or on
+   * the `AGENTOS_ANTHROPIC_AUTO_CACHE=0`/`false` kill switch (same syntax
+   * as the direct path). `options.cache === false` goes further, mirroring
+   * the direct provider's per-call hard-off: caller markers already in the
+   * message content are stripped as well. Sub-floor prefixes are safe to
+   * mark: Anthropic silently ignores markers below the model's minimum
+   * cacheable length. `options.cache.ttl` rides onto the injected markers.
+   */
+  private applyAnthropicSlugCacheControl(
+    modelId: string,
+    orMessages: Array<Partial<ChatMessage>>,
+    options: ModelCompletionOptions,
+  ): void {
+    if (!modelId.toLowerCase().startsWith('anthropic/')) return;
+
+    type WirePart = {
+      type?: string;
+      text?: string;
+      cache_control?: { type: 'ephemeral'; ttl?: '1h' };
+    } & Record<string, unknown>;
+
+    if (options.cache === false) {
+      // Per-call hard-off, mirroring AnthropicProvider's cache:false region
+      // strip: caller-provided markers are removed too, so the opt-out
+      // holds regardless of how a marker arrived. Copies, never in-place
+      // edits — content arrays are shared with caller state.
+      for (const message of orMessages) {
+        if (!Array.isArray(message.content)) continue;
+        const parts = message.content as WirePart[];
+        if (!parts.some((p) => p && p.cache_control !== undefined)) continue;
+        (message as { content: unknown }).content = parts.map((part) => {
+          if (!part || part.cache_control === undefined) return part;
+          const { cache_control: _stripped, ...rest } = part;
+          return rest;
+        });
+      }
+      return;
+    }
+
+    // Same kill-switch syntax as the direct Anthropic auto path.
+    const autoCacheEnv = process.env.AGENTOS_ANTHROPIC_AUTO_CACHE;
+    if (autoCacheEnv === '0' || autoCacheEnv === 'false') return;
+
+    // Caller placement wins: a marker already present in messages, tool
+    // definitions, or customModelParams tool overrides means the caller
+    // owns breakpoint placement — injecting two more could exceed
+    // Anthropic's 4-breakpoint cap or order a longer TTL after a shorter
+    // one (both reject with 400).
+    const holdsMarker = (value: unknown): boolean =>
+      Array.isArray(value) &&
+      value.some(
+        (entry) =>
+          entry !== null &&
+          typeof entry === 'object' &&
+          (entry as Record<string, unknown>).cache_control !== undefined,
+      );
+    const customTools = (options.customModelParams as Record<string, unknown> | undefined)
+      ?.tools;
+    if (
+      orMessages.some((m) => holdsMarker(m.content)) ||
+      holdsMarker(options.tools) ||
+      holdsMarker(customTools)
+    ) {
+      return;
+    }
+
+    const marker: { type: 'ephemeral'; ttl?: '1h' } =
+      options.cache && options.cache.ttl === '1h'
+        ? { type: 'ephemeral', ttl: '1h' }
+        : { type: 'ephemeral' };
+
+    const markMessage = (msg: Partial<ChatMessage>): boolean => {
+      if (typeof msg.content === 'string') {
+        if (!msg.content) return false;
+        (msg as { content: unknown }).content = [
+          { type: 'text', text: msg.content, cache_control: { ...marker } },
+        ];
+        return true;
+      }
+      if (Array.isArray(msg.content)) {
+        // Copy-on-write: mapToOpenRouterMessages shares content references
+        // with the caller's messages, so mutating a part in place would
+        // leak the injected marker back into caller state (and a retry or
+        // fallback leg would then mistake it for a caller marker).
+        const parts = msg.content as WirePart[];
+        for (let i = parts.length - 1; i >= 0; i--) {
+          const part = parts[i];
+          if (part && part.type === 'text' && typeof part.text === 'string' && part.text) {
+            const copy = parts.slice();
+            copy[i] = { ...part, cache_control: { ...marker } };
+            (msg as { content: unknown }).content = copy;
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    // Stable prefix: the FIRST system message. Memory hooks append volatile
+    // per-turn recall as LATER system messages; a breakpoint there would sit
+    // on bytes that change every turn and cold-miss (write premium, no
+    // reads) forever.
+    let systemIdx = -1;
+    for (let i = 0; i < orMessages.length; i++) {
+      if (orMessages[i].role === 'system') {
+        systemIdx = i;
+        break;
+      }
+    }
+    if (systemIdx >= 0) markMessage(orMessages[systemIdx]);
+
+    // Moving tail: the final message, unless it IS the system message we
+    // just marked (single-message requests keep one breakpoint).
+    const lastIdx = orMessages.length - 1;
+    if (lastIdx >= 0 && lastIdx !== systemIdx) markMessage(orMessages[lastIdx]);
+  }
+
   private mapToOpenRouterMessages(messages: ChatMessage[]): Array<Partial<ChatMessage>> {
     return messages.map(msg => {
       const mappedMsg: Partial<ChatMessage> = { role: msg.role, content: msg.content };
       if (msg.name) mappedMsg.name = msg.name;
-      if (msg.tool_calls) mappedMsg.tool_calls = msg.tool_calls;
+      // Only the standard tool-call fields go on the wire. A tool call can
+      // carry provider-specific extras, such as Gemini's thoughtSignature,
+      // that the upstream Chat Completions schema does not define.
+      if (msg.tool_calls) {
+        mappedMsg.tool_calls = msg.tool_calls.map(({ id, type, function: fn }) => ({ id, type, function: fn }));
+      }
       if (msg.tool_call_id) mappedMsg.tool_call_id = msg.tool_call_id;
       return mappedMsg;
     });
@@ -257,6 +496,7 @@ export class OpenRouterProvider implements IProvider {
   ): Promise<ModelCompletionResponse> {
     this.ensureInitialized();
     const openRouterMessages = this.mapToOpenRouterMessages(messages);
+    this.applyAnthropicSlugCacheControl(modelId, openRouterMessages, options);
 
     const payload: Record<string, unknown> = {
       model: modelId,
@@ -269,24 +509,127 @@ export class OpenRouterProvider implements IProvider {
       // capacity (e.g. 64000 for claude-haiku-4-5), which causes 402 credit-required
       // errors on accounts without enough buffer. Default to 4096 — the same value
       // AnthropicProvider uses — so short prompts succeed without explicit tuning.
-      max_tokens: options.maxTokens ?? 4096,
+      // Then clamp to the model's output ceiling so a request sized for a
+      // flagship model is not rejected when routed to a lower-ceiling OpenAI
+      // model (e.g. openai/gpt-4o caps at 16384, not 32000).
+      max_tokens: clampMaxOutputTokens(modelId, options.maxTokens) ?? 4096,
       ...(options.presencePenalty !== undefined && { presence_penalty: options.presencePenalty }),
       ...(options.frequencyPenalty !== undefined && { frequency_penalty: options.frequencyPenalty }),
       ...(options.stopSequences !== undefined && { stop: options.stopSequences }),
       ...(options.userId !== undefined && { user: options.userId }),
+      // Provider sticky routing: pins the conversation to one upstream host
+      // so its prompt cache (host-scoped) actually gets re-read; without it
+      // load balancing cold-misses upstream caches turn over turn.
+      ...(options.sessionId !== undefined && { session_id: options.sessionId }),
       ...(options.tools !== undefined && { tools: options.tools }),
       ...(options.toolChoice !== undefined && { tool_choice: options.toolChoice }),
       ...(options.responseFormat?.type === 'json_object' && { response_format: { type: 'json_object' } }),
-      ...(options.customModelParams || {}),
+      ...(options.responseFormat?.type === 'json_schema' && { response_format: options.responseFormat }),
+      // OpenRouter unified usage accounting: reports `cost` and
+      // `prompt_tokens_details.cached_tokens` on the response (trailing
+      // usage chunk on streams). Placed before the customModelParams spread
+      // so callers can override it.
+      usage: { include: true },
+      // Gemini's request fields never apply here (a Gemini call that fell
+      // over to OpenRouter still carries them); routing controls stay.
+      ...(stripGeminiOnlyParams(options.customModelParams) || {}),
     };
+    this.applyDefaultProviderPrefs(payload);
+    this.applySchemaRoutingPrefs(payload, options);
 
-    const apiResponseData = await this.makeApiRequest<OpenRouterChatCompletionAPIResponse>(
-      '/chat/completions',
-      'POST',
-      this.config.requestTimeout,
-      payload
-    );
+    let apiResponseData: OpenRouterChatCompletionAPIResponse;
+    try {
+      apiResponseData = await this.makeApiRequest<OpenRouterChatCompletionAPIResponse>(
+        '/chat/completions',
+        'POST',
+        // CR8: honor a per-call requestTimeout override over the provider default.
+        options.requestTimeout ?? this.config.requestTimeout,
+        payload
+      );
+    } catch (error: unknown) {
+      const degraded = this.degradeSchemaPayloadOnNoEndpoints(payload, error);
+      if (!degraded) throw error;
+      apiResponseData = await this.makeApiRequest<OpenRouterChatCompletionAPIResponse>(
+        '/chat/completions',
+        'POST',
+        options.requestTimeout ?? this.config.requestTimeout,
+        payload
+      );
+    }
     return this.mapApiToCompletionResponse(apiResponseData, modelId);
+  }
+
+  /**
+   * Seed env-default provider-routing preferences (see
+   * {@link defaultOpenRouterProviderPrefs}) under any caller-supplied
+   * `provider` object — caller keys win field-by-field. Runs before
+   * {@link applySchemaRoutingPrefs} so `require_parameters` merges on top.
+   */
+  private applyDefaultProviderPrefs(payload: Record<string, unknown>): void {
+    const defaults = defaultOpenRouterProviderPrefs();
+    if (!defaults) return;
+    const existing =
+      payload.provider && typeof payload.provider === 'object'
+        ? (payload.provider as Record<string, unknown>)
+        : {};
+    payload.provider = { ...defaults, ...existing };
+  }
+
+  /**
+   * When the request carries a schema-enforced `response_format`
+   * (`json_schema`), restrict OpenRouter's routing to upstream hosts that
+   * actually support the requested parameters — otherwise a host that
+   * ignores `response_format` serves the call, returns prose, and the
+   * caller's Zod validation fails with nothing to retry on. Merges over any
+   * caller-supplied `provider` prefs (e.g. `provider.sort` latency routing
+   * via customModelParams) instead of clobbering them.
+   */
+  private applySchemaRoutingPrefs(
+    payload: Record<string, unknown>,
+    options: ModelCompletionOptions,
+  ): void {
+    if (options.responseFormat?.type !== 'json_schema') return;
+    const existing =
+      payload.provider && typeof payload.provider === 'object'
+        ? (payload.provider as Record<string, unknown>)
+        : {};
+    payload.provider = { ...existing, require_parameters: true };
+  }
+
+  /**
+   * One-shot degrade for schema-enforced calls: when OpenRouter reports
+   * that no endpoint can serve the request (404 "No endpoints found …" —
+   * typically because no host for the model supports `response_format`
+   * with `require_parameters` routing), swap the payload down to loose
+   * `json_object` mode and drop the routing restriction so the call still
+   * completes. Caller-side Zod validation remains the correctness
+   * backstop, exactly as before schema enforcement existed.
+   *
+   * @returns true when the payload was degraded and the caller should
+   *          retry once; false when the error is unrelated.
+   */
+  private degradeSchemaPayloadOnNoEndpoints(
+    payload: Record<string, unknown>,
+    error: unknown,
+  ): boolean {
+    const rf = payload.response_format as { type?: string } | undefined;
+    if (rf?.type !== 'json_schema') return false;
+    if (!(error instanceof OpenRouterProviderError)) return false;
+    const noEndpoints =
+      error.httpStatus === 404 && /no endpoints/i.test(error.message);
+    if (!noEndpoints) return false;
+
+    console.warn(
+      `OpenRouterProvider: no endpoint supports json_schema for model ` +
+        `'${String(payload.model)}' — degrading to json_object for this call.`,
+    );
+    payload.response_format = { type: 'json_object' };
+    const provider = payload.provider as Record<string, unknown> | undefined;
+    if (provider && typeof provider === 'object') {
+      delete provider.require_parameters;
+      if (Object.keys(provider).length === 0) delete payload.provider;
+    }
+    return true;
   }
 
   public async *generateCompletionStream(
@@ -296,6 +639,7 @@ export class OpenRouterProvider implements IProvider {
   ): AsyncGenerator<ModelCompletionResponse, void, undefined> {
     this.ensureInitialized();
     const openRouterMessages = this.mapToOpenRouterMessages(messages);
+    this.applyAnthropicSlugCacheControl(modelId, openRouterMessages, options);
 
     const payload: Record<string, unknown> = {
       model: modelId,
@@ -313,24 +657,55 @@ export class OpenRouterProvider implements IProvider {
       // capacity (e.g. 64000 for claude-haiku-4-5), which causes 402 credit-required
       // errors on accounts without enough buffer. Default to 4096 — the same value
       // AnthropicProvider uses — so short prompts succeed without explicit tuning.
-      max_tokens: options.maxTokens ?? 4096,
+      // Then clamp to the model's output ceiling so a request sized for a
+      // flagship model is not rejected when routed to a lower-ceiling OpenAI
+      // model (e.g. openai/gpt-4o caps at 16384, not 32000).
+      max_tokens: clampMaxOutputTokens(modelId, options.maxTokens) ?? 4096,
       ...(options.presencePenalty !== undefined && { presence_penalty: options.presencePenalty }),
       ...(options.frequencyPenalty !== undefined && { frequency_penalty: options.frequencyPenalty }),
       ...(options.stopSequences !== undefined && { stop: options.stopSequences }),
       ...(options.userId !== undefined && { user: options.userId }),
+      // Provider sticky routing: pins the conversation to one upstream host
+      // so its prompt cache (host-scoped) actually gets re-read; without it
+      // load balancing cold-misses upstream caches turn over turn.
+      ...(options.sessionId !== undefined && { session_id: options.sessionId }),
       ...(options.tools !== undefined && { tools: options.tools }),
       ...(options.toolChoice !== undefined && { tool_choice: options.toolChoice }),
       ...(options.responseFormat?.type === 'json_object' && { response_format: { type: 'json_object' } }),
-      ...(options.customModelParams || {}),
+      ...(options.responseFormat?.type === 'json_schema' && { response_format: options.responseFormat }),
+      // OpenRouter unified usage accounting: reports `cost` and
+      // `prompt_tokens_details.cached_tokens` on the response (trailing
+      // usage chunk on streams). Placed before the customModelParams spread
+      // so callers can override it.
+      usage: { include: true },
+      // Gemini's request fields never apply here (a Gemini call that fell
+      // over to OpenRouter still carries them); routing controls stay.
+      ...(stripGeminiOnlyParams(options.customModelParams) || {}),
     };
+    this.applyDefaultProviderPrefs(payload);
+    this.applySchemaRoutingPrefs(payload, options);
 
-    const stream = await this.makeApiRequest<NodeJS.ReadableStream>(
-      '/chat/completions',
-      'POST',
-      this.config.streamRequestTimeout,
-      payload,
-      true
-    );
+    let stream: NodeJS.ReadableStream;
+    try {
+      stream = await this.makeApiRequest<NodeJS.ReadableStream>(
+        '/chat/completions',
+        'POST',
+        // CR8: honor a per-call requestTimeout override over the stream default.
+        options.requestTimeout ?? this.config.streamRequestTimeout,
+        payload,
+        true
+      );
+    } catch (error: unknown) {
+      const degraded = this.degradeSchemaPayloadOnNoEndpoints(payload, error);
+      if (!degraded) throw error;
+      stream = await this.makeApiRequest<NodeJS.ReadableStream>(
+        '/chat/completions',
+        'POST',
+        options.requestTimeout ?? this.config.streamRequestTimeout,
+        payload,
+        true
+      );
+    }
 
     const accumulatedToolCalls: Map<number, { id?: string; type?: 'function'; function?: { name?: string; arguments?: string; } }> = new Map();
 
@@ -358,7 +733,34 @@ export class OpenRouterProvider implements IProvider {
       if (rawChunk.startsWith('data: ')) {
         const jsonData = rawChunk.substring('data: '.length);
         try {
-          const apiChunk = JSON.parse(jsonData) as OpenRouterChatCompletionAPIResponse;
+          const apiChunk = JSON.parse(jsonData) as OpenRouterChatCompletionAPIResponse & {
+            error?: { code?: number | string; message?: string; metadata?: unknown };
+          };
+          // OpenRouter reports upstream failures MID-STREAM as an SSE data
+          // event carrying an `error` object and no choices. Previously this
+          // fell into the empty-choices branch and surfaced as a generic
+          // "Stream chunk contained no choices" — the real upstream reason
+          // (provider outage, moderation, context overflow) was discarded,
+          // which made every mid-stream failure look identical to callers'
+          // retry/fallback routing. Surface the actual message + code and
+          // terminate the stream.
+          if (apiChunk.error && typeof apiChunk.error === 'object') {
+            const errMessage = apiChunk.error.message || 'OpenRouter mid-stream error';
+            const errCode = apiChunk.error.code;
+            yield {
+              id: apiChunk.id ?? `openrouter-error-${Date.now()}`,
+              object: 'chat.completion.chunk',
+              created: apiChunk.created ?? Math.floor(Date.now() / 1000),
+              modelId: apiChunk.model || modelId,
+              choices: [],
+              isFinal: true,
+              error: {
+                message: errCode !== undefined ? `[${errCode}] ${errMessage}` : errMessage,
+                type: 'upstream_error',
+              },
+            };
+            break;
+          }
           yield this.mapApiToStreamChunkResponse(apiChunk, modelId, accumulatedToolCalls);
           // Don't break on finish_reason: with stream_options.include_usage,
           // OpenRouter (like OpenAI) emits a trailing usage-only chunk AFTER
@@ -393,7 +795,7 @@ export class OpenRouterProvider implements IProvider {
       input: texts,
       ...(options?.encodingFormat && { encoding_format: options.encodingFormat }),
       ...(options?.dimensions && { dimensions: options.dimensions }),
-      ...(options?.customModelParams || {}),
+      ...(stripGeminiOnlyParams(options?.customModelParams) || {}),
     };
     if (options?.inputType && payload.customModelParams && typeof payload.customModelParams === 'object') {
       (payload.customModelParams as Record<string, unknown>).input_type = options.inputType;
@@ -457,7 +859,15 @@ export class OpenRouterProvider implements IProvider {
       return { isHealthy: false, details: { message: "OpenRouterProvider not initialized (HTTP client missing)."}};
     }
     try {
-      await this.client.get('/models', { timeout: Math.min(this.config.requestTimeout || 10000, 10000) });
+      // Auth rides per-request since the key moved off the axios instance
+      // (per-attempt pool rotation) — /models is public today, but keep the
+      // health probe representative of real authenticated traffic.
+      await this.client.get('/models', {
+        timeout: Math.min(this.config.requestTimeout || 10000, 10000),
+        headers: {
+          Authorization: `Bearer ${this.keyPool?.hasKeys ? this.keyPool.next() : this.config.apiKey}`,
+        },
+      });
       return { isHealthy: true, details: { message: "Successfully connected to OpenRouter /models endpoint." } };
     } catch (error: unknown) {
       const err = error as AxiosError;
@@ -487,21 +897,20 @@ export class OpenRouterProvider implements IProvider {
       throw new OpenRouterProviderError("Received empty choices array from OpenRouter.", "API_RESPONSE_MALFORMED", undefined, undefined, { responseId: apiResponse.id });
     }
 
-    const usage: ModelUsage | undefined = apiResponse.usage ? {
-      promptTokens: apiResponse.usage.prompt_tokens,
-      completionTokens: apiResponse.usage.completion_tokens,
-      totalTokens: apiResponse.usage.total_tokens,
-      costUSD: apiResponse.usage.cost,
-    } : undefined;
+    const usage: ModelUsage | undefined = mapOpenRouterUsage(apiResponse.usage);
 
     return {
       id: apiResponse.id,
       object: apiResponse.object,
       created: apiResponse.created,
       modelId: apiResponse.model || requestedModelId,
+      // Serving-host attribution (Groq vs DeepInfra etc.) — load-bearing for
+      // latency telemetry since provider routing prefs (customModelParams
+      // `provider.sort`) change which host serves the same model.
+      ...(apiResponse.provider ? { servingProvider: apiResponse.provider } : {}),
       choices: apiResponse.choices.map(c => ({
         index: c.index,
-        message: { 
+        message: {
           role: c.message!.role,
           content: c.message!.content,
           tool_calls: c.message!.tool_calls,
@@ -531,14 +940,10 @@ export class OpenRouterProvider implements IProvider {
           object: apiChunk.object,
           created: apiChunk.created,
           modelId: apiChunk.model || requestedModelId,
+          ...(apiChunk.provider ? { servingProvider: apiChunk.provider } : {}),
           choices: [],
           isFinal: true,
-          usage: {
-            promptTokens: apiChunk.usage.prompt_tokens,
-            completionTokens: apiChunk.usage.completion_tokens,
-            totalTokens: apiChunk.usage.total_tokens,
-            costUSD: apiChunk.usage.cost,
-          },
+          usage: mapOpenRouterUsage(apiChunk.usage),
         };
       }
 
@@ -639,6 +1044,7 @@ export class OpenRouterProvider implements IProvider {
         object: apiChunk.object,
         created: apiChunk.created,
         modelId: apiChunk.model || requestedModelId,
+        ...(apiChunk.provider ? { servingProvider: apiChunk.provider } : {}),
         choices: finalChoices,
         responseTextDelta: isFinal ? undefined : responseTextDelta,
         toolCallsDeltas: isFinal ? undefined : toolCallsDeltas,
@@ -647,6 +1053,27 @@ export class OpenRouterProvider implements IProvider {
       };
   }
 
+  /** Attempts per request: 1 initial + 2 retries on retryable failures. */
+  private static readonly MAX_REQUEST_ATTEMPTS = 3;
+  /** Ceiling for a single retry sleep (Retry-After or backoff), ms. */
+  private static readonly MAX_RETRY_SLEEP_MS = 15_000;
+
+  /**
+   * Executes one OpenRouter API request with per-attempt key rotation and
+   * bounded retry. Previously this was a single attempt with the API key
+   * baked into the axios instance at initialize() — a throttled or
+   * credit-exhausted key was reused forever and every transient 429/5xx/
+   * network blip surfaced straight to the caller as a final failure.
+   *
+   * Per attempt:
+   *  - the Authorization key is drawn fresh from the {@link ApiKeyPool}
+   *    (weighted round-robin, skips keys in cooldown);
+   *  - a 402/429 marks the CURRENT key exhausted so the next attempt (and
+   *    the next request) fails over to a different key;
+   *  - 408/429/5xx and transport-level failures (no HTTP response) retry
+   *    with the response's Retry-After when present (capped), else
+   *    jittered exponential backoff; 4xx request errors throw immediately.
+   */
   private async makeApiRequest<T = unknown>(
     endpoint: string,
     method: 'GET' | 'POST',
@@ -654,48 +1081,94 @@ export class OpenRouterProvider implements IProvider {
     body?: Record<string, unknown>,
     expectStream: boolean = false
   ): Promise<T> {
-    try {
-      const response = await this.client.request<T>({
-        url: endpoint,
-        method,
-        data: body,
-        timeout: timeout,
-        responseType: expectStream ? 'stream' as ResponseType : 'json' as ResponseType,
-      });
-      return response.data;
-    } catch (error: unknown) {
-      let statusCode: number | undefined;
-      let errorData: any;
-      let errorMessage = 'Unknown OpenRouter API error';
-      let errorType = 'UNKNOWN_API_ERROR';
+    let lastError: OpenRouterProviderError | null = null;
 
-      if (axios.isAxiosError(error)) {
-        statusCode = error.response?.status;
-        errorData = error.response?.data;
-        if (errorData?.error && typeof errorData.error === 'object') {
-          errorMessage = errorData.error.message || errorMessage;
-          errorType = errorData.error.type || errorType;
-        } else if (typeof errorData === 'string') {
-          errorMessage = errorData;
-        } else if ((error as Error).message) {
-          errorMessage = (error as Error).message;
+    for (let attempt = 0; attempt < OpenRouterProvider.MAX_REQUEST_ATTEMPTS; attempt++) {
+      const apiKey = this.keyPool?.hasKeys ? this.keyPool.next() : this.config.apiKey;
+      try {
+        const response = await this.client.request<T>({
+          url: endpoint,
+          method,
+          data: body,
+          timeout: timeout,
+          headers: { Authorization: `Bearer ${apiKey}` },
+          responseType: expectStream ? 'stream' as ResponseType : 'json' as ResponseType,
+        });
+        return response.data;
+      } catch (error: unknown) {
+        let statusCode: number | undefined;
+        let errorData: any;
+        let errorMessage = 'Unknown OpenRouter API error';
+        let errorType = 'UNKNOWN_API_ERROR';
+        let retryAfterSec: number | undefined;
+        let transportFailure = false;
+
+        if (axios.isAxiosError(error)) {
+          statusCode = error.response?.status;
+          errorData = error.response?.data;
+          transportFailure = error.response === undefined;
+          const retryAfterRaw = error.response?.headers?.['retry-after'];
+          const parsedRetryAfter =
+            typeof retryAfterRaw === 'string' ? parseInt(retryAfterRaw, 10) : NaN;
+          if (Number.isFinite(parsedRetryAfter) && parsedRetryAfter > 0) {
+            retryAfterSec = parsedRetryAfter;
+          }
+          if (errorData?.error && typeof errorData.error === 'object') {
+            errorMessage = errorData.error.message || errorMessage;
+            errorType = errorData.error.type || errorType;
+          } else if (typeof errorData === 'string') {
+            errorMessage = errorData;
+          } else if ((error as Error).message) {
+            errorMessage = (error as Error).message;
+          }
+        } else if (error instanceof Error) {
+          errorMessage = error.message;
         }
-      } else if (error instanceof Error) {
-        errorMessage = error.message;
-      }
 
-      // Prefix the status code into the message so downstream retry/fallback
-      // logic (e.g. isRetryableError, which greps for \b402\b) can route on it
-      // even when the OR API body provides a friendlier description.
-      const decoratedMessage = statusCode ? `[${statusCode}] ${errorMessage}` : errorMessage;
-      throw new OpenRouterProviderError(
-        decoratedMessage,
-        'API_REQUEST_FAILED',
-        statusCode,
-        errorType,
-        { requestEndpoint: endpoint, requestBodyPreview: body ? JSON.stringify(body).substring(0, 200) + '...' : undefined, responseData: errorData, underlyingError: error }
-      );
+        // A throttled (429) or credit-exhausted (402) key must not be
+        // reused by the next attempt/request — cool it down in the pool.
+        if ((statusCode === 402 || statusCode === 429) && this.keyPool?.hasKeys) {
+          this.keyPool.markExhausted(apiKey);
+        }
+
+        // Prefix the status code into the message so downstream retry/fallback
+        // logic (e.g. isRetryableError, which greps for \b402\b) can route on it
+        // even when the OR API body provides a friendlier description.
+        const decoratedMessage = statusCode ? `[${statusCode}] ${errorMessage}` : errorMessage;
+        lastError = new OpenRouterProviderError(
+          decoratedMessage,
+          'API_REQUEST_FAILED',
+          statusCode,
+          errorType,
+          { requestEndpoint: endpoint, requestBodyPreview: body ? JSON.stringify(body).substring(0, 200) + '...' : undefined, responseData: errorData, underlyingError: error }
+        );
+
+        const retryable =
+          transportFailure ||
+          statusCode === 408 ||
+          statusCode === 429 ||
+          (typeof statusCode === 'number' && statusCode >= 500 && statusCode < 600);
+        if (!retryable || attempt === OpenRouterProvider.MAX_REQUEST_ATTEMPTS - 1) {
+          throw lastError;
+        }
+
+        const sleepMs = Math.min(
+          retryAfterSec !== undefined
+            ? retryAfterSec * 1000
+            : 300 * 2 ** attempt + Math.floor(Math.random() * 200),
+          OpenRouterProvider.MAX_RETRY_SLEEP_MS,
+        );
+        console.warn(
+          `OpenRouterProvider: attempt ${attempt + 1}/${OpenRouterProvider.MAX_REQUEST_ATTEMPTS} ` +
+            `failed (${decoratedMessage.substring(0, 160)}); retrying in ${sleepMs}ms.`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, sleepMs));
+      }
     }
+
+    // Unreachable in practice (the loop either returns or throws), but keeps
+    // the compiler + any future refactor honest.
+    throw lastError ?? new OpenRouterProviderError('OpenRouter request failed.', 'API_REQUEST_FAILED');
   }
 
   private async *parseSseStream(stream: NodeJS.ReadableStream): AsyncGenerator<string, void, undefined> {

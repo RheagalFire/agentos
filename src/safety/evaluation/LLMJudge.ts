@@ -9,6 +9,8 @@
 
 import type { AIModelProviderManager } from '../../core/llm/providers/AIModelProviderManager';
 import type { ChatMessage } from '../../core/llm/providers/IProvider';
+import { resolveJudgeLlm } from '../../core/llm/providers/judge-config';
+import type { EffortLevel } from '../../core/llm/providers/model-effort';
 import type { ScorerFunction } from './IEvaluator';
 
 /**
@@ -17,14 +19,27 @@ import type { ScorerFunction } from './IEvaluator';
 export interface LLMJudgeConfig {
   /** LLM provider manager */
   llmProvider: AIModelProviderManager;
-  /** Model to use for judging */
+  /** Model to use for judging. @default the central judge resolver (gpt-5.6) */
   modelId?: string;
-  /** Provider ID */
+  /** Provider ID. Pinning a non-openai provider requires an explicit `modelId`. */
   providerId?: string;
+  /**
+   * Reasoning effort. When omitted, the resolver's default (`max`) applies
+   * only when the resolver's model was also selected — a pinned `modelId`
+   * gets no injected effort (zero request-shape change).
+   */
+  effort?: EffortLevel;
   /** Temperature for judging (lower = more consistent) */
   temperature?: number;
   /** Custom system prompt for the judge */
   systemPrompt?: string;
+  /**
+   * Score returned when evaluation fails (provider error, parse failure).
+   * Defaults to 0 (fail-closed) so a judge used as a safety gate does not pass
+   * on infrastructure failure — matching EmergentJudge. Set to 0.5 to restore
+   * the prior neutral-on-error behavior for non-gating quality scoring.
+   */
+  errorScore?: number;
 }
 
 /**
@@ -128,15 +143,28 @@ export class LLMJudge {
   private readonly llmProvider: AIModelProviderManager;
   private readonly modelId: string;
   private readonly providerId?: string;
+  private readonly effort?: EffortLevel;
   private readonly temperature: number;
   private readonly systemPrompt: string;
+  private readonly errorScore: number;
 
   constructor(config: LLMJudgeConfig) {
     this.llmProvider = config.llmProvider;
-    this.modelId = config.modelId || 'gpt-4-turbo';
-    this.providerId = config.providerId;
+    // Default judge selection comes from the central resolver (gpt-5.6 at
+    // max effort; spec batch-1 C3): the three judge sites previously
+    // hardcoded stale model ids and co-drifted. `??`-style resolution with
+    // an empty-string guard replaces the old falsy-swallowing `||`.
+    const sel = resolveJudgeLlm({
+      model: config.modelId,
+      provider: config.providerId,
+      effort: config.effort,
+    });
+    this.modelId = sel.model;
+    this.providerId = sel.provider;
+    this.effort = sel.effort;
     this.temperature = config.temperature ?? 0.1;
     this.systemPrompt = config.systemPrompt || DEFAULT_JUDGE_PROMPT;
+    this.errorScore = config.errorScore ?? 0;
   }
 
   /**
@@ -187,6 +215,7 @@ Please evaluate the ACTUAL OUTPUT against the criteria and provide your judgment
         {
           temperature: this.temperature,
           responseFormat: { type: 'json_object' },
+          ...(this.effort !== undefined ? { effort: this.effort } : {}),
         },
       );
 
@@ -201,9 +230,11 @@ Please evaluate the ACTUAL OUTPUT against the criteria and provide your judgment
         confidence: result.confidence ?? 0.5,
       };
     } catch (error: any) {
-      // Return neutral score on error
+      // Fail closed: an errored judge has no signal, so return the configured
+      // errorScore (default 0) rather than a misleading neutral 0.5 that would
+      // let a `score >= threshold` safety gate pass on infrastructure failure.
       return {
-        score: 0.5,
+        score: this.errorScore,
         criteriaScores: {},
         reasoning: `Evaluation error: ${error.message}`,
         feedback: ['Unable to complete evaluation'],
