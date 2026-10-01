@@ -1,3 +1,12 @@
+## <small>0.10.26 (2026-10-01)</small>
+
+* Merge branch 'master' into fix/cwe22-sandboxedtoolforge-sandboxed-772c ([54d1ccea3523efb50a302aae7ce947e0076419c3](https://github.com/framerslab/agentos/commit/54d1ccea3523efb50a302aae7ce947e0076419c3))
+* Merge pull request #49 from framerslab/fix/sandbox-realpath-containment ([8e739598283b4135011e2910321319747c4a44a2](https://github.com/framerslab/agentos/commit/8e739598283b4135011e2910321319747c4a44a2))
+* fix: resolve symlinks before path containment check in sandboxed fs.readFile ([bb087d831a10ff71c491a3183068ff02dcf48000](https://github.com/framerslab/agentos/commit/bb087d831a10ff71c491a3183068ff02dcf48000))
+* fix(sandbox): check read paths lexically before resolving symlinks ([eb65e30769f60ebdd7664c1d34948d3fb986209f](https://github.com/framerslab/agentos/commit/eb65e30769f60ebdd7664c1d34948d3fb986209f))
+* fix(sandbox): contain read paths with path.relative instead of a string prefix ([14f564264a6dc3201b7644b08064e53e9b11161d](https://github.com/framerslab/agentos/commit/14f564264a6dc3201b7644b08064e53e9b11161d))
+* fix(sandbox): pin each resolved read root on its own ([5cdf53ca16979aea0f99ae329691d39d223c8f17](https://github.com/framerslab/agentos/commit/5cdf53ca16979aea0f99ae329691d39d223c8f17))
+
 ## <small>0.10.25 (2026-10-01)</small>
 
 * fix(api): an explicit provider keeps a vendor-prefixed model id ([6725ed15836c6a268fcf6f63d09fa428352fc177](https://github.com/framerslab/agentos/commit/6725ed15836c6a268fcf6f63d09fa428352fc177))
