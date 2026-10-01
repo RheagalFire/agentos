@@ -1,3 +1,9 @@
+## <small>0.10.25 (2026-10-01)</small>
+
+* fix(api): an explicit provider keeps a vendor-prefixed model id ([6725ed15836c6a268fcf6f63d09fa428352fc177](https://github.com/framerslab/agentos/commit/6725ed15836c6a268fcf6f63d09fa428352fc177))
+* fix(api): keep a stream's error chunk out of its cache diagnostics ([7adcafa766f90d1b8e022bdc84a62dbac71fa819](https://github.com/framerslab/agentos/commit/7adcafa766f90d1b8e022bdc84a62dbac71fa819))
+* fix(openai): send GPT-6 tool calls and Responses-only models to /v1/responses, streamed or not ([36ed84390f89d43f7daccdeffaf8282abdab6b3a](https://github.com/framerslab/agentos/commit/36ed84390f89d43f7daccdeffaf8282abdab6b3a))
+
 ## <small>0.10.24 (2026-09-30)</small>
 
 * test: type the Anthropic wire test's header reader and the root toJSON cache-key case ([f21281278fe766231325e11915b37d503ff7cde2](https://github.com/framerslab/agentos/commit/f21281278fe766231325e11915b37d503ff7cde2))
