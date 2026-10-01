@@ -803,7 +803,9 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
               streamedAnyText = true;
             }
 
-            if (chunk.isFinal && opts.cacheDiagnostics) {
+            // An error chunk ends the step without a provider message, so it
+            // names no id for the next step to compare against.
+            if (chunk.isFinal && opts.cacheDiagnostics && !chunk.error) {
               sawFinalProviderChunk = true;
               // Chain the id for the NEXT step's comparison; keep the
               // latest verdict for the result promise (the final step's
