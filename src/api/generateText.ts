@@ -1127,6 +1127,8 @@ function formatPlanForPrompt(plan: Plan): string {
  * - `402`: payment required (quota exhausted).
  * - `429`: rate limit exceeded.
  * - `500` / `502` / `503` / `504`: server-side errors.
+ * - `529`: provider overloaded (Anthropic's `overloaded_error`). The request
+ *   is fine; this provider has no capacity right now, so another may serve it.
  *
  * Matched network errors:
  * - `fetch failed`: generic fetch rejection (DNS, TLS, etc.).
@@ -1138,7 +1140,7 @@ function formatPlanForPrompt(plan: Plan): string {
  *
  * @internal
  */
-const RETRYABLE_HTTP_STATUSES = new Set([401, 402, 403, 429, 500, 502, 503, 504]);
+const RETRYABLE_HTTP_STATUSES = new Set([401, 402, 403, 429, 500, 502, 503, 504, 529]);
 
 /** Native tool rounds a generateText attempt completed before it failed. */
 interface CompletedToolRounds {
@@ -1253,6 +1255,38 @@ function sumTokenUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
     ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
     ...(cacheCreationTokens !== undefined ? { cacheCreationTokens } : {}),
   };
+}
+
+/** Property key that marks an error thrown after the call walked its fallback chain. */
+const CHAIN_WALKED = Symbol.for('agentos.generateText.chainWalked');
+
+/**
+ * Marks `error` as thrown after this call walked its whole remaining fallback
+ * chain and every entry failed. A walker that called this call as a leg passed
+ * it the entries after that leg (`slice(attempt)`), so on this mark it stops:
+ * walking those entries again would repeat each of them, and on a full outage
+ * leg k would run up to 2^(k-1) times. A non-object is wrapped in an Error
+ * first.
+ *
+ * @returns The marked error.
+ */
+function markChainWalked(error: unknown): unknown {
+  const target = error !== null && typeof error === 'object' ? error : new Error(String(error));
+  try {
+    Object.defineProperty(target, CHAIN_WALKED, { value: true, configurable: true });
+  } catch {
+    // A frozen error cannot carry the mark.
+  }
+  return target;
+}
+
+/** Whether `error` was marked by {@link markChainWalked}. */
+function chainWalkedBefore(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    (error as Record<symbol, unknown>)[CHAIN_WALKED] === true
+  );
 }
 
 /** Whether `error` was marked by {@link markToolsRan}. */
@@ -1371,17 +1405,19 @@ export function isRetryableError(error: unknown): boolean {
   const msg = error.message;
   // HTTP status codes that warrant a provider switch (string-grepped fallback
   // when the error type is not a typed provider error).
-  if (/\b(402|429|500|502|503|504|401|403)\b/.test(msg)) return true;
+  if (/\b(402|429|500|502|503|504|529|401|403)\b/.test(msg)) return true;
   // Network-level failures
   if (/fetch failed|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|network error/i.test(msg)) return true;
   // Provider-specific phrases that always imply a retryable condition.
+  // `overloaded` covers Anthropic's `overloaded_error` when a stream
+  // reports it mid-response without an HTTP status.
   // `credit balance` covers Anthropic's billing message ("Your credit
   // balance is too low to access the Anthropic API") which carries
   // none of the other phrases and is only otherwise caught by the
   // numeric httpStatus 402 branch — a wrapped / re-thrown error that
   // loses the typed `httpStatus` field would slip through without it.
   if (
-    /requires more credits|insufficient credits|credit balance|rate limit|quota|exceeded your current quota/i.test(
+    /requires more credits|insufficient credits|credit balance|rate limit|quota|exceeded your current quota|overloaded/i.test(
       msg,
     )
   ) {
@@ -2685,8 +2721,13 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
             // fallback hop also fails — so an explicit frontier-only chain
             // (e.g. codegen's [gpt-5.6-sol, openrouter:gpt-5.6-sol]) is honored
             // end-to-end. The final entry passes [] -> explicit opt-out -> throw.
+            // When the leg walks these entries and every one fails, it throws a
+            // chain-walked error and the loop below stops instead of trying the
+            // same entries again.
             fallbackProviders: effectiveFallbacks.slice(attempt),
-            onFallback: undefined,
+            // The leg's own walk reports each hop it takes to the caller; this
+            // loop stops once that walk has run, so every hop is reported once.
+            onFallback: opts.onFallback,
             // Continue after the tool rounds this attempt completed: the leg
             // receives the conversation so far (prompt included, so no new
             // prompt), counts all of it as this call's transcript delta, and
@@ -2751,6 +2792,8 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
           // The leg ran tools before it failed. A later leg would start
           // from a conversation that does not show them and run them again.
           if (toolsRanBefore(fbError)) break;
+          // The leg walked every entry after it and all of them failed.
+          if (chainWalkedBefore(fbError)) break;
         }
       }
       // All fallbacks exhausted: fall through to throw
@@ -2764,7 +2807,9 @@ export async function generateText(opts: GenerateTextOptions): Promise<GenerateT
         errorMessage: lastErr.message.slice(0, 200),
       });
       metricStatus = 'error';
-      throw toolProgress.shimRanTool || toolProgress.completedToolRounds ? markToolsRan(lastError) : lastError;
+      throw markChainWalked(
+        toolProgress.shimRanTool || toolProgress.completedToolRounds ? markToolsRan(lastError) : lastError,
+      );
     }
 
     metricStatus = 'error';

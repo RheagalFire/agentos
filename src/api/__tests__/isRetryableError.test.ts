@@ -69,6 +69,15 @@ describe('isRetryableError', () => {
     expect(isRetryableError(new Error('credit balance exhausted'))).toBe(true);
   });
 
+  it('matches an overloaded provider (HTTP 529), typed, grepped or reported mid-stream', () => {
+    // Anthropic answers 529 `overloaded_error` when it has no capacity: the
+    // request is fine and another provider may serve it. Not retryable, an
+    // overloaded primary never reached its fallback legs.
+    expect(isRetryableError(Object.assign(new Error('Overloaded'), { httpStatus: 529 }))).toBe(true);
+    expect(isRetryableError(new Error('HTTP 529: Overloaded'))).toBe(true);
+    expect(isRetryableError(new Error('overloaded_error: Overloaded'))).toBe(true);
+  });
+
   it('does not match a generic non-retryable error', () => {
     expect(isRetryableError(new Error('Invalid request: missing required field "model"'))).toBe(
       false,
