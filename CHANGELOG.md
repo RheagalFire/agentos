@@ -1,3 +1,12 @@
+## <small>0.10.27 (2026-10-02)</small>
+
+* fix(llm): hash the OpenAI cache key and Mistral tool ids without node:crypto ([cb21c8221df0f9416d80ad8cda79fd8f2cdaa747](https://github.com/framerslab/agentos/commit/cb21c8221df0f9416d80ad8cda79fd8f2cdaa747))
+* fix(openrouter): keep API keys out of error details and logs ([0c1b0e4f044720ddef7e6888c7ac6d4ad5ffd90c](https://github.com/framerslab/agentos/commit/0c1b0e4f044720ddef7e6888c7ac6d4ad5ffd90c))
+* fix(telephony): read Telnyx webhook headers and portal keys correctly ([799b65606f1dc2186543e668f365de3a5a920d2a](https://github.com/framerslab/agentos/commit/799b65606f1dc2186543e668f365de3a5a920d2a))
+* fix(telephony): sort Twilio webhook params the way Twilio signs them ([4d2cd0e44a289447f263bd0e37d5ba13cc262bcf](https://github.com/framerslab/agentos/commit/4d2cd0e44a289447f263bd0e37d5ba13cc262bcf))
+* fix(telephony): verify Plivo webhooks with the V3 signature Plivo sends ([bf05ec30fc1a45e1a4dd8d3b52f3606c41da9ba6](https://github.com/framerslab/agentos/commit/bf05ec30fc1a45e1a4dd8d3b52f3606c41da9ba6))
+* docs(telephony): correct the webhook signature table ([4860248af62cca0f6aa008094c1c0f91513b30c7](https://github.com/framerslab/agentos/commit/4860248af62cca0f6aa008094c1c0f91513b30c7))
+
 ## <small>0.10.26 (2026-10-01)</small>
 
 * Merge branch 'master' into fix/cwe22-sandboxedtoolforge-sandboxed-772c ([54d1ccea3523efb50a302aae7ce947e0076419c3](https://github.com/framerslab/agentos/commit/54d1ccea3523efb50a302aae7ce947e0076419c3))
