@@ -1,3 +1,7 @@
+## <small>0.10.28 (2026-10-02)</small>
+
+* fix(generateText): try each fallback leg once, and fail over on HTTP 529 ([9bffd8f11a19dde255716129e986e1ad0f7af402](https://github.com/framerslab/agentos/commit/9bffd8f11a19dde255716129e986e1ad0f7af402))
+
 ## <small>0.10.27 (2026-10-02)</small>
 
 * fix(llm): hash the OpenAI cache key and Mistral tool ids without node:crypto ([cb21c8221df0f9416d80ad8cda79fd8f2cdaa747](https://github.com/framerslab/agentos/commit/cb21c8221df0f9416d80ad8cda79fd8f2cdaa747))
