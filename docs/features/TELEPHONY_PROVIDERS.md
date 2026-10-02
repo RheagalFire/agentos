@@ -187,11 +187,11 @@ the manual path.
 
 All three providers sign their webhook payloads:
 
-| Provider | Algorithm | Header |
+| Provider | Algorithm | Headers |
 |---|---|---|
-| Twilio | HMAC-SHA1 over sorted form params | `x-twilio-signature` |
-| Telnyx | HMAC-SHA256 over raw body | `telnyx-signature-ed25519` |
-| Plivo | HMAC-SHA256 over sorted form params | `x-plivo-signature-v2` |
+| Twilio | HMAC-SHA1 over the URL and the form params sorted by key | `x-twilio-signature` |
+| Telnyx | Ed25519 over the timestamp and the raw body; a timestamp more than 300 seconds old is rejected | `telnyx-signature-ed25519`, `telnyx-timestamp` |
+| Plivo | HMAC-SHA256 (V3) over the URL, its query, the sorted form params and the nonce | `x-plivo-signature-v3` or `x-plivo-signature-ma-v3`, `x-plivo-signature-v3-nonce` |
 
 Signature verification is performed automatically by each provider's
 `verifyWebhook()` method before any events are dispatched.
