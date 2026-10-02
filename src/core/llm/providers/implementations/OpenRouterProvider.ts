@@ -24,6 +24,7 @@ import { ApiKeyPool } from '../../../providers/ApiKeyPool.js';
 import { createGMIErrorFromError, GMIErrorCode } from '../../../utils/errors.js'; // Corrected import path
 import { clampMaxOutputTokens } from '../model-output-limits.js';
 import { stripGeminiOnlyParams } from '../openrouter-only-params';
+import { baseUrlCredentials, redactUrlSecrets } from '../url-secrets.js';
 
 /**
  * Configuration specific to the OpenRouterProvider.
@@ -209,6 +210,80 @@ interface OpenRouterModelAPIObject {
 
 interface OpenRouterListModelsAPIResponse {
   data: OpenRouterModelAPIObject[];
+}
+
+/** Longest streamed error body read into an error, in bytes. */
+const MAX_STREAM_ERROR_BODY_BYTES = 8192;
+
+/** How long reading a streamed error body may take, in milliseconds. */
+const STREAM_ERROR_BODY_TIMEOUT_MS = 2000;
+
+/** Whether a value is a Node readable stream, as axios returns for `responseType: 'stream'`. */
+function isReadableStream(value: unknown): value is NodeJS.ReadableStream & { destroy?: () => void } {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { pipe?: unknown }).pipe === 'function' &&
+    typeof (value as { on?: unknown }).on === 'function'
+  );
+}
+
+/**
+ * Reads up to {@link MAX_STREAM_ERROR_BODY_BYTES} of a streamed error body as
+ * UTF-8 text, waiting at most {@link STREAM_ERROR_BODY_TIMEOUT_MS}, then
+ * destroys the stream so its socket is released.
+ *
+ * @param stream - The error response body axios returned as a stream.
+ * @returns The text read, possibly empty, and whether it is the whole body
+ *   (false when the size limit, the timeout or a stream error cut it short).
+ */
+async function readErrorStream(
+  stream: NodeJS.ReadableStream & { destroy?: () => void },
+): Promise<{ text: string; complete: boolean }> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  let ended = false;
+  try {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(finish, STREAM_ERROR_BODY_TIMEOUT_MS);
+      function finish(): void {
+        clearTimeout(timer);
+        stream.removeListener('data', onData);
+        stream.removeListener('end', onEnd);
+        stream.removeListener('error', finish);
+        resolve();
+      }
+      function onEnd(): void {
+        ended = true;
+        finish();
+      }
+      function onData(chunk: Buffer | string): void {
+        const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+        chunks.push(bytes);
+        size += bytes.length;
+        if (size >= MAX_STREAM_ERROR_BODY_BYTES) finish();
+      }
+      stream.on('data', onData);
+      stream.once('end', onEnd);
+      stream.once('error', finish);
+    });
+  } finally {
+    stream.destroy?.();
+  }
+  return {
+    text: Buffer.concat(chunks).subarray(0, MAX_STREAM_ERROR_BODY_BYTES).toString('utf8'),
+    complete: ended && size <= MAX_STREAM_ERROR_BODY_BYTES,
+  };
+}
+
+/** An error body read as text: the parsed JSON object when it is one, else the text. */
+function parseErrorBody(text: string): unknown {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed !== null && typeof parsed === 'object' ? parsed : text;
+  } catch {
+    return text;
+  }
 }
 
 export class OpenRouterProvider implements IProvider {
@@ -874,9 +949,9 @@ export class OpenRouterProvider implements IProvider {
       return {
         isHealthy: false,
         details: {
-          message: `OpenRouter health check failed: ${err.message}`,
+          message: this.redactSecrets(`OpenRouter health check failed: ${err.message}`),
           status: err.response?.status,
-          responseData: err.response?.data,
+          responseData: this.redactResponseData(err.response?.data),
         },
       };
     }
@@ -1106,6 +1181,17 @@ export class OpenRouterProvider implements IProvider {
         if (axios.isAxiosError(error)) {
           statusCode = error.response?.status;
           errorData = error.response?.data;
+          // A streamed request's error body is the live response stream,
+          // whose `req` holds the request head with the Authorization
+          // header. Read a bounded prefix and drop the stream, so the
+          // message can use the body and nothing keeps the request.
+          if (isReadableStream(errorData)) {
+            const { text, complete } = await readErrorStream(errorData);
+            // A body cut short can end inside a key, which whole-secret
+            // masking would not match. Whole keys are masked first, so a key
+            // whose last characters also start a key is not split in two.
+            errorData = parseErrorBody(complete ? text : this.maskCutSecretTail(this.redactSecrets(text)));
+          }
           transportFailure = error.response === undefined;
           const retryAfterRaw = error.response?.headers?.['retry-after'];
           const parsedRetryAfter =
@@ -1116,7 +1202,7 @@ export class OpenRouterProvider implements IProvider {
           if (errorData?.error && typeof errorData.error === 'object') {
             errorMessage = errorData.error.message || errorMessage;
             errorType = errorData.error.type || errorType;
-          } else if (typeof errorData === 'string') {
+          } else if (typeof errorData === 'string' && errorData.trim()) {
             errorMessage = errorData;
           } else if ((error as Error).message) {
             errorMessage = (error as Error).message;
@@ -1134,13 +1220,21 @@ export class OpenRouterProvider implements IProvider {
         // Prefix the status code into the message so downstream retry/fallback
         // logic (e.g. isRetryableError, which greps for \b402\b) can route on it
         // even when the OR API body provides a friendlier description.
-        const decoratedMessage = statusCode ? `[${statusCode}] ${errorMessage}` : errorMessage;
+        const decoratedMessage = this.redactSecrets(statusCode ? `[${statusCode}] ${errorMessage}` : errorMessage);
         lastError = new OpenRouterProviderError(
           decoratedMessage,
           'API_REQUEST_FAILED',
           statusCode,
           errorType,
-          { requestEndpoint: endpoint, requestBodyPreview: body ? JSON.stringify(body).substring(0, 200) + '...' : undefined, responseData: errorData, underlyingError: error }
+          {
+            requestEndpoint: endpoint,
+            requestBodyPreview: body ? JSON.stringify(body).substring(0, 200) + '...' : undefined,
+            responseData: this.redactResponseData(errorData),
+            // Not the AxiosError itself: its config and request carry the
+            // Authorization header, so logging or serializing the details
+            // would print the API key.
+            underlyingError: this.describeError(error),
+          }
         );
 
         const retryable =
@@ -1171,6 +1265,91 @@ export class OpenRouterProvider implements IProvider {
     throw lastError ?? new OpenRouterProviderError('OpenRouter request failed.', 'API_REQUEST_FAILED');
   }
 
+  /**
+   * Masks the configured API keys (the raw config value and each key in a
+   * comma-separated pool) and any base-URL credentials out of text bound
+   * for an error, a log line or a health report.
+   *
+   * @param text - Text that may quote a request header or URL.
+   * @returns The text with those secrets replaced by `[redacted]`.
+   */
+  private redactSecrets(text: string): string {
+    const rawKeys = this.config?.apiKey ?? '';
+    const keys = [rawKeys, ...rawKeys.split(',').map((key) => key.trim())];
+    return redactUrlSecrets(text, this.config?.baseURL, keys);
+  }
+
+  /** Every configured secret: the raw key setting, each pooled key, and base-URL credentials. */
+  private configuredSecrets(): string[] {
+    const rawKeys = this.config?.apiKey ?? '';
+    return [rawKeys, ...rawKeys.split(',').map((key) => key.trim()), baseUrlCredentials(this.config?.baseURL) ?? ''].filter(
+      (secret) => secret.length > 0,
+    );
+  }
+
+  /**
+   * Masks the end of a text that was cut short when that end is the start
+   * of a configured secret. {@link redactSecrets} matches whole secrets
+   * only, so a key split by the cut would otherwise show all but its last
+   * characters.
+   *
+   * @param text - Text cut at a size limit or a timeout.
+   * @returns The text with any such tail replaced by `[redacted]`.
+   */
+  private maskCutSecretTail(text: string): string {
+    let cut = 0;
+    for (const secret of this.configuredSecrets()) {
+      for (let length = Math.min(secret.length - 1, text.length); length > cut; length--) {
+        if (text.endsWith(secret.slice(0, length))) {
+          cut = length;
+          break;
+        }
+      }
+    }
+    return cut > 0 ? `${text.slice(0, text.length - cut)}[redacted]` : text;
+  }
+
+  /**
+   * A response body as kept in error details, with the configured keys
+   * masked: text directly, JSON values through their serialized form.
+   * Anything that does not serialize, such as a live stream whose `req`
+   * holds the Authorization header, is replaced by a placeholder.
+   *
+   * @param data - The response body as axios returned it.
+   * @returns A plain value that is safe to log or serialize.
+   */
+  private redactResponseData(data: unknown): unknown {
+    if (data === undefined || data === null) return data;
+    if (typeof data === 'string') return this.redactSecrets(data);
+    if (isReadableStream(data)) return '[stream body not read]';
+    try {
+      const json = JSON.stringify(data);
+      return json === undefined ? undefined : JSON.parse(this.redactSecrets(json));
+    } catch {
+      return '[unserializable response body]';
+    }
+  }
+
+  /**
+   * The parts of a caught error worth keeping in details: its name, string
+   * `code` and masked message. An AxiosError's config and request carry the
+   * Authorization header, so they are left out.
+   *
+   * @param error - The caught error.
+   * @returns A plain description that is safe to log or serialize.
+   */
+  private describeError(error: unknown): { name?: string; code?: string; message: string } {
+    if (error instanceof Error) {
+      const code = (error as { code?: unknown }).code;
+      return {
+        name: error.name,
+        ...(typeof code === 'string' ? { code } : {}),
+        message: this.redactSecrets(error.message),
+      };
+    }
+    return { message: this.redactSecrets(String(error)) };
+  }
+
   private async *parseSseStream(stream: NodeJS.ReadableStream): AsyncGenerator<string, void, undefined> {
     let buffer = '';
     const readableStream = stream as NodeJS.ReadableStream & { destroy?: () => void };
@@ -1191,10 +1370,15 @@ export class OpenRouterProvider implements IProvider {
         yield buffer.trim();
       }
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : "OpenRouter stream parsing/reading error";
-      console.error("OpenRouterProvider: Error reading or parsing SSE stream:", message, error);
+      const message = this.redactSecrets(
+        error instanceof Error ? error.message : "OpenRouter stream parsing/reading error",
+      );
+      // A stream error can be an AxiosError holding the request config, so
+      // only its description is logged and kept.
+      const description = this.describeError(error);
+      console.error("OpenRouterProvider: Error reading or parsing SSE stream:", message, description);
       if (error instanceof OpenRouterProviderError) throw error;
-      throw new OpenRouterProviderError(message, 'STREAM_PARSING_ERROR', undefined, undefined, error);
+      throw new OpenRouterProviderError(message, 'STREAM_PARSING_ERROR', undefined, undefined, description);
     } finally {
       if (typeof readableStream.destroy === 'function') {
         readableStream.destroy();
