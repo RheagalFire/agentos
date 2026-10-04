@@ -39,16 +39,32 @@ export interface OpenRouterProviderConfig {
   streamRequestTimeout?: number;
 }
 
+/**
+ * OpenRouter's error envelope. It arrives as an HTTP error body, as the
+ * body of a 200 whose provider failed after accepting the request, on a
+ * choice (`finish_reason: 'error'`), or as a mid-stream SSE event. `code`
+ * is the HTTP status the failure maps to; `metadata.error_type` is
+ * OpenRouter's stable typed code (the OpenRouter error reference).
+ */
+export interface OpenRouterErrorEnvelope {
+  code?: number | string;
+  message?: string;
+  metadata?: Record<string, unknown>;
+}
+
 interface OpenRouterChatChoice {
   index: number;
   message?: {
     role: ChatMessage['role'];
     content: string | null;
     tool_calls?: ChatMessage['tool_calls'];
+    /** Set when the model declined as output (`finish_reason: 'content_filter'`). */
+    refusal?: string | null;
   };
   delta?: {
     role?: ChatMessage['role'];
     content?: string | null;
+    refusal?: string | null;
     tool_calls?: Array<{
       index: number;
       id?: string;
@@ -58,6 +74,8 @@ interface OpenRouterChatChoice {
   };
   finish_reason: string | null;
   logprobs?: unknown;
+  /** Present with `finish_reason: 'error'`: the provider failed mid-generation. */
+  error?: OpenRouterErrorEnvelope;
 }
 
 interface OpenRouterChatCompletionAPIResponse {
@@ -83,6 +101,8 @@ interface OpenRouterChatCompletionAPIResponse {
      */
     prompt_tokens_details?: { cached_tokens?: number };
   };
+  /** A 200 whose body reports a failure instead of choices, or a mid-stream error event. */
+  error?: OpenRouterErrorEnvelope;
 }
 
 /**
@@ -284,6 +304,55 @@ function parseErrorBody(text: string): unknown {
   } catch {
     return text;
   }
+}
+
+/** How OpenRouter declined a request, read from its error envelope. */
+export interface OpenRouterDecline {
+  /**
+   * AgentOS's content-policy codes: `content_filter` for a model's own
+   * refusal, `content_policy_violation` for a filter around the model. Both
+   * are in `isContentPolicyRefusal`'s and the health registry's sets.
+   */
+  code: 'content_filter' | 'content_policy_violation';
+  /** What OpenRouter reported, kept for diagnostics. */
+  nativeType: 'refusal' | 'content_policy_violation' | 'moderation' | 'in_body_403' | 'content_filter_finish';
+}
+
+/**
+ * Classify an OpenRouter error envelope as a content decline, or not.
+ *
+ * - `metadata.error_type` `refusal`: the model refused (code `content_filter`).
+ * - `metadata.error_type` `content_policy_violation`: a filter flagged the
+ *   input or output.
+ * - The documented moderation metadata (`reasons` + `flagged_input`) with no
+ *   `error_type`.
+ * - With `inBody`, a numeric code 403 and no `error_type`: the error reference
+ *   gives every in-body policy decline the code 403 once the HTTP line was
+ *   already committed. Never applied to an HTTP 403 response, which without a
+ *   decline type is a guardrail or permission block (`permission_denied`).
+ *
+ * @param error - The `error` object from an OpenRouter body, choice or event.
+ * @param opts.inBody - True when the error sits inside an HTTP 200 body.
+ * @returns The decline, or `undefined` when the error is not one.
+ */
+export function classifyOpenRouterDecline(
+  error: unknown,
+  opts: { inBody?: boolean } = {},
+): OpenRouterDecline | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const env = error as OpenRouterErrorEnvelope;
+  const meta = env.metadata && typeof env.metadata === 'object' ? env.metadata : undefined;
+  const errorType = typeof meta?.error_type === 'string' ? meta.error_type : undefined;
+  if (errorType === 'refusal') return { code: 'content_filter', nativeType: 'refusal' };
+  if (errorType === 'content_policy_violation') {
+    return { code: 'content_policy_violation', nativeType: 'content_policy_violation' };
+  }
+  if (errorType !== undefined) return undefined;
+  if (Array.isArray(meta?.reasons) && typeof meta?.flagged_input === 'string') {
+    return { code: 'content_policy_violation', nativeType: 'moderation' };
+  }
+  if (opts.inBody && env.code === 403) return { code: 'content_policy_violation', nativeType: 'in_body_403' };
+  return undefined;
 }
 
 export class OpenRouterProvider implements IProvider {
@@ -631,6 +700,7 @@ export class OpenRouterProvider implements IProvider {
         payload
       );
     }
+    this.throwOnInBodyError(apiResponseData, modelId);
     return this.mapApiToCompletionResponse(apiResponseData, modelId);
   }
 
@@ -785,43 +855,95 @@ export class OpenRouterProvider implements IProvider {
     const accumulatedToolCalls: Map<number, { id?: string; type?: 'function'; function?: { name?: string; arguments?: string; } }> = new Map();
 
     const abortSignal = options.abortSignal;
+    // `usage` is what a refused turn billed before the abort; a consumer
+    // metering final chunks would otherwise lose it.
+    const abortChunk = (message: string, usage?: ModelUsage): ModelCompletionResponse => ({
+      id: `openrouter-abort-${Date.now()}`,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      modelId,
+      choices: [],
+      error: { message, type: 'abort' },
+      isFinal: true,
+      ...(usage ? { usage } : {}),
+    });
     if (abortSignal?.aborted) {
-      yield { id: `openrouter-abort-${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now()/1000), modelId, choices: [], error: { message: 'Stream aborted prior to first chunk', type: 'abort' }, isFinal: true };
+      // The response is already open, and parseSseStream, which closes it,
+      // never runs on this path.
+      (stream as NodeJS.ReadableStream & { destroy?: () => void }).destroy?.();
+      yield abortChunk('Stream aborted prior to first chunk');
       return;
     }
     const abortHandler = () => { /* passive; loop logic handles emission */ };
     abortSignal?.addEventListener('abort', abortHandler, { once: true });
 
-    for await (const rawChunk of this.parseSseStream(stream)) {
-      if (abortSignal?.aborted) {
-        yield { id: `openrouter-abort-${Date.now()}`, object: 'chat.completion.chunk', created: Math.floor(Date.now()/1000), modelId, choices: [], error: { message: 'Stream aborted by caller', type: 'abort' }, isFinal: true };
-        break;
-      }
-      if (rawChunk.startsWith('data: ') && rawChunk.includes('[DONE]')) {
-        const doneData = rawChunk.substring('data: '.length).trim();
-        if (doneData === '[DONE]') break;
-      }
-      if (rawChunk === 'data: [DONE]') {
-        break;
-      }
+    // Text yielded so far (for the decline's partialText); the
+    // decline held back when a content_filter finish arrives, while the
+    // trailing usage chunk is read; a read error seen during that wait.
+    let yieldedText = '';
+    let held: { decline: OpenRouterDecline; refusal: string | null; usage?: ModelUsage } | null = null;
+    let readError: unknown;
+    const isDecline = (e: unknown): boolean =>
+      e instanceof OpenRouterProviderError && (e.code === 'content_filter' || e.code === 'content_policy_violation');
 
-      if (rawChunk.startsWith('data: ')) {
-        const jsonData = rawChunk.substring('data: '.length);
-        try {
-          const apiChunk = JSON.parse(jsonData) as OpenRouterChatCompletionAPIResponse & {
-            error?: { code?: number | string; message?: string; metadata?: unknown };
-          };
+    try {
+      try {
+        for await (const rawChunk of this.parseSseStream(stream)) {
+          if (abortSignal?.aborted) {
+            // The line that shows the abort is usually the usage line a held
+            // decline was waiting for: read what it reports before leaving.
+            if (held) held.usage = this.usageOfSseLine(rawChunk) ?? held.usage;
+            yield abortChunk('Stream aborted by caller', held?.usage);
+            return;
+          }
+          if (!rawChunk.startsWith('data: ')) continue;
+          const jsonData = rawChunk.substring('data: '.length);
+          if (jsonData.trim() === '[DONE]') break;
+
+          // The parse has its own catch, so a decline thrown while HANDLING
+          // a chunk is never swallowed as a parse failure. A line that is not
+          // JSON, or is JSON but not an object, is skipped as before.
+          let apiChunk: OpenRouterChatCompletionAPIResponse;
+          try {
+            apiChunk = JSON.parse(jsonData) as OpenRouterChatCompletionAPIResponse;
+          } catch (error: unknown) {
+            console.warn('OpenRouterProvider: Failed to parse stream chunk JSON, skipping chunk. Data:', jsonData, 'Error:', error);
+            continue;
+          }
+          if (!apiChunk || typeof apiChunk !== 'object') {
+            console.warn('OpenRouterProvider: Stream chunk is not a JSON object, skipping chunk. Data:', jsonData);
+            continue;
+          }
+
           // OpenRouter reports upstream failures MID-STREAM as an SSE data
-          // event carrying an `error` object and no choices. Previously this
-          // fell into the empty-choices branch and surfaced as a generic
-          // "Stream chunk contained no choices" — the real upstream reason
-          // (provider outage, moderation, context overflow) was discarded,
-          // which made every mid-stream failure look identical to callers'
-          // retry/fallback routing. Surface the actual message + code and
-          // terminate the stream.
+          // event carrying an `error` object. A content decline throws typed
+          // (the walkers move on before any output; after output the stream
+          // ends with an error part). Any other error still surfaces as an
+          // upstream_error chunk and ends the stream.
           if (apiChunk.error && typeof apiChunk.error === 'object') {
+            // The stream is an HTTP 200, so the in-body 403 row applies here too.
+            const decline = classifyOpenRouterDecline(apiChunk.error, { inBody: true });
+            if (decline) {
+              throw this.declineError(modelId, decline, {
+                httpStatus: typeof apiChunk.error.code === 'number' ? apiChunk.error.code : undefined,
+                error: apiChunk.error,
+                partialText: yieldedText,
+                // The event's own usage when it reports one, else what the
+                // held finish or the usage chunk reported.
+                usage: mapOpenRouterUsage(apiChunk.usage) ?? held?.usage,
+              });
+            }
             const errMessage = apiChunk.error.message || 'OpenRouter mid-stream error';
             const errCode = apiChunk.error.code;
+            const decorated = errCode !== undefined ? `[${errCode}] ${errMessage}` : errMessage;
+            if (held) {
+              // The answer already ended on a content_filter finish. A later
+              // upstream failure is the end of the read: it neither replaces
+              // the held decline nor loses the usage read so far.
+              if (apiChunk.usage) held.usage = mapOpenRouterUsage(apiChunk.usage);
+              readError = new Error(decorated);
+              break;
+            }
             yield {
               id: apiChunk.id ?? `openrouter-error-${Date.now()}`,
               object: 'chat.completion.chunk',
@@ -830,24 +952,72 @@ export class OpenRouterProvider implements IProvider {
               choices: [],
               isFinal: true,
               error: {
-                message: errCode !== undefined ? `[${errCode}] ${errMessage}` : errMessage,
+                message: decorated,
                 type: 'upstream_error',
               },
             };
             break;
           }
-          yield this.mapApiToStreamChunkResponse(apiChunk, modelId, accumulatedToolCalls);
+
+          if (held) {
+            // After a content_filter finish only the trailing usage-only
+            // chunk is wanted; nothing more is yielded.
+            if (apiChunk.usage) held.usage = mapOpenRouterUsage(apiChunk.usage);
+            continue;
+          }
+          const choice = apiChunk.choices?.[0];
+          if (choice && choice.finish_reason === 'content_filter') {
+            held = {
+              decline: { code: 'content_filter', nativeType: 'content_filter_finish' },
+              refusal: choice.delta?.refusal ?? choice.message?.refusal ?? null,
+              usage: mapOpenRouterUsage(apiChunk.usage),
+            };
+            continue;
+          }
+
+          // A chunk of an unexpected shape (no choices array, a malformed
+          // tool call) is logged and skipped, as it was when the parse and
+          // the mapping shared one catch.
+          let mapped: ModelCompletionResponse;
+          try {
+            mapped = this.mapApiToStreamChunkResponse(apiChunk, modelId, accumulatedToolCalls);
+          } catch (error: unknown) {
+            console.warn('OpenRouterProvider: Failed to map stream chunk, skipping chunk. Data:', jsonData, 'Error:', this.describeError(error));
+            continue;
+          }
+          if (mapped.responseTextDelta) yieldedText += mapped.responseTextDelta;
+          yield mapped;
           // Don't break on finish_reason: with stream_options.include_usage,
           // OpenRouter (like OpenAI) emits a trailing usage-only chunk AFTER
-          // the finish_reason chunk and BEFORE [DONE]. Breaking here would
-          // skip the usage chunk and zero out the caller's token totals. The
-          // [DONE] marker check above is the right termination signal.
-        } catch (error: unknown) {
-          console.warn('OpenRouterProvider: Failed to parse stream chunk JSON, skipping chunk. Data:', jsonData, 'Error:', error);
+          // the finish_reason chunk and BEFORE [DONE]. The [DONE] marker
+          // check above is the right termination signal.
         }
+      } catch (error: unknown) {
+        if (isDecline(error)) throw error;
+        // A read error after a content_filter finish does not lose the
+        // decline: it is thrown below with the usage held so far.
+        if (held) readError = error;
+        else throw error;
       }
+      if (held) {
+        // An abort during the wait wins over the decline. The loop only
+        // checks the signal when a line arrives, so a read that ended
+        // without one is checked here.
+        if (abortSignal?.aborted) {
+          yield abortChunk('Stream aborted by caller', held.usage);
+          return;
+        }
+        throw this.declineError(modelId, held.decline, {
+          httpStatus: 200,
+          refusal: held.refusal,
+          partialText: yieldedText,
+          usage: held.usage,
+          readError,
+        });
+      }
+    } finally {
+      abortSignal?.removeEventListener('abort', abortHandler);
     }
-    abortSignal?.removeEventListener('abort', abortHandler);
   }
 
   public async generateEmbeddings(
@@ -1201,7 +1371,8 @@ export class OpenRouterProvider implements IProvider {
           }
           if (errorData?.error && typeof errorData.error === 'object') {
             errorMessage = errorData.error.message || errorMessage;
-            errorType = errorData.error.type || errorType;
+            const metaType = errorData.error.metadata?.error_type;
+            errorType = (typeof metaType === 'string' ? metaType : undefined) || errorData.error.type || errorType;
           } else if (typeof errorData === 'string' && errorData.trim()) {
             errorMessage = errorData;
           } else if ((error as Error).message) {
@@ -1209,6 +1380,17 @@ export class OpenRouterProvider implements IProvider {
           }
         } else if (error instanceof Error) {
           errorMessage = error.message;
+        }
+
+        // A content decline is a verdict on the request, not provider
+        // health: throw it typed at once (no in-provider retry, no key
+        // cooldown) so the walkers move on and the breaker stays closed.
+        const decline = classifyOpenRouterDecline(errorData?.error);
+        if (decline) {
+          throw this.declineError(String(body?.model ?? ''), decline, {
+            httpStatus: statusCode,
+            error: errorData.error as OpenRouterErrorEnvelope,
+          });
         }
 
         // A throttled (429) or credit-exhausted (402) key must not be
@@ -1263,6 +1445,131 @@ export class OpenRouterProvider implements IProvider {
     // Unreachable in practice (the loop either returns or throws), but keeps
     // the compiler + any future refactor honest.
     throw lastError ?? new OpenRouterProviderError('OpenRouter request failed.', 'API_REQUEST_FAILED');
+  }
+
+  /**
+   * The error a declined request raises. Code `content_filter` or
+   * `content_policy_violation` is what `isContentPolicyRefusal` and the
+   * health registry's exemption read, so the walkers move on and no breaker
+   * opens. The message is fixed: no HTTP status digits and no upstream text,
+   * which retry classifiers grep for. The response status, the upstream
+   * message (redacted, 300 chars), the provider, the refusal text (300), the
+   * partial text (2,000) and the billed usage ride `details`.
+   */
+  private declineError(
+    modelId: string,
+    decline: OpenRouterDecline,
+    details: {
+      httpStatus?: number;
+      error?: OpenRouterErrorEnvelope;
+      refusal?: string | null;
+      partialText?: string | null;
+      usage?: ModelUsage;
+      readError?: unknown;
+    },
+  ): OpenRouterProviderError {
+    const meta = details.error?.metadata;
+    const bounded = (value: unknown, max: number): string | undefined =>
+      typeof value === 'string' && value.length > 0 ? this.redactSecrets(value).slice(0, max) : undefined;
+    return new OpenRouterProviderError(
+      `OpenRouter declined the request on ${modelId || 'the requested model'} (${decline.nativeType}).`,
+      decline.code,
+      undefined,
+      decline.nativeType,
+      {
+        httpStatus: details.httpStatus,
+        upstreamMessage: bounded(details.error?.message, 300),
+        providerName: typeof meta?.provider_name === 'string' ? meta.provider_name : undefined,
+        providerCode: typeof meta?.provider_code === 'string' ? meta.provider_code : undefined,
+        refusal: bounded(details.refusal, 300),
+        partialText: bounded(details.partialText, 2000),
+        usage: details.usage,
+        ...(details.readError !== undefined ? { readError: this.describeError(details.readError) } : {}),
+      },
+    );
+  }
+
+  /**
+   * A 200 body that reports a failure instead of an answer throws before
+   * mapping, in this order: a body holding only `error` and no
+   * choice; a choice ended by `finish_reason: 'error'` with its own error
+   * object; a choice ended by `finish_reason: 'content_filter'` (the model
+   * declined as output). A choice with `finish_reason: 'error'` and no error
+   * object is not a documented shape and is mapped as before.
+   */
+  private throwOnInBodyError(body: OpenRouterChatCompletionAPIResponse, modelId: string): void {
+    const choices = Array.isArray(body.choices) ? body.choices : [];
+    const first = choices[0];
+    const usage = mapOpenRouterUsage(body.usage);
+    if (body.error && typeof body.error === 'object' && choices.length === 0) {
+      throw this.inBodyError(body.error, modelId, { responseId: body.id, usage });
+    }
+    if (first && first.finish_reason === 'error' && first.error && typeof first.error === 'object') {
+      throw this.inBodyError(first.error, modelId, {
+        responseId: body.id,
+        usage,
+        partialText: first.message?.content ?? null,
+      });
+    }
+    if (first && first.finish_reason === 'content_filter') {
+      throw this.declineError(modelId, { code: 'content_filter', nativeType: 'content_filter_finish' }, {
+        httpStatus: 200,
+        refusal: first.message?.refusal ?? null,
+        partialText: first.message?.content ?? null,
+        usage,
+      });
+    }
+  }
+
+  /**
+   * An error reported inside an HTTP 200 body: a decline becomes
+   * the decline error; anything else becomes the error an HTTP response with
+   * that code produces today, so `isRetryableError` and the breaker treat it
+   * by its code. The exception is a 401 or 403 that is not a decline: it is
+   * still retryable, but it carries no status, so it counts as a transient
+   * failure and not as a rejected key.
+   */
+  private inBodyError(
+    error: OpenRouterErrorEnvelope,
+    modelId: string,
+    extra: { responseId?: string; usage?: ModelUsage; partialText?: string | null },
+  ): OpenRouterProviderError {
+    const code = typeof error.code === 'number' ? error.code : undefined;
+    const decline = classifyOpenRouterDecline(error, { inBody: true });
+    if (decline) {
+      return this.declineError(modelId, decline, {
+        httpStatus: code,
+        error,
+        partialText: extra.partialText,
+        usage: extra.usage,
+      });
+    }
+    // The body is untyped network input: a message that is not a string
+    // must not reach the redaction's string calls.
+    const message = this.redactSecrets(
+      typeof error.message === 'string' && error.message ? error.message : 'OpenRouter reported an error in a 200 response',
+    );
+    const metaType = typeof error.metadata?.error_type === 'string' ? error.metadata.error_type : undefined;
+    // The 200 means the configured key was accepted, so a 401 or 403 inside
+    // the body describes an upstream attempt (a BYOK key, a failover leg),
+    // not this account. Its code stays in the message, where the retry
+    // classifiers read it, and in details; the error carries no status and
+    // no `[NNN]` prefix, so the breaker counts one transient failure instead
+    // of opening its auth policy (one failure, 30 minutes) on one response.
+    const inBodyAuth = code === 401 || code === 403;
+    return new OpenRouterProviderError(
+      code === undefined ? message : inBodyAuth ? `OpenRouter in-body error ${code}: ${message}` : `[${code}] ${message}`,
+      'API_REQUEST_FAILED',
+      inBodyAuth ? undefined : code,
+      metaType ?? 'UNKNOWN_API_ERROR',
+      {
+        responseId: extra.responseId,
+        ...(inBodyAuth ? { httpStatus: code } : {}),
+        responseData: this.redactResponseData(error),
+        partialText: typeof extra.partialText === 'string' ? this.redactSecrets(extra.partialText).slice(0, 2000) : undefined,
+        usage: extra.usage,
+      },
+    );
   }
 
   /**
@@ -1348,6 +1655,19 @@ export class OpenRouterProvider implements IProvider {
       };
     }
     return { message: this.redactSecrets(String(error)) };
+  }
+
+  /** The usage a raw SSE line reports, when it is a data line that carries one. */
+  private usageOfSseLine(rawChunk: string): ModelUsage | undefined {
+    if (!rawChunk.startsWith('data: ')) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(rawChunk.substring('data: '.length));
+      return parsed && typeof parsed === 'object'
+        ? mapOpenRouterUsage((parsed as OpenRouterChatCompletionAPIResponse).usage)
+        : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private async *parseSseStream(stream: NodeJS.ReadableStream): AsyncGenerator<string, void, undefined> {
