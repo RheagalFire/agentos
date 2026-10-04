@@ -1,3 +1,8 @@
+## <small>0.10.30 (2026-10-04)</small>
+
+* fix(storage): read a column before altering its table ([3878831610983d76a87d678063372ab3cda6eb44](https://github.com/framerslab/agentos/commit/3878831610983d76a87d678063372ab3cda6eb44))
+* docs(agency): show per-agent providers, the chair and the provider quorum in the examples (#61) ([c593081e321c919a038910e7b57c2fb6d565abf9](https://github.com/framerslab/agentos/commit/c593081e321c919a038910e7b57c2fb6d565abf9))
+
 ## <small>0.10.29 (2026-10-04)</small>
 
 * fix(generateObject): the schema text the model reads carries the Zod size checks ([52680b4a3e05b1244bc1a463e628404365b23fdb](https://github.com/framerslab/agentos/commit/52680b4a3e05b1244bc1a463e628404365b23fdb))
