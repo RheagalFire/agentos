@@ -38,29 +38,80 @@ export interface LowerZodOptions {
   sizeConstraints?: boolean;
 }
 
-/**
- * The size bounds Zod v4 accumulates on a schema node from its checks (`_zod.bag`).
- * Checks write the effective bound as they attach (`$ZodCheckMaxLength` and
- * `$ZodCheckMinLength` for strings and arrays, `$ZodCheckGreaterThan` /
- * `$ZodCheckLessThan` for numbers), so the bag already holds the tightest bound when
- * several checks stack. Values are read defensively: the bag is an internal.
- */
-function sizeBag(schema: ZodType): {
+/** The bounds a schema author wrote on one node, read from that node's own checks. */
+interface AuthoredBounds {
+  minLength?: number;
+  maxLength?: number;
   minimum?: number;
   maximum?: number;
   exclusiveMinimum?: number;
   exclusiveMaximum?: number;
-} {
-  const bag = (schema as unknown as { _zod?: { bag?: Record<string, unknown> } })._zod?.bag;
-  if (!bag) return {};
+}
+
+/**
+ * Reads the size and range checks attached to a Zod v4 node (`_zod.def.checks`):
+ * `min_length` / `max_length` / `length_equals` on strings and arrays, `greater_than`
+ * / `less_than` on numbers. When several checks stack, the tightest bound wins.
+ *
+ * The node's `_zod.bag` is NOT used: a number format check (`.int()`, `.int32()`)
+ * overwrites the bag's `minimum` and `maximum` with the format's whole range when it
+ * attaches, so `z.number().min(1).max(10).int()` would read as unbounded (Codex
+ * review of 52680b4a3). The checks keep what the author wrote; the format's own range
+ * is not a bound and is left out. Values that are not plain numbers (bigint, Date
+ * bounds) are ignored. Zod internals are read defensively throughout.
+ */
+function authoredBounds(schema: ZodType): AuthoredBounds {
+  const checks = (schema as unknown as { _zod?: { def?: { checks?: unknown[] } } })._zod?.def
+    ?.checks;
+  const out: AuthoredBounds = {};
+  if (!Array.isArray(checks)) return out;
   const num = (v: unknown): number | undefined =>
     typeof v === 'number' && Number.isFinite(v) ? v : undefined;
-  return {
-    minimum: num(bag.minimum),
-    maximum: num(bag.maximum),
-    exclusiveMinimum: num(bag.exclusiveMinimum),
-    exclusiveMaximum: num(bag.exclusiveMaximum),
-  };
+  const tighterMax = (current: number | undefined, next: number): number =>
+    current === undefined ? next : Math.min(current, next);
+  const tighterMin = (current: number | undefined, next: number): number =>
+    current === undefined ? next : Math.max(current, next);
+  for (const check of checks) {
+    const def = (check as { _zod?: { def?: Record<string, unknown> } })?._zod?.def;
+    if (!def) continue;
+    switch (def.check) {
+      case 'max_length': {
+        const v = num(def.maximum);
+        if (v !== undefined) out.maxLength = tighterMax(out.maxLength, v);
+        break;
+      }
+      case 'min_length': {
+        const v = num(def.minimum);
+        if (v !== undefined) out.minLength = tighterMin(out.minLength, v);
+        break;
+      }
+      case 'length_equals': {
+        const v = num(def.length);
+        if (v !== undefined) {
+          out.minLength = tighterMin(out.minLength, v);
+          out.maxLength = tighterMax(out.maxLength, v);
+        }
+        break;
+      }
+      case 'less_than': {
+        const v = num(def.value);
+        if (v === undefined) break;
+        if (def.inclusive === false) out.exclusiveMaximum = tighterMax(out.exclusiveMaximum, v);
+        else out.maximum = tighterMax(out.maximum, v);
+        break;
+      }
+      case 'greater_than': {
+        const v = num(def.value);
+        if (v === undefined) break;
+        if (def.inclusive === false) out.exclusiveMinimum = tighterMin(out.exclusiveMinimum, v);
+        else out.minimum = tighterMin(out.minimum, v);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return out;
 }
 
 /** `minLength` / `maxLength` or `minItems` / `maxItems` for a string or array node. */
@@ -69,27 +120,21 @@ function lengthKeywords(
   minKey: 'minLength' | 'minItems',
   maxKey: 'maxLength' | 'maxItems',
 ): Record<string, number> {
-  const { minimum, maximum } = sizeBag(schema);
+  const { minLength, maxLength } = authoredBounds(schema);
   return {
-    ...(minimum !== undefined ? { [minKey]: minimum } : {}),
-    ...(maximum !== undefined ? { [maxKey]: maximum } : {}),
+    ...(minLength !== undefined ? { [minKey]: minLength } : {}),
+    ...(maxLength !== undefined ? { [maxKey]: maxLength } : {}),
   };
 }
 
-/**
- * `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum` for a number node.
- * `.int()` fills the bag with the safe-integer extremes; those are the format's
- * range, not a bound the author set, and are left out.
- */
+/** `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum` for a number node. */
 function numericKeywords(schema: ZodType): Record<string, number> {
-  const bag = sizeBag(schema);
-  const isFormatRange = (v: number | undefined): boolean =>
-    v === Number.MIN_SAFE_INTEGER || v === Number.MAX_SAFE_INTEGER;
+  const b = authoredBounds(schema);
   return {
-    ...(bag.minimum !== undefined && !isFormatRange(bag.minimum) ? { minimum: bag.minimum } : {}),
-    ...(bag.maximum !== undefined && !isFormatRange(bag.maximum) ? { maximum: bag.maximum } : {}),
-    ...(bag.exclusiveMinimum !== undefined ? { exclusiveMinimum: bag.exclusiveMinimum } : {}),
-    ...(bag.exclusiveMaximum !== undefined ? { exclusiveMaximum: bag.exclusiveMaximum } : {}),
+    ...(b.minimum !== undefined ? { minimum: b.minimum } : {}),
+    ...(b.maximum !== undefined ? { maximum: b.maximum } : {}),
+    ...(b.exclusiveMinimum !== undefined ? { exclusiveMinimum: b.exclusiveMinimum } : {}),
+    ...(b.exclusiveMaximum !== undefined ? { exclusiveMaximum: b.exclusiveMaximum } : {}),
   };
 }
 

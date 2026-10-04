@@ -212,13 +212,38 @@ describe('lowerZodToJsonSchema — size constraints (prompt-only structured outp
       exclusiveMinimum: 0,
       exclusiveMaximum: 1,
     });
-    // `.int()` fills the bag with the safe-integer range; only the author's bound shows.
+    // A number format check (`.int()`, `.int32()`) is a range, not an authored bound,
+    // and it must not hide a bound written before OR after it.
     expect(lowerZodToJsonSchema(z.number().int().min(1), { sizeConstraints: true })).toEqual({
       type: 'number',
       minimum: 1,
     });
+    const boundedInt = z.number().min(1).max(10).int();
+    expect(lowerZodToJsonSchema(boundedInt, { sizeConstraints: true })).toEqual({
+      type: 'number',
+      minimum: 1,
+      maximum: 10,
+    });
     expect(lowerZodToJsonSchema(z.number().int(), { sizeConstraints: true })).toEqual({
       type: 'number',
+    });
+    expect(lowerZodToJsonSchema(z.int32().max(5), { sizeConstraints: true })).toEqual({
+      type: 'number',
+      maximum: 5,
+    });
+    expect(lowerZodToJsonSchema(z.number().positive(), { sizeConstraints: true })).toEqual({
+      type: 'number',
+      exclusiveMinimum: 0,
+    });
+    expect(lowerZodToJsonSchema(z.string().nonempty(), { sizeConstraints: true })).toEqual({
+      type: 'string',
+      minLength: 1,
+    });
+    const nonEmptyList = z.array(z.string()).nonempty();
+    expect(lowerZodToJsonSchema(nonEmptyList, { sizeConstraints: true })).toEqual({
+      type: 'array',
+      items: { type: 'string' },
+      minItems: 1,
     });
   });
 
