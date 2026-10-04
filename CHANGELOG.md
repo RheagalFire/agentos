@@ -1,3 +1,7 @@
+## <small>0.10.31 (2026-10-04)</small>
+
+* fix(openrouter): declines and in-body errors reach the fallback walkers as typed errors (#62) ([11b2ce673afcccb491ecdf6d4c215dea729719ba](https://github.com/framerslab/agentos/commit/11b2ce673afcccb491ecdf6d4c215dea729719ba))
+
 ## <small>0.10.30 (2026-10-04)</small>
 
 * fix(storage): read a column before altering its table ([3878831610983d76a87d678063372ab3cda6eb44](https://github.com/framerslab/agentos/commit/3878831610983d76a87d678063372ab3cda6eb44))
