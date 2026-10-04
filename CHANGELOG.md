@@ -1,3 +1,10 @@
+## <small>0.10.29 (2026-10-04)</small>
+
+* fix(generateObject): the schema text the model reads carries the Zod size checks ([52680b4a3e05b1244bc1a463e628404365b23fdb](https://github.com/framerslab/agentos/commit/52680b4a3e05b1244bc1a463e628404365b23fdb))
+* fix(SchemaLowering): per-position tuple bounds and an integer type in the bounded lowering; a payload test that can fail ([2d3f7510d18bdca31e074d2dba82b51309761df4](https://github.com/framerslab/agentos/commit/2d3f7510d18bdca31e074d2dba82b51309761df4))
+* fix(SchemaLowering): read the size bounds from the node's checks, not the bag ([dbc5e5913c51dcf16a3a7b2e836cab6f6fc6376b](https://github.com/framerslab/agentos/commit/dbc5e5913c51dcf16a3a7b2e836cab6f6fc6376b))
+* fix(streamObject): the schema text carries the Zod size checks ([a61ed33a4ba3758746a9c231710c65cf55fdee03](https://github.com/framerslab/agentos/commit/a61ed33a4ba3758746a9c231710c65cf55fdee03))
+
 ## <small>0.10.28 (2026-10-02)</small>
 
 * fix(generateText): try each fallback leg once, and fail over on HTTP 529 ([9bffd8f11a19dde255716129e986e1ad0f7af402](https://github.com/framerslab/agentos/commit/9bffd8f11a19dde255716129e986e1ad0f7af402))
