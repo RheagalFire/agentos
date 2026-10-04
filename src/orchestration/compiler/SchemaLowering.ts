@@ -16,9 +16,82 @@
  *
  * Unsupported types fall through to an empty object `{}` — callers should treat that as
  * an "unknown / untyped" schema rather than an error.
+ *
+ * Size checks (`.min()` / `.max()` / `.length()` on strings and arrays, `.min()` /
+ * `.max()` on numbers) are dropped by default, because provider structured-output
+ * modes accept different keyword subsets and a rejected keyword fails the whole
+ * request. They are emitted on request ({@link LowerZodOptions.sizeConstraints}) for
+ * schema TEXT a model reads but no provider enforces: the prompt-only JSON path, where
+ * the lowered schema is the only place the model can learn a limit.
  */
 
 import type { ZodType } from 'zod';
+
+/** Options for {@link lowerZodToJsonSchema}. */
+export interface LowerZodOptions {
+  /**
+   * Emit the schema's size checks as JSON Schema keywords: `minLength` / `maxLength`
+   * on strings, `minItems` / `maxItems` on arrays, `minimum` / `maximum` (and the
+   * exclusive forms) on numbers. Default `false`: the default output is unchanged for
+   * every caller that hands the schema to a provider's structured-output mode.
+   */
+  sizeConstraints?: boolean;
+}
+
+/**
+ * The size bounds Zod v4 accumulates on a schema node from its checks (`_zod.bag`).
+ * Checks write the effective bound as they attach (`$ZodCheckMaxLength` and
+ * `$ZodCheckMinLength` for strings and arrays, `$ZodCheckGreaterThan` /
+ * `$ZodCheckLessThan` for numbers), so the bag already holds the tightest bound when
+ * several checks stack. Values are read defensively: the bag is an internal.
+ */
+function sizeBag(schema: ZodType): {
+  minimum?: number;
+  maximum?: number;
+  exclusiveMinimum?: number;
+  exclusiveMaximum?: number;
+} {
+  const bag = (schema as unknown as { _zod?: { bag?: Record<string, unknown> } })._zod?.bag;
+  if (!bag) return {};
+  const num = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+  return {
+    minimum: num(bag.minimum),
+    maximum: num(bag.maximum),
+    exclusiveMinimum: num(bag.exclusiveMinimum),
+    exclusiveMaximum: num(bag.exclusiveMaximum),
+  };
+}
+
+/** `minLength` / `maxLength` or `minItems` / `maxItems` for a string or array node. */
+function lengthKeywords(
+  schema: ZodType,
+  minKey: 'minLength' | 'minItems',
+  maxKey: 'maxLength' | 'maxItems',
+): Record<string, number> {
+  const { minimum, maximum } = sizeBag(schema);
+  return {
+    ...(minimum !== undefined ? { [minKey]: minimum } : {}),
+    ...(maximum !== undefined ? { [maxKey]: maximum } : {}),
+  };
+}
+
+/**
+ * `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum` for a number node.
+ * `.int()` fills the bag with the safe-integer extremes; those are the format's
+ * range, not a bound the author set, and are left out.
+ */
+function numericKeywords(schema: ZodType): Record<string, number> {
+  const bag = sizeBag(schema);
+  const isFormatRange = (v: number | undefined): boolean =>
+    v === Number.MIN_SAFE_INTEGER || v === Number.MAX_SAFE_INTEGER;
+  return {
+    ...(bag.minimum !== undefined && !isFormatRange(bag.minimum) ? { minimum: bag.minimum } : {}),
+    ...(bag.maximum !== undefined && !isFormatRange(bag.maximum) ? { maximum: bag.maximum } : {}),
+    ...(bag.exclusiveMinimum !== undefined ? { exclusiveMinimum: bag.exclusiveMinimum } : {}),
+    ...(bag.exclusiveMaximum !== undefined ? { exclusiveMaximum: bag.exclusiveMaximum } : {}),
+  };
+}
 
 /**
  * Converts a Zod schema instance to a plain JSON Schema object.
@@ -28,15 +101,25 @@ import type { ZodType } from 'zod';
  * is clean and does not contain Zod-specific metadata.
  *
  * @param schema - Any Zod schema instance.
+ * @param options - {@link LowerZodOptions}; omit for the default keyword set.
  * @returns A JSON Schema-compatible plain object.
  *
  * @example
  * ```ts
- * const jsonSchema = lowerZodToJsonSchema(z.object({ name: z.string(), age: z.number().optional() }));
- * // → { type: 'object', properties: { name: { type: 'string' }, age: { type: 'number' } }, required: ['name'] }
+ * lowerZodToJsonSchema(z.object({ name: z.string(), age: z.number().optional() }));
+ * // → { type: 'object',
+ * //     properties: { name: { type: 'string' }, age: { type: 'number' } },
+ * //     required: ['name'] }
+ * lowerZodToJsonSchema(z.string().max(120), { sizeConstraints: true });
+ * // → { type: 'string', maxLength: 120 }
  * ```
  */
-export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
+export function lowerZodToJsonSchema(
+  schema: ZodType,
+  options: LowerZodOptions = {},
+): Record<string, unknown> {
+  const lower = (inner: ZodType): Record<string, unknown> => lowerZodToJsonSchema(inner, options);
+  const sized = options.sizeConstraints === true;
   // Access Zod v4 internals via `_def`; the top-level `_def.type` is the discriminant.
   const def = (schema as any)._def as Record<string, unknown> | undefined;
   if (!def) return {};
@@ -46,10 +129,12 @@ export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
 
   switch (typeName) {
     case 'string':
-      return { type: 'string' };
+      return sized
+        ? { type: 'string', ...lengthKeywords(schema, 'minLength', 'maxLength') }
+        : { type: 'string' };
 
     case 'number':
-      return { type: 'number' };
+      return sized ? { type: 'number', ...numericKeywords(schema) } : { type: 'number' };
 
     case 'boolean':
       return { type: 'boolean' };
@@ -67,7 +152,8 @@ export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
       // Zod v4: def.element holds the inner schema instance.
       return {
         type: 'array',
-        items: lowerZodToJsonSchema(def.element as ZodType),
+        items: lower(def.element as ZodType),
+        ...(sized ? lengthKeywords(schema, 'minItems', 'maxItems') : {}),
       };
     }
 
@@ -79,7 +165,7 @@ export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
       const shape = def.shape as Record<string, ZodType>;
 
       for (const [key, fieldSchema] of Object.entries(shape)) {
-        properties[key] = lowerZodToJsonSchema(fieldSchema);
+        properties[key] = lower(fieldSchema);
 
         // A field is required unless its outermost wrapper is optional or has a default.
         const fieldType = ((fieldSchema as any)._def as Record<string, unknown> | undefined)?.type as string | undefined;
@@ -97,11 +183,11 @@ export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
 
     case 'optional':
       // Unwrap; optionality is expressed via absence from `required`, not in the field schema.
-      return lowerZodToJsonSchema(def.innerType as ZodType);
+      return lower(def.innerType as ZodType);
 
     case 'default':
       // Unwrap; defaults are runtime concerns, not JSON Schema concerns for our use case.
-      return lowerZodToJsonSchema(def.innerType as ZodType);
+      return lower(def.innerType as ZodType);
 
     case 'nullable': {
       // z.foo().nullable() — lower the inner schema and widen it with null.
@@ -115,7 +201,7 @@ export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
       // stays in the parent object's `required` array and the model must
       // emit it (possibly as null) — exactly the OpenAI-recommended shape
       // for strict-mode "optional-ish" fields.
-      const inner = lowerZodToJsonSchema(def.innerType as ZodType);
+      const inner = lower(def.innerType as ZodType);
       const innerKeys = Object.keys(inner);
       if (innerKeys.length === 0) {
         // Inner type itself is unsupported — stay untyped rather than
@@ -138,8 +224,8 @@ export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
       // typeless `anyOf` is safe across providers while still giving the model the
       // real variant shapes (previously a union lowered to `{}`, leaving the model
       // unguided and structured output validation failing).
-      const options = (def.options as ZodType[] | undefined) ?? [];
-      return { anyOf: options.map((opt) => lowerZodToJsonSchema(opt)) };
+      const variants = (def.options as ZodType[] | undefined) ?? [];
+      return { anyOf: variants.map((opt) => lower(opt)) };
     }
 
     case 'literal': {
@@ -155,7 +241,7 @@ export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
       // described by additionalProperties.
       return {
         type: 'object',
-        additionalProperties: lowerZodToJsonSchema(def.valueType as ZodType),
+        additionalProperties: lower(def.valueType as ZodType),
       };
     }
 
@@ -173,9 +259,9 @@ export function lowerZodToJsonSchema(schema: ZodType): Record<string, unknown> {
       // schema still validates the parsed output, so correctness holds; the
       // JSON schema only needs to guide the model.
       const members = ((def.items as ZodType[] | undefined) ?? []).map((m) =>
-        lowerZodToJsonSchema(m),
+        lower(m),
       );
-      const rest = def.rest ? lowerZodToJsonSchema(def.rest as ZodType) : undefined;
+      const rest = def.rest ? lower(def.rest as ZodType) : undefined;
       const candidates = [...members, ...(rest ? [rest] : [])];
       const unique = candidates.filter(
         (c, i) => candidates.findIndex((o) => JSON.stringify(o) === JSON.stringify(c)) === i,

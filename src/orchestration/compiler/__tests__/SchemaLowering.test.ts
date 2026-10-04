@@ -129,3 +129,108 @@ describe('lowerZodToJsonSchema — nullable (OpenAI strict-mode gap)', () => {
     expect(lowerZodToJsonSchema(z.unknown().nullable())).toEqual({});
   });
 });
+
+describe('lowerZodToJsonSchema — size constraints (prompt-only structured output)', () => {
+  const contract = z.object({
+    summary: z.string().min(1).max(2000),
+    tags: z.array(z.string().min(1).max(80)).max(16),
+    intents: z
+      .array(z.object({ trackId: z.string().max(120), intent: z.string().max(300) }))
+      .min(1)
+      .max(40),
+    score: z.number().min(0).max(10),
+    note: z.string().max(60).optional(),
+  });
+
+  it('drops every size check by default (provider payloads are unchanged)', () => {
+    const lowered = lowerZodToJsonSchema(contract);
+    expect(JSON.stringify(lowered)).not.toMatch(
+      /maxLength|minLength|maxItems|minItems|maximum|minimum/,
+    );
+    expect(lowered).toEqual({
+      type: 'object',
+      properties: {
+        summary: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' } },
+        intents: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: { trackId: { type: 'string' }, intent: { type: 'string' } },
+            required: ['trackId', 'intent'],
+          },
+        },
+        score: { type: 'number' },
+        note: { type: 'string' },
+      },
+      required: ['summary', 'tags', 'intents', 'score'],
+    });
+  });
+
+  it('emits string, array and number bounds on request, through wrappers and nesting', () => {
+    expect(lowerZodToJsonSchema(contract, { sizeConstraints: true })).toEqual({
+      type: 'object',
+      properties: {
+        summary: { type: 'string', minLength: 1, maxLength: 2000 },
+        tags: {
+          type: 'array',
+          items: { type: 'string', minLength: 1, maxLength: 80 },
+          maxItems: 16,
+        },
+        intents: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              trackId: { type: 'string', maxLength: 120 },
+              intent: { type: 'string', maxLength: 300 },
+            },
+            required: ['trackId', 'intent'],
+          },
+          minItems: 1,
+          maxItems: 40,
+        },
+        score: { type: 'number', minimum: 0, maximum: 10 },
+        note: { type: 'string', maxLength: 60 },
+      },
+      required: ['summary', 'tags', 'intents', 'score'],
+    });
+  });
+
+  it('keeps the tightest bound when checks stack, and the exclusive numeric forms', () => {
+    expect(lowerZodToJsonSchema(z.string().max(100).max(40), { sizeConstraints: true })).toEqual({
+      type: 'string',
+      maxLength: 40,
+    });
+    expect(lowerZodToJsonSchema(z.string().length(8), { sizeConstraints: true })).toEqual({
+      type: 'string',
+      minLength: 8,
+      maxLength: 8,
+    });
+    expect(lowerZodToJsonSchema(z.number().gt(0).lt(1), { sizeConstraints: true })).toEqual({
+      type: 'number',
+      exclusiveMinimum: 0,
+      exclusiveMaximum: 1,
+    });
+    // `.int()` fills the bag with the safe-integer range; only the author's bound shows.
+    expect(lowerZodToJsonSchema(z.number().int().min(1), { sizeConstraints: true })).toEqual({
+      type: 'number',
+      minimum: 1,
+    });
+    expect(lowerZodToJsonSchema(z.number().int(), { sizeConstraints: true })).toEqual({
+      type: 'number',
+    });
+  });
+
+  it('leaves an unbounded node and a tuple as they were', () => {
+    expect(lowerZodToJsonSchema(z.string(), { sizeConstraints: true })).toEqual({ type: 'string' });
+    expect(lowerZodToJsonSchema(z.array(z.number()), { sizeConstraints: true })).toEqual({
+      type: 'array',
+      items: { type: 'number' },
+    });
+    const pair = z.tuple([z.string(), z.string()]);
+    expect(lowerZodToJsonSchema(pair, { sizeConstraints: true })).toEqual(
+      lowerZodToJsonSchema(pair),
+    );
+  });
+});

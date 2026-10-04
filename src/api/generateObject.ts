@@ -639,13 +639,22 @@ export async function generateObject<T extends ZodType>(
     ? `${opts.schemaName ?? 'response'}Envelope`
     : opts.schemaName;
 
-  // Convert the Zod schema to JSON Schema for the system prompt.
-  // Uses the hand-rolled SchemaLowering converter to avoid extra dependencies.
+  // Convert the Zod schema to JSON Schema. Two lowerings of the same schema:
+  // `jsonSchema` is the provider payload (tool input_schema, strict
+  // json_schema, responseSchema) and keeps the keyword set every provider's
+  // structured-output mode accepts; `promptJsonSchema` is the TEXT the model
+  // reads in the system prompt and carries the Zod size checks as well
+  // (`maxLength`, `maxItems`, `maximum`, ...). On the prompt-only path (the
+  // Anthropic models that reject a forced tool_choice) that text is the only
+  // place the model can learn a limit: without it a reply over any `.max()`
+  // failed validation on every attempt, and the caller saw only "Failed to
+  // generate valid structured output" (wilds codegen, 2026-10-03).
   const jsonSchema = lowerZodToJsonSchema(effectiveSchema);
+  const promptJsonSchema = lowerZodToJsonSchema(effectiveSchema, { sizeConstraints: true });
 
   const systemPrompt = buildSchemaSystemPrompt(
     opts.system,
-    jsonSchema,
+    promptJsonSchema,
     effectiveSchemaName,
     opts.schemaDescription,
     opts.schemaCacheTtl,
