@@ -363,8 +363,10 @@ export function streamObject<T extends ZodType>(
     resolveUsage = res;
   });
 
-  // Convert the Zod schema to JSON Schema for the system prompt
-  const jsonSchema = lowerZodToJsonSchema(opts.schema);
+  // Convert the Zod schema to JSON Schema for the system prompt. Streaming
+  // has no provider-side structured-output payload: this text is the only
+  // schema the model ever sees, so it carries the Zod size checks too.
+  const jsonSchema = lowerZodToJsonSchema(opts.schema, { sizeConstraints: true });
 
   const systemPrompt = buildSchemaSystemPrompt(
     opts.system,

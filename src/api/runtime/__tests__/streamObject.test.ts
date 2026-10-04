@@ -231,3 +231,36 @@ describe('streamObject', () => {
     expect(text).toContain('"Dan"');
   });
 });
+
+describe('streamObject — the schema text carries the Zod size checks (2026-10-03)', () => {
+  beforeEach(() => {
+    hoisted.generateCompletionStream.mockReset();
+  });
+
+  it('puts the size limits in the system prompt (streaming has no provider payload to carry them)', async () => {
+    hoisted.generateCompletionStream.mockImplementationOnce(async function* () {
+      yield textChunk('{"name": "A", "hobbies": ["x"]}', {
+        isFinal: true,
+        usage: { promptTokens: 5, completionTokens: 5, totalTokens: 10 },
+      });
+    });
+    const bounded = z.object({
+      name: z.string().max(40),
+      hobbies: z.array(z.string()).min(1).max(3),
+    });
+
+    const result = streamObject({ schema: bounded, prompt: 'Create a profile' });
+    for await (const _partial of result.partialObjectStream) {
+      // drain the stream so the provider call is made and the object resolves
+    }
+    await expect(result.object).resolves.toEqual({ name: 'A', hobbies: ['x'] });
+
+    const messages = hoisted.generateCompletionStream.mock.calls[0][1];
+    const systemMsg = messages.find((m: Record<string, unknown>) => m.role === 'system');
+    const text =
+      typeof systemMsg?.content === 'string' ? systemMsg.content : JSON.stringify(systemMsg?.content);
+    expect(text).toContain('"maxLength": 40');
+    expect(text).toContain('"minItems": 1');
+    expect(text).toContain('"maxItems": 3');
+  });
+});
