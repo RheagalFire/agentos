@@ -165,7 +165,7 @@ const team = agency({
 const result = await team.generate('Compare TCP vs UDP for game networking.');
 ```
 
-Strategies: `sequential`, `parallel`, `debate`, `review-loop`, `hierarchical`, `graph`. With `hierarchical` + `emergent: { enabled: true }`, the manager forges new sub-agents at runtime. [Multi-agent docs ->](https://docs.agentos.sh/features/agency-api)
+Strategies: `sequential`, `parallel`, `debate`, `review-loop`, `hierarchical`, `graph`. With `hierarchical` + `emergent: { enabled: true }`, the manager forges new sub-agents at runtime. Every roster agent can set its own `provider`, `model`, `apiKey` and `effort`; a `parallel` agency can require a provider quorum (`quorum: { minProviders: 2 }`) before it synthesizes. [Multi-agent docs ->](https://docs.agentos.sh/features/agency-api)
 
 ---
 
@@ -202,7 +202,7 @@ Three layers, highest priority first: inline `apiKey` on the call, a module-leve
 - **`generateText()` / `streamText()` / `generateObject()` / `generateImage()` / `generateVideo()` / `generateMusic()` / `performOCR()` / `embedText()`**: low-level multi-modal helpers with native tool calling.
 - **`workflow()` / `AgentGraph` / `mission()`**: three orchestration authoring APIs over one graph runtime.
 
-Provider fallback is an explicit opt-in via `agent({ fallbackProviders: [...] })`; the runtime never silently retries against a different provider unless you configure a chain.
+Provider fallback is on by default: when a call fails with a retryable error, it is retried on the other providers whose keys are in the environment. Pass `fallbackProviders: []` to turn it off, or a list to set the chain yourself.
 
 [Full API reference ->](https://docs.agentos.sh/api) * [High-Level API guide ->](https://docs.agentos.sh/getting-started/high-level-api)
 
