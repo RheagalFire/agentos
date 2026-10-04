@@ -1032,6 +1032,29 @@ describe('generateObject — the schema text carries the Zod size checks (2026-1
     expect(text).toContain('"maxItems": 3');
   });
 
+  it('OpenAI strict payload stays free of size keywords while the text has them', async () => {
+    // The openai and openrouter branches are the ones that consume the lowered
+    // `jsonSchema` for their payload (the Anthropic branch lowers the schema
+    // again itself), so this is the case that fails if the bounded lowering is
+    // ever handed to the payload builder: strict mode accepts `maxLength` and
+    // the request would carry it.
+    const { resolveModelOption } = await import('../../model.js');
+    vi.mocked(resolveModelOption).mockReturnValueOnce({ providerId: 'openai', modelId: 'gpt-4o' });
+    hoisted.generateCompletion.mockResolvedValueOnce(mockResponse('{"title": "T", "tags": ["a"]}'));
+
+    await generateObject({
+      schema: boundedSchema,
+      schemaName: 'Bounded',
+      prompt: 'Make one',
+    });
+
+    const args = hoisted.generateCompletion.mock.calls[0][2];
+    const payload = JSON.stringify(args.responseFormat);
+    expect(payload).toContain('"json_schema"');
+    expect(payload).not.toMatch(/maxLength|minItems|maxItems/);
+    expect(systemText()).toContain('"maxLength": 40');
+  });
+
   it('forced-tool path: the provider payload stays free of size keywords while the text has them', async () => {
     const { resolveModelOption } = await import('../../model.js');
     vi.mocked(resolveModelOption).mockReturnValueOnce({

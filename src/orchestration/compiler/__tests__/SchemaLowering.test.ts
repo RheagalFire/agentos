@@ -215,22 +215,26 @@ describe('lowerZodToJsonSchema — size constraints (prompt-only structured outp
     // A number format check (`.int()`, `.int32()`) is a range, not an authored bound,
     // and it must not hide a bound written before OR after it.
     expect(lowerZodToJsonSchema(z.number().int().min(1), { sizeConstraints: true })).toEqual({
-      type: 'number',
+      type: 'integer',
       minimum: 1,
     });
     const boundedInt = z.number().min(1).max(10).int();
     expect(lowerZodToJsonSchema(boundedInt, { sizeConstraints: true })).toEqual({
-      type: 'number',
+      type: 'integer',
       minimum: 1,
       maximum: 10,
     });
     expect(lowerZodToJsonSchema(z.number().int(), { sizeConstraints: true })).toEqual({
-      type: 'number',
+      type: 'integer',
     });
     expect(lowerZodToJsonSchema(z.int32().max(5), { sizeConstraints: true })).toEqual({
-      type: 'number',
+      type: 'integer',
       maximum: 5,
     });
+    expect(lowerZodToJsonSchema(z.float64(), { sizeConstraints: true })).toEqual({ type: 'number' });
+    // The default lowering never says integer: provider payloads are unchanged.
+    expect(lowerZodToJsonSchema(z.number().int())).toEqual({ type: 'number' });
+    expect(lowerZodToJsonSchema(z.int32().max(5))).toEqual({ type: 'number' });
     expect(lowerZodToJsonSchema(z.number().positive(), { sizeConstraints: true })).toEqual({
       type: 'number',
       exclusiveMinimum: 0,
@@ -247,15 +251,38 @@ describe('lowerZodToJsonSchema — size constraints (prompt-only structured outp
     });
   });
 
-  it('leaves an unbounded node and a tuple as they were', () => {
+  it('leaves an unbounded node as it was', () => {
     expect(lowerZodToJsonSchema(z.string(), { sizeConstraints: true })).toEqual({ type: 'string' });
     expect(lowerZodToJsonSchema(z.array(z.number()), { sizeConstraints: true })).toEqual({
       type: 'array',
       items: { type: 'number' },
     });
-    const pair = z.tuple([z.string(), z.string()]);
-    expect(lowerZodToJsonSchema(pair, { sizeConstraints: true })).toEqual(
-      lowerZodToJsonSchema(pair),
-    );
+  });
+
+  it('keeps each tuple position apart with its own bounds (prompt text only)', () => {
+    const pair = z.tuple([z.string().max(5), z.string().max(50)]);
+    expect(lowerZodToJsonSchema(pair, { sizeConstraints: true })).toEqual({
+      type: 'array',
+      prefixItems: [
+        { type: 'string', maxLength: 5 },
+        { type: 'string', maxLength: 50 },
+      ],
+      minItems: 2,
+      maxItems: 2,
+    });
+    const withRest = z.tuple([z.string()]).rest(z.number().max(3));
+    expect(lowerZodToJsonSchema(withRest, { sizeConstraints: true })).toEqual({
+      type: 'array',
+      prefixItems: [{ type: 'string' }],
+      items: { type: 'number', maximum: 3 },
+      minItems: 1,
+    });
+    // The default lowering keeps the collapsed shape strict provider modes accept.
+    expect(lowerZodToJsonSchema(pair)).toEqual({
+      type: 'array',
+      items: { type: 'string' },
+      minItems: 2,
+      maxItems: 2,
+    });
   });
 });

@@ -127,6 +127,22 @@ function lengthKeywords(
   };
 }
 
+/**
+ * True when the node carries an integer number format (`z.int()`, `z.int32()`,
+ * `z.number().int()`): the format lives on the node's own def for the format
+ * schemas and on a `number_format` check for the method form.
+ */
+function isIntegerFormat(schema: ZodType): boolean {
+  const def = (schema as unknown as { _zod?: { def?: Record<string, unknown> } })._zod?.def;
+  const isInt = (v: unknown): boolean => typeof v === 'string' && v.includes('int');
+  if (isInt(def?.format)) return true;
+  const checks = Array.isArray(def?.checks) ? (def?.checks as unknown[]) : [];
+  return checks.some((check) => {
+    const cd = (check as { _zod?: { def?: Record<string, unknown> } })?._zod?.def;
+    return cd?.check === 'number_format' && isInt(cd.format);
+  });
+}
+
 /** `minimum` / `maximum` / `exclusiveMinimum` / `exclusiveMaximum` for a number node. */
 function numericKeywords(schema: ZodType): Record<string, number> {
   const b = authoredBounds(schema);
@@ -179,7 +195,11 @@ export function lowerZodToJsonSchema(
         : { type: 'string' };
 
     case 'number':
-      return sized ? { type: 'number', ...numericKeywords(schema) } : { type: 'number' };
+      // Bounded mode is prompt text, so an integer format can say so; the
+      // default stays `number` for the provider payloads.
+      return sized
+        ? { type: isIntegerFormat(schema) ? 'integer' : 'number', ...numericKeywords(schema) }
+        : { type: 'number' };
 
     case 'boolean':
       return { type: 'boolean' };
@@ -307,6 +327,19 @@ export function lowerZodToJsonSchema(
         lower(m),
       );
       const rest = def.rest ? lower(def.rest as ZodType) : undefined;
+      if (sized) {
+        // Bounded mode is prompt text that no strict provider mode parses, so
+        // the per-position schemas can stay apart (draft 2020-12 prefixItems)
+        // and each member keeps its own bounds; collapsing them into one
+        // `items` would read a 5-character slot as a 50-character one.
+        return {
+          type: 'array',
+          prefixItems: members,
+          ...(rest ? { items: rest } : {}),
+          minItems: members.length,
+          ...(rest ? {} : { maxItems: members.length }),
+        };
+      }
       const candidates = [...members, ...(rest ? [rest] : [])];
       const unique = candidates.filter(
         (c, i) => candidates.findIndex((o) => JSON.stringify(o) === JSON.stringify(c)) === i,
