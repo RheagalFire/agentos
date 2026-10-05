@@ -1,3 +1,8 @@
+## <small>0.10.33 (2026-10-05)</small>
+
+* fix(nlp): read natural's members when the built package runs under plain Node (#68) ([66c76ce7c94c6fe33579d0e6c399e6df1ba8a8a1](https://github.com/framerslab/agentos/commit/66c76ce7c94c6fe33579d0e6c399e6df1ba8a8a1))
+* docs: contributor guides, issue and pull request templates, agent instructions (#65) ([1546eb18252b76316bb8b5b1dc2eec032710dd9e](https://github.com/framerslab/agentos/commit/1546eb18252b76316bb8b5b1dc2eec032710dd9e))
+
 ## <small>0.10.32 (2026-10-05)</small>
 
 * fix(llm): context-window rejections walk, server stream errors are retryable, hermes-3-70b lists no tools (#66) ([b34e7d41354e8b9f320f2139a50b3ef018bb43e3](https://github.com/framerslab/agentos/commit/b34e7d41354e8b9f320f2139a50b3ef018bb43e3))
