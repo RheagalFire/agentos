@@ -1,3 +1,7 @@
+## <small>0.10.34 (2026-10-05)</small>
+
+* fix(streamText): a failed fallback leg hands the walk to the next one (#67) ([34eeac494485eda2d110674fde5ca457e0fb40c5](https://github.com/framerslab/agentos/commit/34eeac494485eda2d110674fde5ca457e0fb40c5))
+
 ## <small>0.10.33 (2026-10-05)</small>
 
 * fix(nlp): read natural's members when the built package runs under plain Node (#68) ([66c76ce7c94c6fe33579d0e6c399e6df1ba8a8a1](https://github.com/framerslab/agentos/commit/66c76ce7c94c6fe33579d0e6c399e6df1ba8a8a1))
