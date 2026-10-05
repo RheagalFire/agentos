@@ -1,3 +1,7 @@
+## <small>0.10.32 (2026-10-05)</small>
+
+* fix(llm): context-window rejections walk, server stream errors are retryable, hermes-3-70b lists no tools (#66) ([b34e7d41354e8b9f320f2139a50b3ef018bb43e3](https://github.com/framerslab/agentos/commit/b34e7d41354e8b9f320f2139a50b3ef018bb43e3))
+
 ## <small>0.10.31 (2026-10-04)</small>
 
 * fix(openrouter): declines and in-body errors reach the fallback walkers as typed errors (#62) ([11b2ce673afcccb491ecdf6d4c215dea729719ba](https://github.com/framerslab/agentos/commit/11b2ce673afcccb491ecdf6d4c215dea729719ba))
