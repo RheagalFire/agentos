@@ -21,6 +21,10 @@ import {
   addModelUsage,
   hasBillableUsage,
   isRetryableError,
+  markChainWalked,
+  markToolsRan,
+  chainWalkedBefore,
+  toolsRanBefore,
   usageOfError,
   resolveChainOfThought,
   type GenerateTextOptions,
@@ -51,6 +55,18 @@ async function recordAgentOSUsageLazy(
 }
 
 /** Adds one {@link TokenUsage} to another; optional counters add when present. */
+/**
+ * The HTTP status a provider error chunk names in a numeric code: Gemini's
+ * in-stream errors carry `code: 500` beside `type: 'INTERNAL'`. A 401 or 403
+ * inside a stream describes an upstream attempt, not this key, so it is not
+ * read as a status (the health registry would open its auth policy on it).
+ */
+function statusOfChunkCode(code: unknown): number | undefined {
+  return typeof code === 'number' && Number.isInteger(code) && code >= 400 && code <= 599 && code !== 401 && code !== 403
+    ? code
+    : undefined;
+}
+
 function addTokenUsage(target: TokenUsage, add: TokenUsage): void {
   target.promptTokens += add.promptTokens;
   target.completionTokens += add.completionTokens;
@@ -158,7 +174,12 @@ export interface StreamTextResult {
   textStream: AsyncIterable<string>;
   /** Async iterable that yields all {@link StreamPart} events in order. */
   fullStream: AsyncIterable<StreamPart>;
-  /** Resolves to the fully assembled assistant reply when the stream completes. */
+  /**
+   * Resolves to the assembled assistant reply when the stream completes: the
+   * text of the latest step that produced any. A stream that ends mid-step,
+   * on an error after output or because the consumer stopped reading,
+   * resolves to the text that step delivered.
+   */
   text: Promise<string>;
   /** Resolves to aggregated {@link TokenUsage} when the stream completes. */
   usage: Promise<TokenUsage>;
@@ -209,9 +230,10 @@ export interface StreamTextResult {
    * chunk `choices[0].finishReason`; Anthropic maps `max_tokens` →
    * `length` in its adapter). Settled via the generator's cleanup on
    * early abandonment too, so awaiting it after a partial consume does
-   * not hang — though like `text`/`usage` it is only meaningful after a
-   * full drain. The prompt-shim tool-emulation path reports `'stop'`
-   * (its internal calls do not thread per-step reasons).
+   * not hang. On a stream the consumer abandoned it does not say why the
+   * stream ended: it reports the latest step that finished. The
+   * prompt-shim tool-emulation path reports `'stop'` (its internal calls
+   * do not thread per-step reasons).
    */
   finishReason: Promise<StreamFinishReason>;
   /**
@@ -368,15 +390,17 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
     // that reports the step's cumulative usage is not counted twice.
     let stepUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
     let finalText = '';
+    // Text of the step in progress, as the consumer received it. A stream
+    // that ends mid-step reports it as its text: the consumer already has it.
+    let stepTextSoFar = '';
     let metricStatus: 'ok' | 'error' = 'ok';
-    // True when a provider-fallback leg served this stream. The recursive
-    // leg call fires its own usage-observer event (leg provider/model,
-    // fallbackDepth stamped), so the outer finally must NOT fire a second
-    // aggregate event: recordedProviderId/ModelId still name the FAILED
-    // primary and opts.__fallbackDepth is absent at the top level, so the
-    // duplicate re-billed the leg's folded usage under the dead primary as
-    // unstamped primary traffic (the 2026-07-20..26 misattribution shape).
-    let fallbackServedStream = false;
+    // True once a provider-fallback leg ran, served or failed. Each leg is a
+    // recursive streamText call that meters its own attempt (usage-observer
+    // event and ledger row, leg provider/model, fallbackDepth stamped), so
+    // the outer finally meters only this call's own attempt (attemptUsage):
+    // recordedProviderId/ModelId name this attempt's provider, and folding a
+    // leg's usage in would bill it twice under that provider.
+    let fallbackLegRan = false;
     // What the failed attempt consumed before a fallback leg took over. The
     // leg meters itself, so this is what the outer stream meters then.
     let attemptUsage: TokenUsage | undefined;
@@ -781,6 +805,7 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
         );
 
         const reconstructor = new StreamingReconstructor();
+        stepTextSoFar = '';
 
         try {
           for await (const chunk of stream) {
@@ -799,6 +824,7 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
             if (textDelta) {
               const part: StreamPart = { type: 'text', text: textDelta };
               parts.push(part);
+              stepTextSoFar += textDelta;
               yield part;
               streamedAnyText = true;
             }
@@ -878,15 +904,36 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
             // /v1/responses response carries its usage), and the result,
             // the usage ledger and the observer read `usage`.
             if (chunk.error) {
-              const error = new Error(chunk.error.message);
-              const part: StreamPart = { type: 'error', error };
-              parts.push(part);
-              yield part;
+              // The error keeps what the provider classified, so the retry
+              // classifier and the health registry read the fields a thrown
+              // provider error carries.
+              const chunkStatus = statusOfChunkCode(chunk.error.code);
+              const error: Error = Object.assign(new Error(chunk.error.message), {
+                ...(chunk.error.type !== undefined ? { type: chunk.error.type } : {}),
+                ...(chunk.error.code !== undefined ? { code: chunk.error.code } : {}),
+                ...(chunkStatus !== undefined ? { httpStatus: chunkStatus } : {}),
+                ...(chunk.error.details !== undefined ? { details: chunk.error.details } : {}),
+              });
+              const aborted = chunk.error.type === 'abort';
+              // Before anything reached the consumer, a provider error is this
+              // attempt failing: thrown, it is recorded with the health
+              // registry and walked like any thrown error. An abort is the
+              // caller's own stop and never walks.
+              if (!aborted && firstPartAt === undefined && !shimRanTool) throw error;
+              // After output the stream ends here, and the failure is recorded.
+              if (!aborted && recordedProviderId) {
+                globalLLMProviderHealth.recordFailure(recordedProviderId, error);
+              }
+              // Settled before the error part is handed over: a consumer that
+              // stops reading at it still finds the stream failed.
               metricStatus = 'error';
-              resolveText!(finalText);
+              resolveText!(stepTextSoFar || finalText);
               resolveUsage!(usage); resolveResponseModel!(lastResponseModelId); resolveServiceTier!(lastServiceTier);
               resolveToolCalls!(allToolCalls);
               resolveFinishReason!('error');
+              const part: StreamPart = { type: 'error', error };
+              parts.push(part);
+              yield part;
               return;
             }
           }
@@ -964,6 +1011,8 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
         if (effectiveStepText) {
           finalText = effectiveStepText;
         }
+        // The step's text is settled; finalText reports it from here on.
+        stepTextSoFar = '';
 
         if (!streamedToolCalls || streamedToolCalls.length === 0) {
           const stepFinish = normalizeStreamFinishReason(lastStepFinishReason);
@@ -1203,7 +1252,10 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
       const deliveredOutput = firstPartAt !== undefined || shimRanTool;
       if (effectiveFallbacks.length && isRetryableError(error) && !deliveredOutput) {
         let lastFallbackError: Error = error;
-        let fallbackSucceeded = false;
+        // How the walk ended: a leg served the stream; a leg failed after it
+        // delivered output (its error part already reached the consumer); or
+        // no leg delivered anything.
+        let outcome: 'served' | 'failed-after-output' | 'exhausted' = 'exhausted';
         let fallbackFinishReason: StreamFinishReason = 'stop';
         let attempt = 0;
 
@@ -1224,6 +1276,10 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
             });
             continue;
           }
+          // Whether this leg handed the consumer a part, and the error it
+          // reported before it did.
+          let legDelivered = false;
+          let legError: Error | undefined;
           try {
             fallbackLogger.info('streaming provider fallback triggered', {
               event: 'fallback_fired',
@@ -1261,35 +1317,57 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
               // passes [] -> explicit opt-out -> the recursion throws
               // instead of looping.
               fallbackProviders: effectiveFallbacks.slice(attempt),
-              onFallback: undefined,
+              // The leg reports the hops of its own walk, as generateText's
+              // legs do, so every hop is reported once.
             });
+            // The leg meters its own attempt from here on, served or failed.
+            fallbackLegRan = true;
 
-            // Pipe all parts from the fallback stream to the consumer
-            for await (const fbPart of fallbackResult.fullStream) {
-              parts.push(fbPart);
-              yield fbPart;
+            // A leg reports its failure as an error part. Before the leg
+            // delivered anything, that part is held back and the walk moves
+            // on, so the consumer sees one terminal error at most. After
+            // output it is the stream's terminal error; nothing is replayed.
+            try {
+              for await (const fbPart of fallbackResult.fullStream) {
+                if (fbPart.type === 'error' && !legDelivered) {
+                  legError = fbPart.error;
+                  continue;
+                }
+                legDelivered = true;
+                // An error part after the leg's output ends this stream too;
+                // marked before it is handed over, so a consumer that stops
+                // reading at it finds the stream failed.
+                if (fbPart.type === 'error') metricStatus = 'error';
+                parts.push(fbPart);
+                yield fbPart;
+              }
+            } finally {
+              // This call's result usage covers every attempt, a leg the
+              // consumer abandoned mid-stream included: closing the loop
+              // above ran the leg's finally, which settled its usage and its
+              // text. The leg's text is what the consumer received from it,
+              // served, failed after output or abandoned.
+              addTokenUsage(usage, await fallbackResult.usage);
+              finalText = await fallbackResult.text;
             }
 
-            // Resolve aggregated promises from the fallback stream
-            finalText = await fallbackResult.text;
-            const fbUsage = await fallbackResult.usage;
-            usage.promptTokens += fbUsage.promptTokens;
-            usage.completionTokens += fbUsage.completionTokens;
-            usage.totalTokens += fbUsage.totalTokens;
-            if (typeof fbUsage.costUSD === 'number') {
-              usage.costUSD = (usage.costUSD ?? 0) + fbUsage.costUSD;
+            if (legError) {
+              lastFallbackError = legError;
+              // The leg ran tools before it failed, or it walked every entry
+              // after it: walking on would run the tools again or repeat the
+              // entries it already walked. An abort is the caller's stop.
+              if (
+                toolsRanBefore(legError) ||
+                chainWalkedBefore(legError) ||
+                (legError as { type?: unknown }).type === 'abort'
+              ) {
+                break;
+              }
+              continue;
             }
-            if (typeof fbUsage.cacheReadTokens === 'number') {
-              usage.cacheReadTokens = (usage.cacheReadTokens ?? 0) + fbUsage.cacheReadTokens;
-            }
-            if (typeof fbUsage.cacheCreationTokens === 'number') {
-              usage.cacheCreationTokens = (usage.cacheCreationTokens ?? 0) + fbUsage.cacheCreationTokens;
-            }
-            if (typeof fbUsage.inclusiveInputTokens === 'number') {
-              usage.inclusiveInputTokens = (usage.inclusiveInputTokens ?? 0) + fbUsage.inclusiveInputTokens;
-            }
-            // Adopt the fallback stream's response identity (spec batch-1
-            // review fold): the fallback is the run that actually answered.
+
+            // Adopt the leg's response identity: the leg is the run that
+            // answered.
             const fbResponseModel = await fallbackResult.responseModel;
             if (fbResponseModel) lastResponseModelId = fbResponseModel;
             const fbServiceTier = await fallbackResult.serviceTier;
@@ -1297,39 +1375,66 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
 
             const fbToolCalls = await fallbackResult.toolCalls;
             allToolCalls.push(...fbToolCalls);
-            // The recursive fallback streamText computed its own reason;
-            // capture it while the result is in scope (drained above, so
-            // the promise is already settled).
+            // The recursive leg computed its own reason; the stream was
+            // drained above, so the promise is already settled.
             fallbackFinishReason = await fallbackResult.finishReason;
             if (opts.cacheDiagnostics) {
-              // Adopt the fallback run's verdict + thread key. Resolving with
-              // the child promises locks ours to follow them; the outer
+              // Adopt the leg's verdict + thread key. Resolving with the
+              // child promises locks ours to follow them; the outer
               // finally's later settle is then a no-op.
               resolveCacheDiagnostics!(fallbackResult.cacheDiagnostics);
               resolveProviderMessageId!(fallbackResult.providerMessageId);
             }
 
-            fallbackLogger.info('streaming provider fallback succeeded', {
-              event: 'fallback_succeeded',
-              api: 'streamText',
-              primaryProvider: recordedProviderId,
-              fallbackProvider: fb.provider,
-              fallbackModel: fb.model,
-              attempt,
-            });
-            fallbackSucceeded = true;
-            fallbackServedStream = true;
+            if (fallbackFinishReason === 'error') {
+              outcome = 'failed-after-output';
+              fallbackLogger.warn('streaming provider fallback failed after output', {
+                event: 'fallback_failed_after_output',
+                api: 'streamText',
+                primaryProvider: recordedProviderId,
+                fallbackProvider: fb.provider,
+                fallbackModel: fb.model,
+                attempt,
+              });
+            } else {
+              outcome = 'served';
+              fallbackLogger.info('streaming provider fallback succeeded', {
+                event: 'fallback_succeeded',
+                api: 'streamText',
+                primaryProvider: recordedProviderId,
+                fallbackProvider: fb.provider,
+                fallbackModel: fb.model,
+                attempt,
+              });
+            }
             break;
           } catch (fbErr: any) {
-            lastFallbackError = fbErr instanceof Error ? fbErr: new Error(String(fbErr));
+            lastFallbackError = fbErr instanceof Error ? fbErr : new Error(String(fbErr));
+            if (legDelivered) {
+              // Output already reached the consumer: this error ends the
+              // stream and nothing is replayed.
+              outcome = 'failed-after-output';
+              metricStatus = 'error';
+              const errorPart: StreamPart = { type: 'error', error: lastFallbackError };
+              parts.push(errorPart);
+              yield errorPart;
+              break;
+            }
+            if (toolsRanBefore(lastFallbackError) || chainWalkedBefore(lastFallbackError)) break;
           }
         }
 
-        if (fallbackSucceeded) {
+        if (outcome === 'served') {
           resolveText!(finalText);
           resolveUsage!(usage); resolveResponseModel!(lastResponseModelId); resolveServiceTier!(lastServiceTier);
           resolveToolCalls!(allToolCalls);
           resolveFinishReason!(fallbackFinishReason);
+        } else if (outcome === 'failed-after-output') {
+          metricStatus = 'error';
+          resolveText!(finalText);
+          resolveUsage!(usage); resolveResponseModel!(lastResponseModelId); resolveServiceTier!(lastServiceTier);
+          resolveToolCalls!(allToolCalls);
+          resolveFinishReason!('error');
         } else {
           fallbackLogger.warn('streaming provider fallbacks exhausted', {
             event: 'fallback_exhausted',
@@ -1340,7 +1445,10 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
             errorMessage: lastFallbackError.message.slice(0, 200),
           });
           metricStatus = 'error';
-          const errorPart: StreamPart = { type: 'error', error: lastFallbackError };
+          // Marked so a walker that called this one as a leg stops instead of
+          // walking the same remaining entries again.
+          const terminal = markChainWalked(lastFallbackError) as Error;
+          const errorPart: StreamPart = { type: 'error', error: terminal };
           parts.push(errorPart);
           yield errorPart;
           resolveText!(finalText);
@@ -1350,10 +1458,13 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
         }
       } else {
         metricStatus = 'error';
-        const part: StreamPart = { type: 'error', error };
+        // Marked so a walker that called this one as a leg does not run the
+        // tools again on another provider.
+        const terminal = (shimRanTool ? markToolsRan(error) : error) as Error;
+        const part: StreamPart = { type: 'error', error: terminal };
         parts.push(part);
         yield part;
-        resolveText!(finalText);
+        resolveText!(stepTextSoFar || finalText);
         resolveUsage!(usage); resolveResponseModel!(lastResponseModelId); resolveServiceTier!(lastServiceTier);
         resolveToolCalls!(allToolCalls);
         resolveFinishReason!('error');
@@ -1369,7 +1480,7 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
       // to await text/usage/toolCalls without hanging. Values reflect what
       // streamed before the abandonment; normal completions already settled
       // these, making the calls no-ops (first settle wins).
-      resolveText!(finalText);
+      resolveText!(stepTextSoFar || finalText);
       resolveUsage!(usage); resolveResponseModel!(lastResponseModelId); resolveServiceTier!(lastServiceTier);
       resolveToolCalls!(allToolCalls);
       resolveProviderId!(recordedProviderId ?? '');
@@ -1417,8 +1528,8 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
         await recordAgentOSUsageLazy({
           providerId: recordedProviderId,
           modelId: recordedModelId,
-          // A fallback leg recorded its own usage; this row is the attempt's.
-          usage: fallbackServedStream && attemptUsage ? attemptUsage : usage,
+          // A fallback leg recorded its own usage; this row is this attempt's.
+          usage: fallbackLegRan && attemptUsage ? attemptUsage : usage,
           options: {
             ...opts.usageLedger,
             source: opts.usageLedger?.source ?? 'streamText',
@@ -1431,7 +1542,7 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
         durationMs: Date.now() - startedAt,
         status: metricStatus,
         ...(firstPartAt !== undefined ? { ttfbMs: firstPartAt - startedAt } : {}),
-        usage: toTurnMetricUsage(fallbackServedStream && attemptUsage ? attemptUsage : usage),
+        usage: toTurnMetricUsage(fallbackLegRan && attemptUsage ? attemptUsage : usage),
       });
       // 2026-05-29 — fire the global LLM usage observer with the
       // finalized stream usage. Same hook generateText fires; hosts
@@ -1439,17 +1550,17 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
       // one consistent stream of events whether the caller used
       // generateText or streamText. No-op when no observer is
       // registered.
-      // One usage event per served answer:
-      // - fallback-served: the recursive leg already fired a correctly
-      //   attributed event — never fire the outer aggregate. The failed
-      //   attempt gets its own event only when it was billed: providers
-      //   report usage on the final chunk, so a thrown-over primary has
-      //   usually accrued none, but a refusal carries its usage on the error.
+      // One usage event per attempt:
+      // - a fallback leg ran: every leg already fired its own correctly
+      //   attributed event — never fire the outer aggregate. This attempt
+      //   gets its own event only when it was billed: providers report
+      //   usage on the final chunk, so a thrown-over attempt has usually
+      //   accrued none, but a refusal carries its usage on the error.
       // - error terminals: fire ONLY when the stream accrued real billable
       //   usage (tokens metered before a later failure) — suppressing those
       //   left real spend unmetered; zero-usage failures stay silent.
       const accruedBillableUsage = hasBillableUsage(usage);
-      if (fallbackServedStream && attemptUsage && hasBillableUsage(attemptUsage)) {
+      if (fallbackLegRan && attemptUsage && hasBillableUsage(attemptUsage)) {
         fireLlmUsageObserver({
           provider: recordedProviderId ?? '',
           model: recordedModelId ?? '',
@@ -1461,7 +1572,7 @@ export function streamText(opts: GenerateTextOptions): StreamTextResult {
           durationMs: Date.now() - startedAt,
         });
       }
-      if (!fallbackServedStream && (metricStatus !== 'error' || accruedBillableUsage)) {
+      if (!fallbackLegRan && (metricStatus !== 'error' || accruedBillableUsage)) {
         fireLlmUsageObserver({
           provider: recordedProviderId ?? '',
           model: recordedModelId ?? '',
