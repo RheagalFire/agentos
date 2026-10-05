@@ -232,8 +232,10 @@ We use [Conventional Commits](https://www.conventionalcommits.org/). Project gui
 
 | Guide | What |
 |---|---|
-| [Contributing](https://github.com/framerslab/agentos/blob/master/CONTRIBUTING.md) | Dev setup, PR checklist, commit conventions, contribution licensing |
+| [Contributing](https://github.com/framerslab/agentos/blob/master/CONTRIBUTING.md) | Development setup, commit and pull request rules, review threads, contribution licensing |
 | [Adding an LLM provider](https://github.com/framerslab/agentos/blob/master/docs/contributing/new-provider.md) | Provider interface, acceptance checklist, vendor-neutrality policy |
+| [Release guide](https://github.com/framerslab/agentos/blob/master/docs/getting-started/RELEASING.md) | How a merge to master becomes an npm release |
+| [Agent instructions](https://github.com/framerslab/agentos/blob/master/AGENTS.md) | Commands and conventions for coding agents |
 | [Maintainers](https://github.com/framerslab/agentos/blob/master/MAINTAINERS.md) | Who reviews and merges changes |
 | [Code of Conduct](https://github.com/framerslab/agentos/blob/master/.github/CODE_OF_CONDUCT.md) | Community standards |
 | [Security Policy](https://github.com/framerslab/agentos/blob/master/.github/SECURITY.md) | Reporting vulnerabilities privately |
