@@ -23,6 +23,7 @@ import { OpenRouterProviderError } from '../errors/OpenRouterProviderError';
 import { ApiKeyPool } from '../../../providers/ApiKeyPool.js';
 import { createGMIErrorFromError, GMIErrorCode } from '../../../utils/errors.js'; // Corrected import path
 import { clampMaxOutputTokens } from '../model-output-limits.js';
+import { CONTEXT_WINDOW_EXCEEDED_CODE } from '../errors/errorCodes.js';
 import { stripGeminiOnlyParams } from '../openrouter-only-params';
 import { baseUrlCredentials, redactUrlSecrets } from '../url-secrets.js';
 
@@ -304,6 +305,32 @@ function parseErrorBody(text: string): unknown {
   } catch {
     return text;
   }
+}
+
+/**
+ * Whether an OpenRouter error is a request larger than the model's context
+ * window. Once a provider took the request, OpenRouter types it
+ * `context_length_exceeded`. Its own check before routing answers HTTP 400
+ * with no type, only the message: "This endpoint's maximum context length is
+ * 16384 tokens. However, you requested about 33760 tokens ..." (observed
+ * 2026-10-05, for streamed and plain requests alike).
+ *
+ * @param errorType - The typed code, when the error carries one.
+ * @param code - The HTTP status, or the numeric code inside a 200 body or event.
+ * @param message - The error's message as OpenRouter sent it.
+ */
+function isContextWindowRejection(errorType: string | undefined, code: number | undefined, message: string): boolean {
+  if (errorType === 'context_length_exceeded') return true;
+  return code === 400 && /maximum context length is \d+ tokens/i.test(message);
+}
+
+/**
+ * A string error code that names a class (`server_error`), kept as the error's
+ * code. A number in a string (`'502'`) is not one: it is neither a status the
+ * registry should read nor a class the retry classifier knows.
+ */
+function namedErrorCode(code: unknown): string | undefined {
+  return typeof code === 'string' && /^[a-z][a-z0-9_]*$/i.test(code) ? code : undefined;
 }
 
 /** How OpenRouter declined a request, read from its error envelope. */
@@ -935,7 +962,31 @@ export class OpenRouterProvider implements IProvider {
             }
             const errMessage = apiChunk.error.message || 'OpenRouter mid-stream error';
             const errCode = apiChunk.error.code;
-            const decorated = errCode !== undefined ? `[${errCode}] ${errMessage}` : errMessage;
+            // The typed code: metadata.error_type, else the envelope's own
+            // `type`, in the order the HTTP error path reads them.
+            const envelopeType = (apiChunk.error as { type?: unknown }).type;
+            const errType =
+              typeof apiChunk.error.metadata?.error_type === 'string'
+                ? apiChunk.error.metadata.error_type
+                : typeof envelopeType === 'string'
+                  ? envelopeType
+                  : undefined;
+            // A 401 or 403 inside a 200 stream describes an upstream attempt,
+            // not this key: without the `[NNN]` prefix the health registry
+            // counts a transient failure, not its auth policy (as inBodyError
+            // does for a 200 body).
+            const decorated =
+              errCode === 401 || errCode === 403
+                ? `OpenRouter in-body error ${errCode}: ${errMessage}`
+                : errCode !== undefined
+                  ? `[${errCode}] ${errMessage}`
+                  : errMessage;
+            // A context-window rejection, or a string code such as
+            // `server_error`, rides the chunk's `code` for the walkers.
+            const chunkCode =
+              isContextWindowRejection(errType, typeof errCode === 'number' ? errCode : undefined, errMessage)
+                ? CONTEXT_WINDOW_EXCEEDED_CODE
+                : namedErrorCode(errCode);
             if (held) {
               // The answer already ended on a content_filter finish. A later
               // upstream failure is the end of the read: it neither replaces
@@ -954,6 +1005,7 @@ export class OpenRouterProvider implements IProvider {
               error: {
                 message: decorated,
                 type: 'upstream_error',
+                ...(chunkCode !== undefined ? { code: chunkCode } : {}),
               },
             };
             break;
@@ -1405,7 +1457,7 @@ export class OpenRouterProvider implements IProvider {
         const decoratedMessage = this.redactSecrets(statusCode ? `[${statusCode}] ${errorMessage}` : errorMessage);
         lastError = new OpenRouterProviderError(
           decoratedMessage,
-          'API_REQUEST_FAILED',
+          isContextWindowRejection(errorType, statusCode, errorMessage) ? CONTEXT_WINDOW_EXCEEDED_CODE : 'API_REQUEST_FAILED',
           statusCode,
           errorType,
           {
@@ -1535,6 +1587,9 @@ export class OpenRouterProvider implements IProvider {
     extra: { responseId?: string; usage?: ModelUsage; partialText?: string | null },
   ): OpenRouterProviderError {
     const code = typeof error.code === 'number' ? error.code : undefined;
+    // A named string code (`server_error`) is kept as the error's code, as a
+    // stream error event's is, so the retry classifier reads it.
+    const stringCode = namedErrorCode(error.code);
     const decline = classifyOpenRouterDecline(error, { inBody: true });
     if (decline) {
       return this.declineError(modelId, decline, {
@@ -1549,7 +1604,15 @@ export class OpenRouterProvider implements IProvider {
     const message = this.redactSecrets(
       typeof error.message === 'string' && error.message ? error.message : 'OpenRouter reported an error in a 200 response',
     );
-    const metaType = typeof error.metadata?.error_type === 'string' ? error.metadata.error_type : undefined;
+    // The typed code: metadata.error_type, else the envelope's own `type`, in
+    // the order the HTTP error path reads them.
+    const envelopeType = (error as { type?: unknown }).type;
+    const errorType =
+      typeof error.metadata?.error_type === 'string'
+        ? error.metadata.error_type
+        : typeof envelopeType === 'string'
+          ? envelopeType
+          : undefined;
     // The 200 means the configured key was accepted, so a 401 or 403 inside
     // the body describes an upstream attempt (a BYOK key, a failover leg),
     // not this account. Its code stays in the message, where the retry
@@ -1559,9 +1622,11 @@ export class OpenRouterProvider implements IProvider {
     const inBodyAuth = code === 401 || code === 403;
     return new OpenRouterProviderError(
       code === undefined ? message : inBodyAuth ? `OpenRouter in-body error ${code}: ${message}` : `[${code}] ${message}`,
-      'API_REQUEST_FAILED',
+      isContextWindowRejection(errorType, code, message)
+        ? CONTEXT_WINDOW_EXCEEDED_CODE
+        : (stringCode ?? 'API_REQUEST_FAILED'),
       inBodyAuth ? undefined : code,
-      metaType ?? 'UNKNOWN_API_ERROR',
+      errorType ?? 'UNKNOWN_API_ERROR',
       {
         responseId: extra.responseId,
         ...(inBodyAuth ? { httpStatus: code } : {}),
