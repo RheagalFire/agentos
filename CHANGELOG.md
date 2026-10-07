@@ -1,3 +1,20 @@
+## [0.11.1](https://github.com/framerslab/agentos/compare/v0.11.0...v0.11.1) (2026-10-07)
+
+### fix
+
+* **images:** decode raw base64 that contains "/" instead of reading it as a file path (#110) ([3bc42c1](https://github.com/framerslab/agentos/commit/3bc42c161b428b033fd5c72bcba027b6cc88f9b6))
+* **model:** split a colon-qualified model id only on a known provider prefix, never under ollama (#106) ([6f68209](https://github.com/framerslab/agentos/commit/6f682096a97874548fb09d053c905db2492d4e47))
+* **openrouter:** keep the role of the final streamed message (#112) ([ffeb2f1](https://github.com/framerslab/agentos/commit/ffeb2f198bc5350649cdffe33d71494d6366e2d6))
+* **speech:** keep registered providers on refresh and never resolve one without an instance (#109) ([48b5e53](https://github.com/framerslab/agentos/commit/48b5e5325ef3b9fd8ed20a41702169bd56d7b0ce))
+
+### feat
+
+* **speech:** current provider defaults for speech and transcription (#115) ([c9147b6](https://github.com/framerslab/agentos/commit/c9147b6b0ecfd4c6f1b491543c2e3837448d29bc))
+
+### docs
+
+* **agency:** describe what agency() shares (#111) ([5b9f428](https://github.com/framerslab/agentos/commit/5b9f428023003f3a6868e33bdb5ad76783ef93eb))
+
 ## [0.11.0](https://github.com/framerslab/agentos/compare/v0.10.40...v0.11.0) (2026-10-07)
 
 ### ⚠ BREAKING CHANGE
