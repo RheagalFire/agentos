@@ -34,6 +34,16 @@ export { normalizeHostLLMPolicy } from './runtime/hostPolicy.js';
 export { ContextWindowExceededError } from '../core/llm/providers/errors/ContextWindowExceededError.js';
 export { checkContextFit, type ContextFit, type ContextFitRequest } from './runtime/contextWindowFit.js';
 export { streamText } from './streamText.js';
+export { createCompletionGateway, toolFormatFor } from './runtime/completionGateway.js';
+export type {
+  CompletionAttempt,
+  CompletionGateway,
+  CompletionHop,
+  CompletionOutcome,
+  CompletionResolution,
+  CompletionRoute,
+} from './runtime/completionGateway.js';
+export { GatewayProviderManager } from './runtime/gatewayProviderManager.js';
 export { generateObject } from './generateObject.js';
 export { streamObject } from './streamObject.js';
 export { embedText } from './embedText.js';
