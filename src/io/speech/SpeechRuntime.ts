@@ -66,13 +66,21 @@ export class SpeechRuntime {
       if (openaiApiKey) {
         const stt = new OpenAIWhisperSpeechToTextProvider({
           apiKey: openaiApiKey,
-          model: env['WHISPER_MODEL_DEFAULT'] ?? 'whisper-1',
+          // With WHISPER_MODEL_DEFAULT unset or empty, calls run on
+          // gpt-transcribe. A call that asks for verbose_json, srt or vtt runs
+          // on whisper-1 unless WHISPER_MODEL_DEFAULT names a model that serves
+          // those formats; OpenAI's gpt- transcription models do not.
+          model: env['WHISPER_MODEL_DEFAULT'] || undefined,
         });
         this.registry.registerSttProvider(stt);
         this.registerProviderInResolver(stt, 'stt');
 
         const tts = new OpenAITextToSpeechProvider({
           apiKey: openaiApiKey,
+          // tts-1 stays the default. OpenAI removes tts-1, tts-1-hd and the
+          // gpt-4o-mini-tts snapshots on 2027-01-06 and names
+          // gpt-realtime-2.1-mini as their replacement, but that model runs
+          // only on the Realtime API, and this provider calls /v1/audio/speech.
           model: env['OPENAI_TTS_DEFAULT_MODEL'] ?? 'tts-1',
           voice: env['OPENAI_TTS_DEFAULT_VOICE'] ?? 'nova',
         });
