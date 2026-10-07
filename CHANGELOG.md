@@ -1,3 +1,24 @@
+## [0.12.0](https://github.com/framerslab/agentos/compare/v0.11.7...v0.12.0) (2026-10-07)
+
+### ⚠ BREAKING CHANGE
+
+* **emergent:** a composition or workflow step no longer chains a tool
+with side effects unless the host lists it in
+emergent.compose.sideEffectingTools, and never chains a tool whose
+hasSideEffects is unset; ComposableToolBuilder needs a StepGate to compose
+(a bare callback still constructs but composes nothing, compose_needs_gate);
+allowSandboxTools: false now also loads stored code tools suspended
+(sandbox_tools_off); a composed tool's approval moves from the composed
+call to its side-effecting steps.
+
+### feat
+
+* **emergent:** compose mode runs every step through a gate ([0c637aa](https://github.com/framerslab/agentos/commit/0c637aadf07b1126d20afe776ccb897dff2f0ee9))
+
+### test
+
+* **openrouter:** streamText keeps the text that arrives with the finish reason (#127) ([04df6e8](https://github.com/framerslab/agentos/commit/04df6e8f5238376c48a7ce1cc3035bc9a21f2259))
+
 ## [0.11.7](https://github.com/framerslab/agentos/compare/v0.11.6...v0.11.7) (2026-10-07)
 
 ### fix
