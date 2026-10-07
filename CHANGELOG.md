@@ -1,3 +1,9 @@
+## [0.11.7](https://github.com/framerslab/agentos/compare/v0.11.6...v0.11.7) (2026-10-07)
+
+### fix
+
+* **emergent:** a load adopts only rows unchanged since its read, and settlement re-checks ([d1bda8e](https://github.com/framerslab/agentos/commit/d1bda8ee0298ea8381166bd158abd3dbe61573b0))
+
 ## [0.11.6](https://github.com/framerslab/agentos/compare/v0.11.5...v0.11.6) (2026-10-07)
 
 ### fix
