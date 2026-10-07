@@ -244,15 +244,42 @@ the key together on every seat of a multi-vendor roster:
 - A seat that sets `provider` but not `model` inherits the agency's model id. An
   Anthropic seat that inherits `gpt-6-astra` gets a 404 from Anthropic, which is
   not retried on another provider, and the seat fails.
-- An agency-level `apiKey` or `baseUrl` is inherited by every config seat that
-  sets none, whatever that seat's provider. An OpenAI key sent to Anthropic gets
-  a 401; that error is retryable, so the seat silently fails over to another
-  provider. The inherited key also disables the Anthropic-through-OpenRouter
-  route described below.
+- An agency-level `apiKey` or `baseUrl` belongs to the provider the agency's
+  own calls go to. A config seat that sets none inherits them only when its
+  calls go to that same provider; a seat whose calls go to another provider
+  (its own `provider`, or one its `model` names, described next) does not, so
+  an OpenAI key never reaches Anthropic through a seat. Nor does a seat whose
+  calls go to auto-detection: under an agency that names its provider only
+  by its model's prefix (`model: 'openai:gpt-4.1'`), a seat with a plain
+  `model` (`gpt-4.1-mini`) has no provider to inherit, so it goes to
+  whichever provider the environment's keys select and uses that provider's
+  key. Write the prefix on the seat's model (`openai:gpt-4.1-mini`) or set its
+  `provider` to share the agency's key. When the agency's provider is left to
+  auto-detection (no `provider` and no prefix on its `model`), it is unknown,
+  and every seat that sets none inherits the agency's key and URL.
 - A seat value set explicitly to `undefined` (for example
   `apiKey: process.env.UNSET_VAR`) counts as set and blocks inheritance.
 
-Keys resolve per seat: the seat's `apiKey`, else the agency's `apiKey`, else a
+A seat `model` written as `provider:model` (`anthropic:claude-opus-5-5`) names
+its provider and does not inherit the agency's `provider`. A call goes to the
+provider its `model` prefix names (`provider:`, which wins over `provider`
+except under `provider: 'ollama'`, or `provider/` when `provider` is unset or
+repeats it; an id that also holds a colon takes the `provider/` form only
+when `provider` repeats it), or else to its `provider`. Under `provider: 'openrouter'` a
+`vendor/model` id (`anthropic/claude-sonnet-5-5`) stays an OpenRouter id and
+the seat keeps the agency's OpenRouter key. A colon splits an id only when its
+prefix is a provider agentos knows: `qwen2.5:7b` under `provider: 'ollama'`
+and `meta-llama/llama-3.3-70b-instruct:free` under `provider: 'openrouter'`
+stay whole, and under `provider: 'ollama'` an id is never split. A colon id
+whose prefix is not a provider agentos knows, with no `provider`, is rejected:
+`qwen2.5:7b` alone throws and asks for `provider: 'ollama'`, rather than being
+sent to whichever cloud provider the environment's keys select. An Ollama tag named after a provider (`mistral:7b`) is the one
+case to watch: as a seat `model` under an Ollama agency it names the Mistral
+provider and goes to Mistral's API, so a seat that means the local tag writes
+`provider: 'ollama'` itself.
+
+Keys resolve per seat: the seat's `apiKey`, else the agency's `apiKey` when the
+seat inherits it (above), else a
 key set with `setDefaultProvider()` (used when that default names no provider
 or names the seat's provider), else the provider's environment variable
 (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and so on). A
