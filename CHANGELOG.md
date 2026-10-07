@@ -1,3 +1,9 @@
+## [0.12.3](https://github.com/framerslab/agentos/compare/v0.12.2...v0.12.3) (2026-10-07)
+
+### fix
+
+* **images:** a DOCTYPE's quoted literals no longer end it early (#133) ([b2c3646](https://github.com/framerslab/agentos/commit/b2c3646bfa1cebe8dba749ab5b0507299274f9f2))
+
 ## [0.12.2](https://github.com/framerslab/agentos/compare/v0.12.1...v0.12.2) (2026-10-07)
 
 ### fix
