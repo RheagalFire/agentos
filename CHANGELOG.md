@@ -1,3 +1,10 @@
+## [0.12.4](https://github.com/framerslab/agentos/compare/v0.12.3...v0.12.4) (2026-10-07)
+
+### feat
+
+* **fallback:** the policy chain follows the catalog ladder, legs run as named, oversized requests skip small models ([547973d](https://github.com/framerslab/agentos/commit/547973da9beb305a536c7ee2cde6439925b8bf72))
+* **runtime:** completion gateway and the GMI step contract (#129) ([fa936a7](https://github.com/framerslab/agentos/commit/fa936a72d0793fc9c624070dcf8c87a3a0f98447))
+
 ## [0.12.3](https://github.com/framerslab/agentos/compare/v0.12.2...v0.12.3) (2026-10-07)
 
 ### fix
