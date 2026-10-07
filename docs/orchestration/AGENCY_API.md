@@ -791,10 +791,12 @@ Requires the `ws` package (`npm install ws`).
 ### Channel adapters
 
 When `channels` contains at least one entry the agency exposes a `connect()`
-method.  Calling it logs each configured channel and defers real adapter
-initialisation to the runtime.  Full adapter wiring (Discord, Telegram, Slack,
-etc.) is handled by the channel adapter infrastructure in
-`src/io/channels/`; `connect()` is the hook point for that wiring.
+method so the surface matches the full runtime. The lightweight `agency()`
+constructs no channel adapters: `connect()` rejects with the configured
+channel names. Channel wiring (Discord, Telegram, Slack and the rest) is done
+with `ChannelRouter` and the adapters in `src/io/channels/` (the Channels guide
+shows the standalone form), or by the full AgentOS runtime with its
+`messaging-channel` extension packs; `connect()` never does it.
 
 ```typescript
 const social = agency({
@@ -807,7 +809,13 @@ const social = agency({
   },
 });
 
-await social.connect(); // logs each channel; real adapter connection is a follow-up
+try {
+  await social.connect();
+} catch (error) {
+  // agency().connect() cannot connect "discord", "telegram", "slack": the
+  // lightweight agency() helper constructs no channel adapters ...
+  console.error((error as Error).message);
+}
 ```
 
 ---
