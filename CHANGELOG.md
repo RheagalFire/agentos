@@ -1,3 +1,9 @@
+## [0.11.2](https://github.com/framerslab/agentos/compare/v0.11.1...v0.11.2) (2026-10-07)
+
+### fix
+
+* **llm:** keep every variant's schema for a property the Anthropic union merge shares (#114) ([ca60ae1](https://github.com/framerslab/agentos/commit/ca60ae1a376096e1d06e1af5f138d8a2934e5f9a))
+
 ## [0.11.1](https://github.com/framerslab/agentos/compare/v0.11.0...v0.11.1) (2026-10-07)
 
 ### fix
