@@ -1,3 +1,13 @@
+## [0.10.38](https://github.com/framerslab/agentos/compare/v0.10.37...v0.10.38) (2026-10-07)
+
+### feat
+
+* **personas:** define personas inline with a built-in in-memory loader (#97) ([6785eb2](https://github.com/framerslab/agentos/commit/6785eb2df86505b4fe922e35f6d35b3928c47bd2))
+
+### docs
+
+* say what a GMI adds over a plain agent and put GMIs first in Concepts (#96) ([f38e5fc](https://github.com/framerslab/agentos/commit/f38e5fc5f6a9cb04523b1e4c68f136b2c8b0803f))
+
 ## [0.10.37](https://github.com/framerslab/agentos/compare/v0.10.36...v0.10.37) (2026-10-07)
 
 ### fix
