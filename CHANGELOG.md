@@ -1,3 +1,9 @@
+## [0.12.1](https://github.com/framerslab/agentos/compare/v0.12.0...v0.12.1) (2026-10-07)
+
+### fix
+
+* **emergent:** stored chains load at any depth, admissions of a tool run in turn, and inner refusals stay inner ([d853bfd](https://github.com/framerslab/agentos/commit/d853bfd67a25a32ac8ff3f459bf32b18986d2455))
+
 ## [0.12.0](https://github.com/framerslab/agentos/compare/v0.11.7...v0.12.0) (2026-10-07)
 
 ### ⚠ BREAKING CHANGE
