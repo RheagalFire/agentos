@@ -197,6 +197,10 @@ interface AdmissionCandidate {
   requestStored: boolean;
   /** The tool row's `is_active`, or a host-built object's `isActive`. */
   legacyActive: boolean;
+  /** The tier the row or the host-built object carries. */
+  tier: ToolTier;
+  /** The owner the row or the host-built object carries (`created_by_agent`). */
+  createdBy: string;
   /** False when the row's last state write did not finish its flag write; undefined for a host-built object. */
   flagSynced?: boolean;
   buildTool: (implementation: ToolImplementation) => EmergentTool;
@@ -506,6 +510,7 @@ export class EmergentCapabilityEngine {
       };
 
       this.registry.register(tool, 'session');
+      const registered = this.registry.generation(toolId);
       let written: ToolStateRecord | undefined;
       try {
         written = await this.registry.setState(toolId, 'active', null, {
@@ -520,7 +525,7 @@ export class EmergentCapabilityEngine {
           error instanceof Error ? error.message : error,
         );
       }
-      if (this.registry.wasRemoved(toolId)) {
+      if (this.registry.generation(toolId) !== registered) {
         // Removed while it was being forged: nothing is registered.
         return { success: false, error: 'the tool was removed while it was being forged' };
       }
@@ -551,8 +556,12 @@ export class EmergentCapabilityEngine {
       this.indexTool(toolId, context.agentId, context.sessionId);
 
       if (this.onToolForged) {
+        // The object the registry holds (a registration stores a stamped copy;
+        // an adoption above stores the object itself), so the settlement
+        // below compares like with like.
+        const live = this.registry.get(toolId) ?? tool;
         try {
-          await this.onToolForged(tool, this.createExecutableTool(tool));
+          await this.onToolForged(live, this.createExecutableTool(live));
         } catch (error: unknown) {
           this.registry.remove(toolId);
           this.removeIndexedTool(toolId, context.agentId, context.sessionId);
@@ -560,6 +569,11 @@ export class EmergentCapabilityEngine {
             success: false,
             error: error instanceof Error ? error.message : 'Failed to activate forged tool.',
           };
+        }
+        const settled = await this.settleRegistration(live);
+        if (settled && settled.reason === 'removed') {
+          // Removed while the host was registering it: nothing is registered.
+          return { success: false, error: 'the tool was removed while it was being forged' };
         }
       }
 
@@ -699,6 +713,17 @@ export class EmergentCapabilityEngine {
     const removedTools = this.getSessionTools(sessionId);
     this.registry.cleanupSession(sessionId);
     this.index.bySession.delete(sessionId);
+    for (const tool of removedTools) {
+      // The agent index too, so a lookup by agent never names a tool that is gone.
+      this.removeIndexedToolEverywhere(tool.id);
+    }
+    if (this.onToolRemoved) {
+      // The executables go with the tools, as removeTool does. A host that
+      // cleans up through the orchestrator unregisters the same names; a
+      // second unregistration of a name finds nothing to do.
+      const unregister = this.onToolRemoved;
+      void Promise.allSettled(removedTools.map((tool) => unregister(tool)));
+    }
     return removedTools;
   }
 
@@ -737,6 +762,8 @@ export class EmergentCapabilityEngine {
       stored,
       requestStored: stored?.request != null,
       legacyActive: (tool as EmergentTool & { isActive?: boolean }).isActive ?? true,
+      tier: tool.tier,
+      createdBy: tool.createdBy,
       buildTool: () => tool,
     });
   }
@@ -905,6 +932,8 @@ export class EmergentCapabilityEngine {
         stored: held,
         requestStored: held?.request != null,
         legacyActive: true,
+        tier: tool.tier,
+        createdBy: tool.createdBy,
         buildTool: () => tool,
       },
       { force: true },
@@ -951,6 +980,8 @@ export class EmergentCapabilityEngine {
         requestStored: row.request_json != null,
         legacyActive: !(row.is_active === 0 || row.is_active === false),
         flagSynced: row.flag_synced == null ? undefined : !(row.flag_synced === 0 || row.flag_synced === false),
+        tier: row.tier,
+        createdBy: row.created_by_agent,
         buildTool: (implementation) => toolFromRow(row, implementation),
       },
       options,
@@ -999,6 +1030,10 @@ export class EmergentCapabilityEngine {
     options: { force?: boolean; readmitted?: number; sourceFallback?: PersistedSource } = {},
   ): Promise<LoadedToolOutcome> {
     const { toolId, name, source, stored, requestStored } = candidate;
+    // The tool's generation as this admission starts: a removal, a
+    // registration or a row write after this point makes what it holds stale,
+    // and the adoption below is refused.
+    const generation = this.registry.generation(toolId);
     let legacyActive = candidate.legacyActive;
     // A row whose last state write did not finish its flag write: finish it
     // first, so the flag reads what the state row says before anything is
@@ -1086,6 +1121,14 @@ export class EmergentCapabilityEngine {
         allowlist:
           source.format === 'code-with-list' ? granted.filter((api) => listed.allowlist.includes(api)) : granted,
       };
+    }
+    // 3a. An agent-tier row from an earlier release is owned by the forging
+    //     GMI instance's id, which no persona can match, so no caller could
+    //     ever pass the owner check: it loads suspended rather than running
+    //     for everyone. Forging the tool again under the persona is the way
+    //     back; `reactivateTool` goes through this same path.
+    if (!refusal && candidate.tier === 'agent' && candidate.createdBy.startsWith('gmi-instance-')) {
+      refusal = 'legacy_owner';
     }
     if (implementation && !refusal) {
       refusal = this.refusalFor(implementation);
@@ -1177,16 +1220,21 @@ export class EmergentCapabilityEngine {
     if (live && live.name !== tool.name) {
       await this.unregisterIfLive(toolId);
     }
-    const adopted = this.registry.adopt(tool, {
-      toolId,
-      state: 'active',
-      reason: null,
-      setBy: 'library',
-      at: Date.now(),
-      request,
-    });
+    const adopted = this.registry.adopt(
+      tool,
+      {
+        toolId,
+        state: 'active',
+        reason: null,
+        setBy: 'library',
+        at: Date.now(),
+        request,
+      },
+      generation,
+    );
     if (!adopted) {
-      // Removed in this process while the row was being admitted.
+      // Removed, or replaced under its id, in this process while the row was
+      // being admitted: what this admission read is stale.
       return { toolId, name, state: 'demoted', reason: 'removed' };
     }
     this.indexTool(
@@ -1205,16 +1253,50 @@ export class EmergentCapabilityEngine {
         this.removeIndexedToolEverywhere(toolId);
         throw error;
       }
-      if (this.registry.wasRemoved(toolId)) {
-        // Removed while the host was registering it: the registration goes.
-        if (this.onToolRemoved) {
-          await this.onToolRemoved(tool);
-        }
-        this.removeIndexedToolEverywhere(toolId);
-        return { toolId, name, state: 'demoted', reason: 'removed' };
+      const settled = await this.settleRegistration(tool);
+      if (settled) {
+        return settled;
       }
     }
     return { toolId, name, state: 'active', reason: null };
+  }
+
+  /**
+   * After the host registered a tool's executable, the registry must still
+   * hold that very object. When it does not (the tool was removed, or
+   * replaced under its id, while the registration ran), the executor is
+   * brought back in line with the registry: the current tool's executable is
+   * registered again when there is one, so whichever registration landed
+   * last, the current tool is what runs under the name; the stale executable
+   * is taken out when there is none. Returns the outcome to report, or
+   * undefined when the registration stands.
+   */
+  private async settleRegistration(tool: EmergentTool): Promise<LoadedToolOutcome | undefined> {
+    const current = this.registry.get(tool.id);
+    if (current === tool) {
+      return undefined;
+    }
+    try {
+      if (current && this.onToolForged) {
+        await this.onToolForged(current, this.createExecutableTool(current));
+      } else if (!current && this.onToolRemoved) {
+        await this.onToolRemoved(tool);
+      }
+    } catch (error: unknown) {
+      console.warn(
+        `[agentos:emergent] could not settle the executable of "${tool.name}" (${tool.id}):`,
+        error instanceof Error ? error.message : error,
+      );
+    } finally {
+      if (!current) {
+        this.removeIndexedToolEverywhere(tool.id);
+      }
+    }
+    if (!current) {
+      return { toolId: tool.id, name: tool.name, state: 'demoted', reason: 'removed' };
+    }
+    const held = this.registry.getState(tool.id);
+    return { toolId: tool.id, name: current.name, state: held?.state ?? 'active', reason: held?.reason ?? null };
   }
 
   /**
@@ -1426,11 +1508,12 @@ export class EmergentCapabilityEngine {
         // The owner is the persona that forged the tool, compared as it was
         // stored ('unknown' for a caller without one). A row from an earlier
         // release holds the forging GMI instance's id instead, which no
-        // persona can match: such a tool runs for any caller of the host that
-        // loaded it by that id, as it did before this change.
+        // persona can match; the loader suspends such a row (`legacy_owner`),
+        // and a call to one held in memory is refused here like any other
+        // owner mismatch.
         const owner = current.createdBy;
         const caller = context.personaId ?? 'unknown';
-        if (current.tier === 'agent' && !owner.startsWith('gmi-instance-') && caller !== owner) {
+        if (current.tier === 'agent' && caller !== owner) {
           return {
             success: false,
             error: `Emergent tool "${tool.name}" belongs to agent ${owner}; it is not callable as ${caller}.`,

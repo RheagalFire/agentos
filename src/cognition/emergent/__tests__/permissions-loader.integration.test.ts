@@ -746,7 +746,7 @@ describe('stored tools: the loader, legacy rows and suspension', () => {
     ]);
   });
 
-  it('an agent-tier row from an earlier release, owned by a GMI instance id, runs for any caller of the host that loaded it', async () => {
+  it('an agent-tier row from an earlier release, owned by a GMI instance id, loads suspended and runs for no one', async () => {
     const db = createSqliteAdapter();
     const host = await makeForgeHost({ db });
     seedToolRow(db, {
@@ -761,10 +761,20 @@ describe('stored tools: the loader, legacy rows and suspension', () => {
     });
 
     const loaded = await host.engine.loadPersistedTools({ tiers: ['agent'], agentId: 'gmi-instance-0b7e3c1a' });
-    expect(loaded.outcomes).toEqual([{ toolId: 'old-1', name: 'double_it', state: 'active', reason: null }]);
-    expect((await callTool(host.orchestrator, 'double_it', { n: 2 }, { personaId: 'anyone' })).output).toEqual({
-      doubled: 4,
-    });
+    expect(loaded.outcomes).toEqual([{ toolId: 'old-1', name: 'double_it', state: 'suspended', reason: 'legacy_owner' }]);
+    expect(readToolRow(db, 'old-1')).toMatchObject({ is_active: 0 });
+    expect(readStateRow(db, 'old-1')).toMatchObject({ state: 'suspended', state_reason: 'legacy_owner' });
+    const called = await callTool(host.orchestrator, 'double_it', { n: 2 }, { personaId: 'anyone' });
+    expect(called.isError).toBe(true);
+    const asStoredOwner = await callTool(host.orchestrator, 'double_it', { n: 2 }, { personaId: 'gmi-instance-0b7e3c1a' });
+    expect(asStoredOwner.isError).toBe(true);
+
+    // The host's reactivation goes through the same path and cannot change the
+    // owner, so the row stays suspended; the next load re-checks it and says
+    // the same. Forging the tool again under the persona is the way back.
+    expect(await host.engine.reactivateTool('old-1')).toEqual({ toolId: 'old-1', name: 'double_it', state: 'suspended', reason: 'legacy_owner' });
+    const again = await host.engine.loadPersistedTools({ tiers: ['agent'], agentId: 'gmi-instance-0b7e3c1a' });
+    expect(again.outcomes).toEqual([{ toolId: 'old-1', name: 'double_it', state: 'suspended', reason: 'legacy_owner' }]);
   });
 
   it('a stored request wider than a stored list grants nothing the list did not', async () => {
@@ -1073,6 +1083,65 @@ describe('stored tools: the loader, legacy rows and suspension', () => {
     expect(await host.orchestrator.getTool('double_it')).toBeUndefined();
     expect(readToolRow(db, 'raw-1')).toBeUndefined();
     expect(readStateRow(db, 'raw-1')).toBeUndefined();
+  });
+
+  it("a host's row write for a tool whose removal is still deleting lands after the deletes", async () => {
+    const db = createSqliteAdapter();
+    const host = await makeForgeHost({ db });
+    const tool: EmergentTool = {
+      id: 'host-2',
+      name: 'double_it',
+      description: 'Doubles a number.',
+      inputSchema: NUMBER_IN,
+      outputSchema: DOUBLED_OUT,
+      implementation: { mode: 'sandbox', code: RAW_DOUBLE, allowlist: [] },
+      tier: 'shared',
+      createdBy: 'host',
+      createdAt: new Date(1_700_000_000_000).toISOString(),
+      judgeVerdicts: [],
+      usageStats: { totalUses: 0, successCount: 0, failureCount: 0, avgExecutionTimeMs: 0, lastUsedAt: null, confidenceScore: 0.9 },
+      source: 'hydrated by the host from its own store',
+    };
+
+    // The removal's first delete is held open; the host syncs the same id meanwhile.
+    const gate = db.gateNext('DELETE FROM agentos_emergent_tools');
+    const removing = host.engine.removeTool('host-2');
+    await gate.entered;
+    const syncing = host.engine.syncPersistedTool(tool);
+    gate.release();
+    await removing;
+
+    expect(await syncing).toEqual({ toolId: 'host-2', name: 'double_it', state: 'active', reason: null });
+    expect(readToolRow(db, 'host-2')).toMatchObject({ name: 'double_it', is_active: 1 });
+    expect((await callTool(host.orchestrator, 'double_it', { n: 3 })).output).toEqual({ doubled: 6 });
+  });
+
+  it("a session's cleanup takes its tools out of the executor", async () => {
+    const db = createSqliteAdapter();
+    const host = await makeForgeHost({ db });
+    seedToolRow(db, {
+      id: 'sc-1',
+      name: 'double_it',
+      mode: 'sandbox',
+      source: RAW_DOUBLE,
+      tier: 'session',
+      createdBy: 'agent-c',
+      createdBySession: 'sess-c',
+      inputSchema: NUMBER_IN,
+      outputSchema: DOUBLED_OUT,
+    });
+    await host.engine.loadPersistedTools({ tiers: ['session'], sessionId: 'sess-c' });
+    expect(await host.orchestrator.getTool('double_it')).toBeDefined();
+    expect(host.engine.getSessionTools('sess-c').map((t) => t.id)).toEqual(['sc-1']);
+
+    const removed = host.engine.cleanupSession('sess-c');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(removed.map((t) => t.id)).toEqual(['sc-1']);
+    expect(await host.orchestrator.getTool('double_it')).toBeUndefined();
+    expect(host.engine.getSessionTools('sess-c')).toEqual([]);
+    // A call by name finds nothing registered.
+    expect((await callTool(host.orchestrator, 'double_it', { n: 2 })).isError).toBe(true);
   });
 
   it("a session's stored tools load for that session only", async () => {
