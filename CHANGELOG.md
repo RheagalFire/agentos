@@ -1,3 +1,9 @@
+## [0.11.5](https://github.com/framerslab/agentos/compare/v0.11.4...v0.11.5) (2026-10-07)
+
+### fix
+
+* **speech:** build every keyed core provider in SpeechRuntime, and make its register methods reach the resolver (#123) ([346b2f7](https://github.com/framerslab/agentos/commit/346b2f73810a35b4b236514415173abce8515819))
+
 ## [0.11.4](https://github.com/framerslab/agentos/compare/v0.11.3...v0.11.4) (2026-10-07)
 
 ### fix
