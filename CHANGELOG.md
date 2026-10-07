@@ -1,3 +1,9 @@
+## [0.11.3](https://github.com/framerslab/agentos/compare/v0.11.2...v0.11.3) (2026-10-07)
+
+### fix
+
+* **speech:** read a real ExtensionManager on refresh, and drop stale preference boosts (#117) ([a10a51f](https://github.com/framerslab/agentos/commit/a10a51f94f5d19f8f2aa4072a094724f029ea060))
+
 ## [0.11.2](https://github.com/framerslab/agentos/compare/v0.11.1...v0.11.2) (2026-10-07)
 
 ### fix
