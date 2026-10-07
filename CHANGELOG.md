@@ -1,3 +1,12 @@
+## [0.11.6](https://github.com/framerslab/agentos/compare/v0.11.5...v0.11.6) (2026-10-07)
+
+### fix
+
+* **emergent:** legacy owners load suspended, and a per-tool generation guards adoption ([b6b61c9](https://github.com/framerslab/agentos/commit/b6b61c99e874fdb97055b2e24aae85b1de2d6b5b))
+* **images:** do not attach the payload-carrying read error as cause (#124) ([a3eb89e](https://github.com/framerslab/agentos/commit/a3eb89ef1f0b537de9e45463411ee800bdd8cc8f))
+* **openrouter:** keep the text and tool-argument deltas of the finish chunk (#125) ([eb5fc8d](https://github.com/framerslab/agentos/commit/eb5fc8d6a57320ea4c5cd935f4ecf7fc6f315784))
+* **speech:** take a provider's streaming capability from the instance, and a catalog entry only of its own kind (#126) ([0f0bfbc](https://github.com/framerslab/agentos/commit/0f0bfbc6a3221e9c7bb6f0343c112d5d1ef722cc))
+
 ## [0.11.5](https://github.com/framerslab/agentos/compare/v0.11.4...v0.11.5) (2026-10-07)
 
 ### fix
