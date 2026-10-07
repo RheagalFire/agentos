@@ -1,3 +1,9 @@
+## [0.10.36](https://github.com/framerslab/agentos/compare/v0.10.35...v0.10.36) (2026-10-07)
+
+### fix
+
+* **nlp:** decide language by script before trigram scoring (#80) ([84ea2d0](https://github.com/framerslab/agentos/commit/84ea2d04412618be243efe2a7e1529afd2569926))
+
 ## [0.10.35](https://github.com/framerslab/agentos/compare/v0.10.34...v0.10.35) (2026-10-07)
 
 ### fix
