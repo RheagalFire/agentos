@@ -1,3 +1,10 @@
+## [0.11.4](https://github.com/framerslab/agentos/compare/v0.11.3...v0.11.4) (2026-10-07)
+
+### fix
+
+* **anthropic:** drop strict mode for a schema over the strict complexity limits (#121) ([88507ea](https://github.com/framerslab/agentos/commit/88507ea12120e62ab7ed5d95177f570634ea9c86))
+* **images:** decode raw base64 BMP, ICO, JPEG 2000, JPEG XL and SVG, and stop echoing base64 in errors (#122) ([ed6bf45](https://github.com/framerslab/agentos/commit/ed6bf4535a1e0f9574a0bb78d6b81eb189ddbe8f))
+
 ## [0.11.3](https://github.com/framerslab/agentos/compare/v0.11.2...v0.11.3) (2026-10-07)
 
 ### fix
