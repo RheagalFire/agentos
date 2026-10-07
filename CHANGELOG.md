@@ -1,3 +1,9 @@
+## [0.10.39](https://github.com/framerslab/agentos/compare/v0.10.38...v0.10.39) (2026-10-07)
+
+### fix
+
+* **hierarchical:** delegate and spawn tools return output the manager can read (#101) ([4be9e5f](https://github.com/framerslab/agentos/commit/4be9e5fea639c8d58e113a070b2468f4412eacc5))
+
 ## [0.10.38](https://github.com/framerslab/agentos/compare/v0.10.37...v0.10.38) (2026-10-07)
 
 ### feat
