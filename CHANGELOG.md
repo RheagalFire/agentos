@@ -1,3 +1,10 @@
+## [0.12.2](https://github.com/framerslab/agentos/compare/v0.12.1...v0.12.2) (2026-10-07)
+
+### fix
+
+* **images:** SVG detection reads the root element, and error previews stop at 40 characters (#132) ([9b0fb44](https://github.com/framerslab/agentos/commit/9b0fb44bcd4ca98a3a4185c75e087391fa150b24))
+* **speech:** a streaming feature requirement follows the streaming capability (#131) ([2ddb996](https://github.com/framerslab/agentos/commit/2ddb9963ee70b18b67692967a82f7dde0072bda3))
+
 ## [0.12.1](https://github.com/framerslab/agentos/compare/v0.12.0...v0.12.1) (2026-10-07)
 
 ### fix
