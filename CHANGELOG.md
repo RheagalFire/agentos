@@ -1,3 +1,9 @@
+## [0.10.37](https://github.com/framerslab/agentos/compare/v0.10.36...v0.10.37) (2026-10-07)
+
+### fix
+
+* **api:** let structured calls turn thinking off and run the Anthropic rescue leg on Sonnet 5.5 (#88) ([1c9afbf](https://github.com/framerslab/agentos/commit/1c9afbf27f8bcc3d33f1d929921a37efbc48d757))
+
 ## [0.10.36](https://github.com/framerslab/agentos/compare/v0.10.35...v0.10.36) (2026-10-07)
 
 ### fix
