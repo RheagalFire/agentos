@@ -1,3 +1,9 @@
+## [0.12.12](https://github.com/framerslab/agentos/compare/v0.12.11...v0.12.12) (2026-10-08)
+
+### fix
+
+* **sandbox:** the output limit is measured in bytes, and a forged call that passes it on either stream fails (#151) ([b83f058](https://github.com/framerslab/agentos/commit/b83f058ece33de2ef188649d556e36b64c5f1e92))
+
 ## [0.12.11](https://github.com/framerslab/agentos/compare/v0.12.10...v0.12.11) (2026-10-08)
 
 ### fix
