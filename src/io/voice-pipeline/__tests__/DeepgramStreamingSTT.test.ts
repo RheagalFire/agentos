@@ -14,19 +14,43 @@ vi.mock('ws', () => {
   class MockWebSocket extends EE {
     static OPEN = 1;
     static CLOSED = 3;
+    /** Per-test connect behavior; reset to 'open' after use. */
+    static nextBehavior: 'open' | 'reject-400' = 'open';
     readyState = 1;
     send = vi.fn();
     close = vi.fn();
+    url: string;
 
-    constructor() {
+    constructor(url?: string) {
       super();
-      process.nextTick(() => this.emit('open'));
+      this.url = String(url ?? '');
+      const behavior = MockWebSocket.nextBehavior;
+      process.nextTick(() => {
+        if (behavior === 'reject-400') {
+          const res = {
+            statusCode: 400,
+            on(event: string, cb: (arg?: unknown) => void) {
+              if (event === 'data') cb(Buffer.from('{"err_code":"BAD_REQUEST"}'));
+              if (event === 'end') cb();
+            },
+          };
+          this.emit('unexpected-response', {}, res);
+          return;
+        }
+        this.emit('open');
+      });
     }
   }
   return { default: MockWebSocket, WebSocket: MockWebSocket };
 });
 
 import { DeepgramStreamingSTT } from '../providers/DeepgramStreamingSTT.js';
+// Default import: the 'ws' types only expose WebSocket as the default export
+// under this tsconfig (TS2595 on a named import). vi.mock supplies the same
+// mock class for both the default and named bindings.
+import MockedWs from 'ws';
+
+const MockCtl = MockedWs as unknown as { nextBehavior: 'open' | 'reject-400' };
 
 describe('DeepgramStreamingSTT', () => {
   let stt: DeepgramStreamingSTT;
@@ -146,5 +170,51 @@ describe('DeepgramStreamingSTT', () => {
     expect(Buffer.isBuffer(sentBuffer)).toBe(true);
     // 4 samples * 2 bytes each = 8 bytes
     expect(sentBuffer.byteLength).toBe(8);
+  });
+
+  it('REJECTS startSession (never hangs) when the server refuses the upgrade, carrying the HTTP body', async () => {
+    // Regression: the old connect() ran emit('error') BEFORE reject() — with
+    // no 'error' listener attached yet the emit threw, reject never ran, and
+    // the promise never settled, hanging the orchestrator's startSession
+    // await forever (the silent zombie voice sessions observed in prod).
+    MockCtl.nextBehavior = 'reject-400';
+    try {
+      await expect(stt.startSession()).rejects.toThrow(/HTTP 400.*BAD_REQUEST/s);
+    } finally {
+      MockCtl.nextBehavior = 'open';
+    }
+  });
+
+  it('defaults to nova-3 and leaves the training opt-out off', async () => {
+    const defaults = new DeepgramStreamingSTT({ apiKey: 'test-key-123' });
+    const session = await defaults.startSession({ language: 'en-US' });
+    const params = new URL((session as any).ws.url).searchParams;
+    expect(params.get('model')).toBe('nova-3');
+    expect(params.has('mip_opt_out')).toBe(false);
+  });
+
+  it('sends mip_opt_out when the provider or a single session opts out', async () => {
+    const optedOut = new DeepgramStreamingSTT({ apiKey: 'test-key-123', mipOptOut: true });
+    const providerSession = await optedOut.startSession();
+    expect(new URL((providerSession as any).ws.url).searchParams.get('mip_opt_out')).toBe('true');
+
+    const sessionOnly = await stt.startSession({ providerOptions: { mip_opt_out: true } });
+    expect(new URL((sessionOnly as any).ws.url).searchParams.get('mip_opt_out')).toBe('true');
+  });
+
+  it('sends keywords as plain keyterm values on nova-3 and as keywords on nova-2', async () => {
+    const keywords = ['snuffleupagus:5', 'AC-42', 'customer service:1.5'];
+
+    const nova3 = new DeepgramStreamingSTT({ apiKey: 'test-key-123' });
+    const nova3Session = await nova3.startSession({ providerOptions: { keywords } });
+    const nova3Params = new URL((nova3Session as any).ws.url).searchParams;
+    expect(nova3Params.getAll('keyterm')).toEqual(['snuffleupagus', 'AC-42', 'customer service']);
+    expect(nova3Params.has('keywords')).toBe(false);
+
+    // The shared `stt` instance is configured with nova-2, which keeps `keywords`.
+    const nova2Session = await stt.startSession({ providerOptions: { keywords } });
+    const nova2Params = new URL((nova2Session as any).ws.url).searchParams;
+    expect(nova2Params.getAll('keywords')).toEqual(keywords);
+    expect(nova2Params.has('keyterm')).toBe(false);
   });
 });

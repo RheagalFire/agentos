@@ -48,6 +48,153 @@ function sanitizeName(name: string): string {
   return name.replace(SCHEMA_NAME_INVALID_CHARS, '_').slice(0, SCHEMA_NAME_MAX_LEN);
 }
 
+/** JSON with object keys sorted, so two schemas that differ only in key order compare equal. */
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(',')}]`;
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`);
+    return `{${entries.join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'undefined';
+}
+
+/**
+ * Merges the schemas that the variants of a top-level union give one property.
+ * Enum schemas (a discriminant such as `kind`) become one enum of every value,
+ * keeping the fields they all share;
+ * otherwise identical schemas collapse to one, and different ones are kept side
+ * by side under a nested `anyOf`, which Anthropic accepts below the top level.
+ * Keeping only the first variant's schema would tell the model a later
+ * variant's value has the first variant's type, and the reply would then fail
+ * the caller's Zod schema.
+ */
+function mergePropertySchemas(schemas: unknown[]): unknown {
+  if (schemas.length === 1) {
+    return schemas[0];
+  }
+  if (
+    schemas.every(
+      (s) => s && typeof s === 'object' && Array.isArray((s as Record<string, unknown>).enum),
+    )
+  ) {
+    const records = schemas as Array<Record<string, unknown>>;
+    // Fields every variant gives the same value (`type`, a shared `description`) stay.
+    const shared: Record<string, unknown> = {};
+    for (const [field, value] of Object.entries(records[0])) {
+      if (field === 'enum') continue;
+      if (records.every((r) => field in r && stableStringify(r[field]) === stableStringify(value))) {
+        shared[field] = value;
+      }
+    }
+    return {
+      ...shared,
+      enum: Array.from(new Set(records.flatMap((r) => r.enum as unknown[]))),
+    };
+  }
+  const distinct: unknown[] = [];
+  const seen = new Set<string>();
+  for (const schema of schemas) {
+    const key = stableStringify(schema);
+    if (!seen.has(key)) {
+      seen.add(key);
+      distinct.push(schema);
+    }
+  }
+  return distinct.length === 1 ? distinct[0] : { anyOf: distinct };
+}
+
+/**
+ * Adapt a lowered JSON Schema into a shape Anthropic's tool `input_schema`
+ * accepts. The Anthropic Messages API requires the tool input_schema to be a
+ * JSON Schema **object** with a top-level `type`, and REJECTS a top-level
+ * `oneOf` / `allOf` / `anyOf` (`input_schema does not support … at the top
+ * level`). {@link lowerZodToJsonSchema} emits `{ anyOf: [...] }` for a top-level
+ * `z.union` / `z.discriminatedUnion` and `{}` for shapes it does not model.
+ * Two adaptations:
+ *
+ *  1. **Union of objects → one merged object.** Union the members' `properties`
+ *     (merging same-named `enum` members so a discriminant like `kind` becomes
+ *     the full set of variant values, and keeping a shared property's differing
+ *     schemas under a nested `anyOf`), and keep in `required` only the fields
+ *     required by EVERY member, so variant-specific fields stay optional. The
+ *     model returns one flat object; the caller's Zod schema re-validates the
+ *     exact variant, so strictness is preserved. Nested `anyOf` (inside a
+ *     property / `additionalProperties`) is left intact — Anthropic only forbids
+ *     it at the TOP level.
+ *  2. **No top-level `type` (e.g. `{}` or a non-object union) → `{ type: 'object' }`**
+ *     (mirrors the `?? { type: 'object' }` fallback AnthropicProvider's regular
+ *     tool-conversion path applies). An object schema already carrying a `type`
+ *     passes through unchanged.
+ *
+ * @internal Exported for tests: {@link lowerZodToJsonSchema} gives an enum no
+ *   other fields, so some merge rules can only be reached with a hand-written
+ *   schema. Callers use {@link buildResponseFormat}.
+ */
+export function ensureAnthropicObjectSchema(jsonSchema: unknown): Record<string, unknown> {
+  if (!jsonSchema || typeof jsonSchema !== 'object') {
+    return { type: 'object' };
+  }
+  const schema = jsonSchema as Record<string, unknown>;
+
+  const variants = (
+    Array.isArray(schema.anyOf)
+      ? schema.anyOf
+      : Array.isArray(schema.oneOf)
+        ? schema.oneOf
+        : null
+  ) as Array<Record<string, unknown>> | null;
+
+  if (
+    variants &&
+    variants.length > 0 &&
+    variants.every((v) => v && typeof v === 'object' && v.type === 'object')
+  ) {
+    // Every variant's schema for each property, in the order properties first appear.
+    const propertySchemas = new Map<string, unknown[]>();
+    const requiredCounts: Record<string, number> = {};
+    for (const variant of variants) {
+      const props =
+        variant.properties && typeof variant.properties === 'object'
+          ? (variant.properties as Record<string, unknown>)
+          : {};
+      for (const [key, propSchema] of Object.entries(props)) {
+        const schemas = propertySchemas.get(key) ?? [];
+        schemas.push(propSchema);
+        propertySchemas.set(key, schemas);
+      }
+      const variantRequired = Array.isArray(variant.required)
+        ? (variant.required as string[])
+        : [];
+      for (const field of variantRequired) {
+        requiredCounts[field] = (requiredCounts[field] ?? 0) + 1;
+      }
+    }
+    // A field is required in the merged object only when EVERY variant requires
+    // it; variant-specific fields must stay optional.
+    const required = Object.keys(requiredCounts).filter(
+      (field) => requiredCounts[field] === variants.length,
+    );
+    const mergedProperties: Record<string, unknown> = {};
+    for (const [key, schemas] of propertySchemas) {
+      mergedProperties[key] = mergePropertySchemas(schemas);
+    }
+    return {
+      type: 'object',
+      properties: mergedProperties,
+      ...(required.length > 0 ? { required } : {}),
+    };
+  }
+
+  if ('type' in schema) {
+    return schema;
+  }
+  return { type: 'object', ...schema };
+}
+
 /**
  * Build a provider-specific structured-output payload from a Zod schema.
  *
@@ -85,7 +232,10 @@ export function buildResponseFormat(
     case 'anthropic':
       return {
         _agentosUseToolForStructuredOutput: true,
-        tool: { name: schemaName, input_schema: jsonSchema },
+        tool: {
+          name: schemaName,
+          input_schema: ensureAnthropicObjectSchema(jsonSchema),
+        },
       };
     case 'gemini':
     case 'gemini-cli':

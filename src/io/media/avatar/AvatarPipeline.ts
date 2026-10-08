@@ -79,6 +79,38 @@ const ALL_STAGES: AvatarGenerationStage[] = [
  * stages drift-check each generated image against the anchor face embedding
  * and regenerate on low similarity.
  */
+/**
+ * Cap on concurrent image generations within a single expression-sheet or
+ * emote-sheet render. The per-emotion jobs are independent — each reads the
+ * shared neutral-portrait anchor + face embedding and writes only its own
+ * result — so they run in bounded-parallel batches instead of one slow
+ * sequential pass. An 8-emotion sheet drops from ~8× a single image's wall
+ * time to ~2×. Bounded (not an unbounded `Promise.all`) so the underlying
+ * image provider isn't flooded / rate-limited.
+ */
+const EMOTION_GENERATION_CONCURRENCY = 4;
+
+/**
+ * Run `fn` over `items` with at most `limit` concurrent in-flight calls.
+ * A fixed pool of workers drains a shared cursor, so the slowest item never
+ * blocks the others and the concurrency ceiling is never exceeded.
+ */
+async function runBounded<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      await fn(items[index]!);
+    }
+  };
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+}
+
 export class AvatarPipeline {
   private readonly faceService: IFaceEmbeddingService;
   private readonly generateImage: ImageGeneratorFn;
@@ -90,6 +122,24 @@ export class AvatarPipeline {
   constructor(faceService: IFaceEmbeddingService, generateImage: ImageGeneratorFn) {
     this.faceService = faceService;
     this.generateImage = generateImage;
+  }
+
+  /**
+   * Fire the caller's `onJobComplete` hook for a settled job. Await inside a
+   * try/catch so a throwing callback can neither abort the pipeline nor
+   * reorder subsequent jobs in the same worker lane; the job records on the
+   * final result remain the authoritative outcome.
+   */
+  private async notifyJobComplete(
+    request: AvatarGenerationRequest,
+    job: AvatarGenerationJob,
+  ): Promise<void> {
+    if (!request.onJobComplete) return;
+    try {
+      await request.onJobComplete(job);
+    } catch {
+      // Caller-side persistence is best-effort; swallow and continue.
+    }
   }
 
   /**
@@ -144,6 +194,7 @@ export class AvatarPipeline {
       }
       job.durationMs = Date.now() - jobStart;
       jobs.push(job);
+      await this.notifyJobComplete(request, job);
     }
 
     // -----------------------------------------------------------------------
@@ -164,19 +215,20 @@ export class AvatarPipeline {
       }
       job.durationMs = Date.now() - jobStart;
       jobs.push(job);
+      await this.notifyJobComplete(request, job);
     }
 
     // -----------------------------------------------------------------------
     // Stage: expression_sheet
     // -----------------------------------------------------------------------
     if (stages.includes('expression_sheet')) {
-      for (const emotion of AVATAR_EMOTIONS) {
+      await runBounded(AVATAR_EMOTIONS, EMOTION_GENERATION_CONCURRENCY, async (emotion) => {
         // Neutral portrait is already the anchor; skip re-generating it
         if (emotion === 'neutral') {
           if (neutralPortraitUrl) {
             expressionSheet.neutral = neutralPortraitUrl;
           }
-          continue;
+          return;
         }
 
         const label = `expression:${emotion}`;
@@ -258,14 +310,15 @@ export class AvatarPipeline {
 
         job.durationMs = Date.now() - jobStart;
         jobs.push(job);
-      }
+        await this.notifyJobComplete(request, job);
+      });
     }
 
     // -----------------------------------------------------------------------
     // Stage: animated_emotes
     // -----------------------------------------------------------------------
     if (stages.includes('animated_emotes')) {
-      for (const emotion of AVATAR_EMOTIONS) {
+      await runBounded(AVATAR_EMOTIONS, EMOTION_GENERATION_CONCURRENCY, async (emotion) => {
         const label = `emote:${emotion}`;
         const job = this.createJob('animated_emotes', label);
         const jobStart = Date.now();
@@ -289,7 +342,8 @@ export class AvatarPipeline {
 
         job.durationMs = Date.now() - jobStart;
         jobs.push(job);
-      }
+        await this.notifyJobComplete(request, job);
+      });
     }
 
     // -----------------------------------------------------------------------
@@ -322,6 +376,7 @@ export class AvatarPipeline {
 
       job.durationMs = Date.now() - jobStart;
       jobs.push(job);
+      await this.notifyJobComplete(request, job);
     }
 
     // -----------------------------------------------------------------------

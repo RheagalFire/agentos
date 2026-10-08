@@ -78,10 +78,19 @@ export interface DeepgramStreamingSTTConfig {
   baseUrl?: string;
 
   /**
-   * Deepgram model to use.
-   * @default 'nova-2'
+   * Deepgram model to use. `nova-3` is Deepgram's general-purpose model.
+   * @default 'nova-3'
    */
   model?: string;
+
+  /**
+   * Opt every session out of Deepgram's Model Improvement Program by sending
+   * `mip_opt_out=true`. Off by default because Deepgram notes that opting out
+   * has pricing impacts. A single session can opt out with
+   * `providerOptions.mip_opt_out: true`.
+   * @default false
+   */
+  mipOptOut?: boolean;
 
   /**
    * Chain priority. Lower values are tried first.
@@ -146,6 +155,19 @@ interface DGResult {
   };
 }
 
+/** Deepgram's general-purpose speech-to-text model. */
+const DEFAULT_MODEL = 'nova-3';
+
+/** Nova-3 models take `keyterm` in place of the `keywords` parameter. */
+function isNova3Model(model: string): boolean {
+  return model === 'nova-3' || model.startsWith('nova-3-');
+}
+
+/** Drops a trailing `:intensifier` from a `keywords` entry, since `keyterm` takes plain terms. */
+function stripKeywordIntensifier(keyword: string): string {
+  return keyword.replace(/:-?\d+(?:\.\d+)?$/, '');
+}
+
 // ---------------------------------------------------------------------------
 // Session Implementation
 // ---------------------------------------------------------------------------
@@ -155,6 +177,9 @@ interface DGResult {
  * Emits `transcript`, `speech_start`, `speech_end`, `error`, and `close` events
  * as required by the voice pipeline orchestrator.
  */
+/** How long to wait for the Deepgram WS upgrade before failing the connect. */
+const CONNECT_TIMEOUT_MS = 8_000;
+
 class DeepgramStreamingSTTSession extends EventEmitter implements StreamingSTTSession {
   private ws: WebSocket | null = null;
   private speechActive = false;
@@ -168,12 +193,24 @@ class DeepgramStreamingSTTSession extends EventEmitter implements StreamingSTTSe
   }
 
   /**
+   * Emit `'error'` only when a listener exists — an unlistened EventEmitter
+   * `'error'` throws and takes the whole process down as an uncaughtException.
+   */
+  private _emitErrorSafe(err: Error): void {
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', err);
+    } else {
+      console.warn('[deepgram-streaming] session error (no listener attached):', err.message);
+    }
+  }
+
+  /**
    * Open the WebSocket connection to Deepgram.
    * Resolves once the connection is established and ready to receive audio.
    */
   async connect(): Promise<void> {
     const baseUrl = this.config.baseUrl ?? 'wss://api.deepgram.com/v1/listen';
-    const model = this.config.model ?? 'nova-2';
+    const model = this.config.model ?? DEFAULT_MODEL;
     const language = this.sessionConfig.language ?? 'en-US';
     const interim = this.sessionConfig.interimResults !== false;
     const punctuate = this.sessionConfig.punctuate !== false;
@@ -198,32 +235,78 @@ class DeepgramStreamingSTTSession extends EventEmitter implements StreamingSTTSe
     if (opts.smart_format) params.set('smart_format', 'true');
     if (opts.diarize) params.set('diarize', 'true');
     if (opts.utterance_end_ms) params.set('utterance_end_ms', String(opts.utterance_end_ms));
+    if (this.config.mipOptOut === true || opts.mip_opt_out === true) {
+      params.set('mip_opt_out', 'true');
+    }
     if (Array.isArray(opts.keywords)) {
+      // Nova-3 does not support `keywords`; it boosts terms through `keyterm`,
+      // which takes plain terms, so the `:intensifier` suffix is dropped there.
+      const useKeyterm = isNova3Model(model);
       for (const kw of opts.keywords) {
-        params.append('keywords', String(kw));
+        if (useKeyterm) params.append('keyterm', stripKeywordIntensifier(String(kw)));
+        else params.append('keywords', String(kw));
       }
     }
 
     const url = `${baseUrl}?${params.toString()}`;
 
+    // Failure paths settle the promise EXACTLY once and reject FIRST: the
+    // previous implementation ran `this.emit('error', err)` before
+    // `reject(err)` — with no 'error' listener attached at connect time the
+    // emit threw synchronously (Node EventEmitter contract), `reject` never
+    // executed, and the connect promise never settled, hanging the caller
+    // forever. Handshake rejections also capture the HTTP body now
+    // (`unexpected-response`) so the real Deepgram error is visible instead
+    // of the blind "Unexpected server response: NNN".
     return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        fail(new Error(`deepgram stt ws connect timed out after ${CONNECT_TIMEOUT_MS}ms`));
+      }, CONNECT_TIMEOUT_MS);
+      const fail = (err: Error): void => {
+        if (settled) {
+          this._emitErrorSafe(err);
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      };
+
       this.ws = new WebSocket(url, {
         headers: {
           Authorization: `Token ${this.config.apiKey}`,
         },
       });
 
-      this.ws.on('open', () => resolve());
-      this.ws.on('error', (err) => {
-        this.emit('error', err);
-        reject(err);
+      this.ws.on('unexpected-response', (_req, res) => {
+        let body = '';
+        res.on('data', (d: Buffer) => {
+          body += d.toString('utf-8');
+        });
+        res.on('end', () => {
+          fail(
+            new Error(
+              `deepgram stt ws rejected: HTTP ${res.statusCode}${body ? ` — ${body.slice(0, 300)}` : ''}`
+            )
+          );
+        });
       });
+
+      this.ws.on('open', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      });
+      this.ws.on('error', (err) => fail(err as Error));
 
       this.ws.on('message', (data: Buffer | string) => {
         this._handleMessage(typeof data === 'string' ? data : data.toString('utf-8'));
       });
 
       this.ws.on('close', () => {
+        if (!settled) fail(new Error('deepgram stt ws closed before the upgrade completed'));
         this.closed = true;
         this.emit('close');
       });
@@ -361,7 +444,7 @@ class DeepgramStreamingSTTSession extends EventEmitter implements StreamingSTTSe
  * ```typescript
  * const stt = new DeepgramStreamingSTT({
  *   apiKey: process.env.DEEPGRAM_API_KEY!,
- *   model: 'nova-2',
+ *   model: 'nova-3',
  * });
  * const session = await stt.startSession({ language: 'en-US' });
  * session.on('transcript', (event) => console.log(event.text));

@@ -59,6 +59,15 @@ export interface LlmUsageEvent {
    */
   source?: string;
   /**
+   * Set (>= 1) when this event was served by a provider-fallback leg
+   * rather than the requested primary; the value is the hop number.
+   * Absent on primary-served calls. Lets hosts tell a leg row from a
+   * primary row instead of inferring it from paired token counts —
+   * during the 2026-07-20..26 quota outage every diverted call was
+   * indistinguishable from primary traffic in cost telemetry.
+   */
+  fallbackDepth?: number;
+  /**
    * Mirrors the `finishReason` on the GenerateText result so observers
    * can distinguish a clean stop from a token-cap truncation.
    */
@@ -75,6 +84,39 @@ export interface LlmUsageEvent {
     | 'streamObject'
     | 'embedText'
     | 'generateImage';
+  /**
+   * Wall-clock duration of the whole call in milliseconds, measured from
+   * surface entry (post-option parse, pre-routing) to the moment the
+   * observer fires. For streaming surfaces this spans the full stream —
+   * first byte through final chunk — not just time-to-first-token.
+   *
+   * Fallback semantics: on a provider-fallback, `generateText` fires ONE
+   * event (from the winning hop) whose `durationMs` is threaded to span the
+   * whole call — failed primary attempts included — so a slow fallback turn
+   * reads as slow. `streamText` instead fires one event per hop: the inner
+   * hop event times that hop, and an aggregate outer event times the whole
+   * call. Either way `durationMs` is never less than the time the caller
+   * actually waited on the event that carries the final result.
+   *
+   * Optional so hosts tolerate events from older agentos versions.
+   */
+  durationMs?: number;
+  /**
+   * Time-to-first-part for streaming surfaces, in milliseconds: surface
+   * entry to the first StreamPart yielded to the consumer (text or
+   * tool-call alike). Undefined on non-streaming surfaces and when the
+   * stream errored before producing any part. The latency triage
+   * counterpart to `durationMs` — a high ttfb with a short remainder
+   * points at routing/prefill; the inverse points at generation length.
+   */
+  ttfbMs?: number;
+  /**
+   * Upstream host that actually served the call when the provider is an
+   * aggregator (OpenRouter: Groq, DeepInfra, ...). Mirrors the
+   * `servingProvider` response telemetry; absent for direct providers
+   * and surfaces that don't track it.
+   */
+  servingProvider?: string;
 }
 
 /**

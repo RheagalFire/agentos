@@ -140,7 +140,8 @@ export interface ICognitiveMemoryManager {
   observe?(
     role: 'user' | 'assistant' | 'system' | 'tool',
     content: string,
-    mood?: PADState
+    mood?: PADState,
+    options?: { contentSentiment?: number }
   ): Promise<ObservationNote[] | null>;
 
   /** Check prospective memory triggers (Batch 2). */
@@ -149,6 +150,11 @@ export interface ICognitiveMemoryManager {
     events?: string[];
     queryText?: string;
     queryEmbedding?: number[];
+    /**
+     * Policy-tier ceiling: drop prospective items whose `tierRank` exceeds it,
+     * matching the assembly path. Forwarded to `prospective.check`.
+     */
+    maxTierRank?: number;
   }): Promise<ProspectiveMemoryItem[]>;
 
   /** Register a new prospective reminder/intention. */
@@ -274,6 +280,10 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
   private workingMemory!: CognitiveWorkingMemory;
   private featureDetector!: IContentFeatureDetector;
   private initialized = false;
+  private lifecycleState: 'uninitialized' | 'initializing' | 'initialized' | 'shutting-down' =
+    'uninitialized';
+  private lifecycleRequest = 0;
+  private lifecycleTail: Promise<void> = Promise.resolve();
 
   // Batch 2 modules (optional)
   private graph: IMemoryGraph | null = null;
@@ -313,6 +323,37 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
   private typedNetworkExtractAtEncode = false;
 
   async initialize(config: CognitiveMemoryConfig): Promise<void> {
+    const request = ++this.lifecycleRequest;
+    this.lifecycleState = 'initializing';
+    await this.enqueueLifecycle(async () => {
+      let initializationStarted = false;
+      try {
+        if (this.initialized) {
+          throw new Error('CognitiveMemoryManager is already initialized');
+        }
+        initializationStarted = true;
+        await this.initializeResources(config);
+      } catch (error) {
+        if (initializationStarted) {
+          try {
+            await this.cleanupResources();
+          } catch (cleanupError) {
+            throw new AggregateError(
+              [error, cleanupError],
+              'CognitiveMemoryManager initialization failed and cleanup also failed',
+            );
+          }
+        }
+        throw error;
+      } finally {
+        if (request === this.lifecycleRequest) {
+          this.lifecycleState = this.initialized ? 'initialized' : 'uninitialized';
+        }
+      }
+    });
+  }
+
+  private async initializeResources(config: CognitiveMemoryConfig): Promise<void> {
     this.config = config;
 
     // Cognitive Mechanisms (optional — dynamic import to avoid loading when unused)
@@ -353,7 +394,11 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
       minActivation: 0.15,
       onEvict: async (_slotId, traceId) => {
         const trace = this.store.getTrace(traceId);
-        if (trace && !trace.isActive) {
+        // Never resurrect a soft-deleted trace: its isActive=false is a
+        // tombstone, not a working-memory focus state. Re-activating it let
+        // the spaced-repetition sweep re-embed and re-upsert the deleted
+        // document into shared vector recall.
+        if (trace && !trace.isActive && !this.store.isDeleted(traceId)) {
           trace.isActive = true;
         }
       },
@@ -413,9 +458,6 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
         llmInvoker: config.reflector?.llmInvoker ?? config.featureDetectionLlmInvoker,
         mechanismsEngine: this.mechanismsEngine ?? undefined,
       });
-      if (config.consolidation?.enabled !== false) {
-        this.consolidation.start();
-      }
     }
 
     // --- Batch 3: Infinite Context Window ---
@@ -518,6 +560,9 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
       }
     }
 
+    if (this.consolidation && config.consolidation?.enabled !== false) {
+      this.consolidation.start();
+    }
     this.initialized = true;
   }
 
@@ -945,42 +990,66 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
   ): Promise<AssembledMemoryContext> {
     this.ensureInitialized();
 
-    // Retrieve relevant memories
-    const result = await this.retrieve(query, mood, options);
+    // The three pre-assembly stages that hit a backend — retrieval (vector
+    // search + rerank), the persistent-memory read, and the prospective
+    // trigger check (query embed + cue match) — are mutually independent,
+    // so they run concurrently instead of stacking their latencies on every
+    // turn. Only the graph-association walk below is a real data dependency
+    // (it seeds from the retrieved trace ids), so it alone waits on
+    // retrieval. The auxiliary stages never reject: each degrades to its
+    // empty value so a rejected retrieval is the only fatal path (unchanged)
+    // and no auxiliary promise is left to reject unhandled behind it.
+    const retrievePromise = this.retrieve(query, mood, options);
 
-    // Get working memory state
-    const wmText = this.workingMemory.formatForPrompt();
-
-    let persistentMemoryText: string | undefined;
-    if (this.config.persistentMemory) {
-      try {
-        const text = await this.config.persistentMemory.read();
-        const trimmed = typeof text === 'string' ? text.trim() : '';
-        persistentMemoryText = trimmed.length > 0 ? trimmed : undefined;
-      } catch {
-        /* non-critical */
-      }
-    }
+    const persistentPromise: Promise<string | undefined> = this.config.persistentMemory
+      ? Promise.resolve()
+          .then(() => this.config.persistentMemory!.read())
+          .then((text) => {
+            const trimmed = typeof text === 'string' ? text.trim() : '';
+            return trimmed.length > 0 ? trimmed : undefined;
+          })
+          .catch(() => undefined /* non-critical */)
+      : Promise.resolve(undefined);
 
     // --- Batch 2: Check prospective memory ---
-    const prospectiveAlerts: string[] = [];
-    if (this.prospective) {
-      let queryEmbedding: number[] | undefined;
-      try {
-        const resp = await this.config.embeddingManager.generateEmbeddings({ texts: query });
-        queryEmbedding = resp.embeddings[0];
-      } catch {
-        /* non-critical */
-      }
+    // Best-effort like the other auxiliary stages: a throwing prospective
+    // backend degrades to "no alerts" instead of failing the whole turn's
+    // assembly (pre-2026-07 the check ran unguarded and was fatal).
+    const prospectivePromise: Promise<string[]> = this.prospective
+      ? (async () => {
+          const alerts: string[] = [];
+          try {
+            let queryEmbedding: number[] | undefined;
+            try {
+              const resp = await this.config.embeddingManager.generateEmbeddings({ texts: query });
+              queryEmbedding = resp.embeddings[0];
+            } catch {
+              /* non-critical — check falls back to text-only cue matching */
+            }
+            const triggered = await this.prospective!.check({
+              queryText: query,
+              queryEmbedding,
+              maxTierRank: options.maxTierRank,
+            });
+            for (const item of triggered) {
+              alerts.push(`[${item.triggerType}] ${item.content}`);
+            }
+          } catch {
+            /* non-critical */
+          }
+          return alerts;
+        })()
+      : Promise.resolve([]);
 
-      const triggered = await this.prospective.check({
-        queryText: query,
-        queryEmbedding,
-      });
-      for (const item of triggered) {
-        prospectiveAlerts.push(`[${item.triggerType}] ${item.content}`);
-      }
-    }
+    const [result, persistentMemoryText, prospectiveAlerts] = await Promise.all([
+      retrievePromise,
+      persistentPromise,
+      prospectivePromise,
+    ]);
+
+    // Get working memory state (sync; after retrieval so it reflects the
+    // focus/decay updates retrieval just applied — same order as before).
+    const wmText = this.workingMemory.formatForPrompt();
 
     // --- Batch 2: Graph associations ---
     const graphContext: string[] = [];
@@ -988,9 +1057,16 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
       const seedIds = result.retrieved.slice(0, 3).map((t) => t.id);
       try {
         const activated = await this.graph.spreadingActivation(seedIds, { maxResults: 5 });
+        const recallableIds = await this.store.filterRecallableTraceIds(
+          activated.map((node) => node.memoryId),
+        );
         for (const node of activated) {
           const trace = this.store.getTrace(node.memoryId);
-          if (trace) {
+          if (
+            trace?.isActive &&
+            recallableIds.has(node.memoryId) &&
+            !this.store.isDeleted(node.memoryId)
+          ) {
             graphContext.push(
               `[associated, activation=${node.activation.toFixed(2)}] ${trace.content.substring(0, 150)}`
             );
@@ -1100,7 +1176,8 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
   async observe(
     role: 'user' | 'assistant' | 'system' | 'tool',
     content: string,
-    mood?: PADState
+    mood?: PADState,
+    options?: { contentSentiment?: number }
   ): Promise<ObservationNote[] | null> {
     if (!this.observer) return null;
 
@@ -1124,6 +1201,7 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
               sourceType: traceData.provenance.sourceType,
               tags: traceData.tags,
               entities: traceData.entities,
+              contentSentiment: options?.contentSentiment,
             }
           );
         }
@@ -1177,6 +1255,12 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
     events?: string[];
     queryText?: string;
     queryEmbedding?: number[];
+    /**
+     * Policy-tier ceiling forwarded to `prospective.check`, so the direct
+     * prospective-check path gates by session tier exactly like the assembly
+     * path (`assembleForPrompt`) already does.
+     */
+    maxTierRank?: number;
   }): Promise<ProspectiveMemoryItem[]> {
     if (!this.prospective) return [];
     return this.prospective.check(context);
@@ -1226,6 +1310,10 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
   // =========================================================================
 
   async runConsolidation(): Promise<ConsolidationResult> {
+    if (this.lifecycleState === 'shutting-down') {
+      throw new Error('CognitiveMemoryManager is shutting down');
+    }
+    this.ensureInitialized();
     if (!this.consolidation) {
       return {
         prunedCount: 0,
@@ -1362,9 +1450,17 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
   // =========================================================================
 
   async shutdown(): Promise<void> {
-    this.consolidation?.stop();
-    await this.graph?.shutdown();
-    this.initialized = false;
+    const request = ++this.lifecycleRequest;
+    this.lifecycleState = 'shutting-down';
+    await this.enqueueLifecycle(async () => {
+      try {
+        await this.cleanupResources();
+      } finally {
+        if (request === this.lifecycleRequest) {
+          this.lifecycleState = 'uninitialized';
+        }
+      }
+    });
   }
 
   // =========================================================================
@@ -1541,8 +1637,53 @@ export class CognitiveMemoryManager implements ICognitiveMemoryManager {
   // Internal
   // =========================================================================
 
+  private enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.lifecycleTail.then(operation, operation);
+    this.lifecycleTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private async cleanupResources(): Promise<void> {
+    const consolidation = this.consolidation;
+    const graph = this.graph;
+    const store = this.store;
+    try {
+      try {
+        consolidation?.stop();
+        await consolidation?.waitForIdle();
+      } finally {
+        await graph?.shutdown();
+      }
+    } finally {
+      try {
+        store?.dispose();
+      } finally {
+        this.initialized = false;
+        this.graph = null;
+        this.observer = null;
+        this.reflector = null;
+        this.prospective = null;
+        this.consolidation = null;
+        this.contextWindow = null;
+        this.mechanismsEngine = null;
+        this.rerankerService = null;
+        this.archive = null;
+        this.hydeRetriever = null;
+        this.typedNetworkStore = null;
+        this.typedNetworkObserver = null;
+        this.typedSpreadingActivation = null;
+        this.typedNetworkRetriever = null;
+        this.typedNetworkVariant = null;
+        this.typedNetworkExtractAtEncode = false;
+      }
+    }
+  }
+
   private ensureInitialized(): void {
-    if (!this.initialized) {
+    if (!this.initialized || this.lifecycleState !== 'initialized') {
       throw new Error('CognitiveMemoryManager not initialized. Call initialize() first.');
     }
   }

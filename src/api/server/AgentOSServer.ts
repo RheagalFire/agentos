@@ -15,7 +15,7 @@ interface ChatRequestPayload {
 }
 
 export class AgentOSServer {
-  private readonly agentOS: AgentOS;
+  private agentOS: AgentOS;
   private readonly server: HTTPServer;
   private readonly config: AgentOSServerConfig;
   private agentReady: Promise<void>;
@@ -64,7 +64,32 @@ export class AgentOSServer {
       return;
     }
 
+    if (this.config.dispatchExtensionHandlers !== false) {
+      for (const handler of this.agentOS.getHttpHandlers()) {
+        try {
+          if (await handler(req, res)) return;
+        } catch (error) {
+          // Log the detail server-side; never echo arbitrary extension error
+          // text back to the client (it can carry internal/sensitive strings).
+          console.error('[AgentOSServer] Extension HTTP handler error:', (error as Error).message);
+          this.sendJson(res, 500, { error: 'Extension HTTP handler error' });
+          return;
+        }
+      }
+    }
+
     this.sendJson(res, 404, { error: 'Not Found' });
+  }
+
+  /**
+   * Test seam: replace the embedded AgentOS (unit tests only). Silences the
+   * original readiness promise so a pending initialize() rejection from the
+   * constructor cannot surface as an unhandled rejection.
+   */
+  public setAgentOSForTesting(stub: AgentOS): void {
+    void this.agentReady.catch(() => undefined);
+    this.agentOS = stub;
+    this.agentReady = Promise.resolve();
   }
 
   private async handleListPersonasRequest(url: URL, res: ServerResponse): Promise<void> {

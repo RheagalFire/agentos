@@ -124,12 +124,14 @@ import type { IPersonaLoader } from '../cognition/substrate/personas/IPersonaLoa
 import {
   ExtensionManager,
   EXTENSION_KIND_GUARDRAIL,
+  EXTENSION_KIND_HTTP_HANDLER,
   EXTENSION_KIND_PROVENANCE,
   EXTENSION_KIND_TOOL,
   EXTENSION_KIND_WORKFLOW,
   type ExtensionLifecycleContext,
   type ExtensionManifest,
   type ExtensionOverrides,
+  type HttpHandlerPayload,
 } from '../extensions';
 import type { MemoryToolsExtensionOptions } from '../cognition/memory/io/extension/MemoryToolsExtension.js';
 import type { Memory } from '../cognition/memory/io/facade/Memory.js';
@@ -146,7 +148,10 @@ import { adaptTools, adaptToolsToMap, type AdaptableToolInput } from './runtime/
 import { createSchemaOnDemandPack } from '../extensions/packs/schema-on-demand-pack.js';
 import { WorkflowFacade } from './runtime/WorkflowFacade';
 import { CapabilityDiscoveryInitializer } from './runtime/CapabilityDiscoveryInitializer';
-import { SelfImprovementSessionManager } from './runtime/SelfImprovementSessionManager';
+import {
+  SelfImprovementSessionManager,
+  resolveGMIForToolContext,
+} from './runtime/SelfImprovementSessionManager';
 import { RagMemoryInitializer } from './runtime/RagMemoryInitializer';
 import type { TurnPlannerConfig } from '../orchestration/turn-planner/TurnPlanner';
 import type {
@@ -287,6 +292,7 @@ function wrapStorageAdapterWithWriteHooks(
 
 // Re-export from extracted module
 import { AgentOSServiceError } from './errors';
+import { resolvePersonaLoader, validatePersonaSource } from './runtime/personaLoaderResolution';
 export { AgentOSServiceError } from './errors';
 
 export interface AgentOSCapabilityDiscoverySources {
@@ -643,6 +649,12 @@ export interface AgentOSConfig {
   languageConfig?: import('../cognition/nlp/language').AgentOSLanguageConfig;
   /** Optional custom persona loader (useful for browser/local runtimes). */
   personaLoader?: IPersonaLoader;
+  /**
+   * Persona definitions given inline, as parsed JSON objects or code-built objects. They are
+   * served by an in-memory loader and validated like file personas. Exclusive with
+   * `personaLoader`; when set, the file-system persona directory is not read.
+   */
+  personas?: IPersonaDefinition[];
   /**
    * Optional cross-platform storage adapter for client-side persistence.
    * Enables fully offline AgentOS in browsers (IndexedDB), desktop (SQLite), mobile (Capacitor).
@@ -1086,7 +1098,8 @@ export class AgentOS implements IAgentOS {
             selfImprovementDeps:
               this.config.emergentConfig?.selfImprovement?.enabled
                 ? this.selfImprovementManager.buildToolDeps(storageAdapter, {
-                    getActiveGMI: () => this.gmiManager?.activeGMIs?.values().next().value,
+                    // The GMI that made the tool call, never whichever GMI happens to be first.
+                    getGMIForContext: (context) => resolveGMIForToolContext(this.gmiManager, context),
                     getToolOrchestrator: () => this.toolOrchestrator,
                   })
                 : undefined,
@@ -1142,8 +1155,9 @@ export class AgentOS implements IAgentOS {
       console.log('AgentOS: StreamingManager initialized.');
 
       // Initialize GMI Manager
+      const personaSource = resolvePersonaLoader(this.config);
       this.gmiManager = new GMIManager(
-        this.config.gmiManagerConfig,
+        { ...this.config.gmiManagerConfig, personaLoaderConfig: personaSource.personaLoaderConfig },
         this.subscriptionService,
         this.authService,
         this.conversationManager, // Removed Prisma parameter
@@ -1152,7 +1166,7 @@ export class AgentOS implements IAgentOS {
         this.utilityAIService, // Pass the potentially dual-role utility service
         this.toolOrchestrator,
         this.ragMemoryInitializer.retrievalAugmentor,
-        this.config.personaLoader
+        personaSource.loader
       );
       await this.gmiManager.initialize();
       console.log('AgentOS: GMIManager initialized.');
@@ -1237,6 +1251,7 @@ export class AgentOS implements IAgentOS {
       // but as a runtime check:
       missingParams.push('AgentOSConfig (entire object)');
     } else {
+      validatePersonaSource(config);
       // Check for each required sub-configuration
       const requiredConfigs: Array<keyof AgentOSConfig> = [
         'gmiManagerConfig',
@@ -1519,6 +1534,21 @@ export class AgentOS implements IAgentOS {
   public getExtensionManager(): ExtensionManager {
     this.ensureInitialized();
     return this.extensionManager;
+  }
+
+  /**
+   * Active extension HTTP handlers (EXTENSION_KIND_HTTP_HANDLER payloads), in
+   * registration order. Empty before initialize() or when none are loaded.
+   * Hosts (AgentOSServer, wunderland start, express mounts) iterate these to
+   * serve pack-contributed endpoints such as webhooks.
+   */
+  public getHttpHandlers(): HttpHandlerPayload[] {
+    if (!this.extensionManager) return [];
+    return this.extensionManager
+      .getRegistry<HttpHandlerPayload>(EXTENSION_KIND_HTTP_HANDLER)
+      .listActive()
+      .map((descriptor) => descriptor.payload)
+      .filter(Boolean);
   }
 
   public getToolOrchestrator(): IToolOrchestrator {

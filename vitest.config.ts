@@ -36,6 +36,14 @@ export default defineConfig({
     ],
   },
   test: {
+    // Vitest 3 reads dep-externalization from test.server.deps (the root
+    // server.deps block above is the Vite-level home Vitest 1 read).
+    // Keep both so native C++ addons stay untransformed across majors.
+    server: {
+      deps: {
+        external: ['better-sqlite3', 'sharp'],
+      },
+    },
     globals: true,
     environment: 'node',
     testTimeout: 120000, // 2 minutes — Memory facade tests take 45s+ for SQLite ops
@@ -79,7 +87,9 @@ export default defineConfig({
     coverage: {
       reporter: ['text', 'html', 'lcov', 'json-summary'],
       reportsDirectory: 'coverage',
-      all: true,
+      // Vitest 4 removed `all`; `include` keeps every source file in the
+      // report, covered or not, and `exclude` is applied within it.
+      include: ['src/**/*.ts'],
       exclude: [
         'src/stubs/**',
         'src/server/**',

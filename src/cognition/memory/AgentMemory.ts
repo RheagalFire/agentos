@@ -101,6 +101,8 @@ export interface SearchOptions {
   usableFor?: TrustCapability | TrustCapability[];
   /** Shared retrieval policy surface. */
   policy?: MemoryRetrievalPolicy;
+  /** Live PAD mood for mood-congruent recall ranking. Omitted → neutral (no bias). */
+  currentMood?: PADState;
 }
 
 type StandaloneMemoryBackend = Pick<
@@ -129,11 +131,16 @@ export class AgentMemory {
   private manager?: ICognitiveMemoryManager;
   private standalone?: StandaloneMemoryBackend;
   private _initialized = false;
+  private lifecycleState: 'uninitialized' | 'initializing' | 'initialized' | 'shutting-down' =
+    'uninitialized';
+  private lifecycleRequest = 0;
+  private lifecycleTail: Promise<void> = Promise.resolve();
 
   constructor(backend?: ICognitiveMemoryManager | StandaloneMemoryBackend) {
     if (isStandaloneMemoryBackend(backend)) {
       this.standalone = backend;
       this._initialized = true;
+      this.lifecycleState = 'initialized';
       return;
     }
 
@@ -147,6 +154,7 @@ export class AgentMemory {
   static wrap(manager: ICognitiveMemoryManager): AgentMemory {
     const mem = new AgentMemory(manager);
     mem._initialized = true; // assume the passed manager is already initialized
+    mem.lifecycleState = 'initialized';
     return mem;
   }
 
@@ -171,13 +179,26 @@ export class AgentMemory {
    * `AgentMemory.sqlite()`).
    */
   async initialize(config: CognitiveMemoryConfig): Promise<void> {
-    if (this._initialized) return;
-    if (!this.manager) {
-      this._initialized = true;
-      return;
-    }
-    await this.manager.initialize(config);
-    this._initialized = true;
+    if (this._initialized && this.lifecycleState === 'initialized') return;
+    const request = ++this.lifecycleRequest;
+    this.lifecycleState = 'initializing';
+    await this.enqueueLifecycle(async () => {
+      try {
+        if (this._initialized) return;
+        if (!this.manager) {
+          throw new Error(
+            'AgentMemory.initialize() cannot reopen a closed standalone memory backend. ' +
+            'Create a new instance with AgentMemory.sqlite(...) or AgentMemory.wrapMemory(...).',
+          );
+        }
+        await this.manager.initialize(config);
+        this._initialized = true;
+      } finally {
+        if (request === this.lifecycleRequest) {
+          this.lifecycleState = this._initialized ? 'initialized' : 'uninitialized';
+        }
+      }
+    });
   }
 
   /**
@@ -197,6 +218,10 @@ export class AgentMemory {
       tags?: string[];
       entities?: string[];
       importance?: number;
+      /** Live PAD mood for mood-congruent encoding. Omitted → neutral (no bias). */
+      currentMood?: PADState;
+      /** Content sentiment for the emotional-context tag. Omitted → falls back to `importance` (today's behavior). */
+      contentSentiment?: number;
       /**
        * Set when encoding a subjective trace produced by
        * {@link PerspectiveObserver}. Threads the source-event identifiers into
@@ -218,14 +243,14 @@ export class AgentMemory {
             entities: options?.entities,
             importance: options?.importance,
           })
-        : await this.manager!.encode(content, NEUTRAL_MOOD, 'neutral', {
+        : await this.manager!.encode(content, options?.currentMood ?? NEUTRAL_MOOD, 'neutral', {
             type: options?.type ?? 'episodic',
             scope: options?.scope ?? 'thread',
             scopeId: options?.scopeId,
             sourceType: options?.sourceType ?? 'user_statement',
             tags: options?.tags,
             entities: options?.entities,
-            contentSentiment: options?.importance,
+            contentSentiment: options?.contentSentiment ?? options?.importance,
             perspectiveSource: options?.perspectiveSource,
           });
       return { trace, success: true };
@@ -249,7 +274,7 @@ export class AgentMemory {
       return this.recallFromStandalone(query, options);
     }
 
-    const result = await this.manager!.retrieve(query, NEUTRAL_MOOD, {
+    const result = await this.manager!.retrieve(query, options?.currentMood ?? NEUTRAL_MOOD, {
       topK: options?.limit ?? 10,
       types: options?.types,
       tags: options?.tags,
@@ -283,12 +308,17 @@ export class AgentMemory {
   async observe(
     role: 'user' | 'assistant' | 'system' | 'tool',
     content: string,
+    options?: { currentMood?: PADState; contentSentiment?: number },
   ): Promise<ObservationNote[] | null> {
     this.ensureReady();
     if (!this.manager) {
       this.throwUnsupportedForStandalone('observe');
     }
-    return this.manager.observe?.(role, content, NEUTRAL_MOOD) ?? null;
+    return (
+      this.manager.observe?.(role, content, options?.currentMood ?? NEUTRAL_MOOD, {
+        contentSentiment: options?.contentSentiment,
+      }) ?? null
+    );
   }
 
   /**
@@ -296,13 +326,18 @@ export class AgentMemory {
    */
   async getContext(
     query: string,
-    options?: { tokenBudget?: number },
+    options?: { tokenBudget?: number; currentMood?: PADState; maxTierRank?: number },
   ): Promise<AssembledMemoryContext> {
     this.ensureReady();
     if (!this.manager) {
       this.throwUnsupportedForStandalone('getContext');
     }
-    return this.manager.assembleForPrompt(query, options?.tokenBudget ?? 2000, NEUTRAL_MOOD);
+    return this.manager.assembleForPrompt(
+      query,
+      options?.tokenBudget ?? 2000,
+      options?.currentMood ?? NEUTRAL_MOOD,
+      { maxTierRank: options?.maxTierRank },
+    );
   }
 
   /**
@@ -350,14 +385,27 @@ export class AgentMemory {
 
   /** Shutdown and release resources. */
   async shutdown(): Promise<void> {
-    if (!this._initialized) return;
-    if (this.standalone) {
-      await this.standalone.close();
-      this._initialized = false;
-      return;
-    }
-    await this.manager?.shutdown();
-    this._initialized = false;
+    if (!this._initialized && this.lifecycleState === 'uninitialized') return;
+    const request = ++this.lifecycleRequest;
+    this.lifecycleState = 'shutting-down';
+    await this.enqueueLifecycle(async () => {
+      try {
+        if (!this._initialized) return;
+        try {
+          if (this.standalone) {
+            await this.standalone.close();
+            return;
+          }
+          await this.manager?.shutdown();
+        } finally {
+          this._initialized = false;
+        }
+      } finally {
+        if (request === this.lifecycleRequest) {
+          this.lifecycleState = 'uninitialized';
+        }
+      }
+    });
   }
 
   /**
@@ -777,6 +825,7 @@ export class AgentMemory {
         importance: p.importance,
         triggered: p.triggered,
         createdAt: p.createdAt,
+        tierRank: p.tierRank,
       })),
       metadata: {
         exportedAt: Date.now(),
@@ -833,6 +882,7 @@ export class AgentMemory {
             triggerType: item.triggerType as any,
             importance: item.importance,
             recurring: false,
+            tierRank: item.tierRank,
           });
         } catch {
           // Non-critical
@@ -844,7 +894,7 @@ export class AgentMemory {
   }
 
   get isInitialized(): boolean {
-    return this._initialized;
+    return this._initialized && this.lifecycleState === 'initialized';
   }
 
   /** Access the underlying manager for advanced usage. */
@@ -864,12 +914,21 @@ export class AgentMemory {
   }
 
   private ensureReady(): void {
-    if (!this._initialized) {
+    if (!this._initialized || this.lifecycleState !== 'initialized') {
       throw new Error(
         'AgentMemory not initialized. Call await memory.initialize(config), ' +
         'use AgentMemory.wrap(existingManager), or create a standalone instance with AgentMemory.sqlite(...).',
       );
     }
+  }
+
+  private enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.lifecycleTail.then(operation, operation);
+    this.lifecycleTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   private async recallFromStandalone(query: string, options?: SearchOptions): Promise<RecallResult> {

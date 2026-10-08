@@ -191,16 +191,24 @@ export class PostgresVectorStore implements IVectorStore {
     );
 
     // Create tsvector column + GIN index for full-text search.
-    // Use a try-catch because the column may already exist.
-    try {
-      await this.pool.query(
-        `ALTER TABLE ${table} ADD COLUMN tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', COALESCE(text_content, ''))) STORED`,
-      );
-      await this.pool.query(
-        `CREATE INDEX IF NOT EXISTS ${name}_fts ON ${table} USING gin (tsv)`,
-      );
-    } catch {
-      // Column already exists — fine.
+    //
+    // The column is read first and added only when that read fails. ALTER
+    // TABLE takes an ACCESS EXCLUSIVE lock even when the column exists. That
+    // lock waits behind every open reader of the table (a pg_dump reads the
+    // table for its whole run), and every later query on the table queues
+    // behind the waiting ALTER. A read takes ACCESS SHARE, which a dump does
+    // not block.
+    if (!(await this._hasTsvColumn(table))) {
+      try {
+        await this.pool.query(
+          `ALTER TABLE ${table} ADD COLUMN tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', COALESCE(text_content, ''))) STORED`,
+        );
+        await this.pool.query(
+          `CREATE INDEX IF NOT EXISTS ${name}_fts ON ${table} USING gin (tsv)`,
+        );
+      } catch {
+        // Another caller added the column between the read and the ALTER.
+      }
     }
 
     // Register in collections metadata.
@@ -467,29 +475,43 @@ export class PostgresVectorStore implements IVectorStore {
       : meta?.metric === 'dotproduct' ? '<#>'
       : '<=>';
 
+    // Filter each candidate source before its window rank and LIMIT. Applying
+    // the predicate after fusion can discard winners without allowing the
+    // next matching dense or lexical candidates into the RRF pool.
+    const { clause: filterClause, filterParams } = options?.filter
+      ? this._buildMetadataFilter(options.filter, 3)
+      : { clause: '', filterParams: [] };
+    const candidatePoolParam = 3 + filterParams.length;
+    const rrfKParam = candidatePoolParam + 1;
+    const topKParam = rrfKParam + 1;
+    const denseFilterSql = filterClause ? `WHERE ${filterClause}` : '';
+    const lexicalFilterSql = filterClause ? `AND ${filterClause}` : '';
+
     // RRF hybrid query: two CTEs (dense + lexical) merged with reciprocal rank fusion.
     const sql = `
       WITH dense AS (
         SELECT id, (embedding ${op} $1::vector) AS distance,
                ROW_NUMBER() OVER (ORDER BY embedding ${op} $1::vector) AS rank
         FROM ${table}
+        ${denseFilterSql}
         ORDER BY embedding ${op} $1::vector
-        LIMIT $3
+        LIMIT $${candidatePoolParam}
       ),
       lexical AS (
         SELECT id, ts_rank(tsv, plainto_tsquery('english', $2)) AS score,
                ROW_NUMBER() OVER (ORDER BY ts_rank(tsv, plainto_tsquery('english', $2)) DESC) AS rank
         FROM ${table}
         WHERE tsv @@ plainto_tsquery('english', $2)
-        LIMIT $3
+        ${lexicalFilterSql}
+        LIMIT $${candidatePoolParam}
       ),
       fused AS (
         SELECT COALESCE(d.id, l.id) AS id,
-               (1.0 / ($4 + COALESCE(d.rank, 10000))) + (1.0 / ($4 + COALESCE(l.rank, 10000))) AS rrf_score
+               (1.0 / ($${rrfKParam} + COALESCE(d.rank, 10000))) + (1.0 / ($${rrfKParam} + COALESCE(l.rank, 10000))) AS rrf_score
         FROM dense d
         FULL OUTER JOIN lexical l ON d.id = l.id
         ORDER BY rrf_score DESC
-        LIMIT $5
+        LIMIT $${topKParam}
       )
       SELECT f.id, f.rrf_score, t.embedding::text, t.metadata_json, t.text_content
       FROM fused f
@@ -497,7 +519,10 @@ export class PostgresVectorStore implements IVectorStore {
       ORDER BY f.rrf_score DESC
     `;
 
-    const result = await this.pool.query(sql, [vecStr, queryText, candidatePool, rrfK, topK]);
+    const result = await this.pool.query(
+      sql,
+      [vecStr, queryText, ...filterParams, candidatePool, rrfK, topK],
+    );
 
     const documents: RetrievedVectorDocument[] = result.rows.map((row: any) => {
       const doc: RetrievedVectorDocument = {
@@ -558,6 +583,16 @@ export class PostgresVectorStore implements IVectorStore {
   // =========================================================================
   // Internals
   // =========================================================================
+
+  /** Whether a collection table already has its `tsv` full-text column. */
+  private async _hasTsvColumn(table: string): Promise<boolean> {
+    try {
+      await this.pool.query(`SELECT tsv FROM ${table} LIMIT 0`);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   /** Ensure the store is initialized before any operation. */
   private async _ensureInit(): Promise<void> {

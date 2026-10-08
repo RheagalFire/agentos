@@ -1,0 +1,457 @@
+/**
+ * assembleForPrompt latency behavior:
+ *
+ * 1. The independent pre-assembly stages — retrieval (vector search), the
+ *    persistent-memory read, and the prospective trigger check (query embed +
+ *    check) — run CONCURRENTLY, not as stacked serial awaits. Verified by
+ *    gating the vector store's query on a manual latch and asserting the
+ *    sibling stages already started while retrieval is still in flight.
+ * 2. The prospective stage is best-effort like every other auxiliary stage
+ *    (persistent read, graph associations): a throwing prospective backend
+ *    degrades to "no alerts" instead of failing the whole turn's assembly.
+ * 3. A failing persistent-memory read still degrades to `undefined` (existing
+ *    contract, preserved across the concurrency refactor).
+ *
+ * Graph associations intentionally stay AFTER retrieval — they seed from the
+ * retrieved trace ids, so that edge is a real data dependency.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { CognitiveMemoryManager } from '../CognitiveMemoryManager';
+import { MemoryStore } from '../retrieval/store/MemoryStore.js';
+import type { PADState } from '../core/config.js';
+
+const MOOD: PADState = { valence: 0, arousal: 0.3, dominance: 0 };
+
+function makeMocks() {
+  const mockKnowledgeGraph = {
+    initialize: vi.fn(),
+    upsertEntity: vi.fn(),
+    upsertRelation: vi.fn(),
+    queryEntities: vi.fn().mockResolvedValue([]),
+    getNeighborhood: vi.fn().mockResolvedValue({ entities: [], relations: [] }),
+    getRelations: vi.fn().mockResolvedValue([]),
+    deleteEntity: vi.fn(),
+    deleteRelation: vi.fn(),
+    traverse: vi.fn().mockResolvedValue({
+      root: {
+        id: 'root',
+        type: 'memory',
+        label: 'root',
+        properties: {},
+        confidence: 1,
+        source: { type: 'system', timestamp: '', method: '' },
+      },
+      levels: [],
+      totalEntities: 0,
+      totalRelations: 0,
+    }),
+    recordMemory: vi.fn(),
+  };
+
+  const mockVectorStore = {
+    initialize: vi.fn(),
+    upsert: vi.fn(),
+    delete: vi.fn().mockResolvedValue({ deletedCount: 1, failedCount: 0 }),
+    query: vi.fn().mockResolvedValue({ documents: [] }),
+    collectionExists: vi.fn().mockResolvedValue(true),
+    createCollection: vi.fn(),
+  };
+
+  const mockEmbeddingManager = {
+    generateEmbeddings: vi.fn().mockResolvedValue({
+      embeddings: [[0.1, 0.2, 0.3]],
+      modelId: 'test',
+      providerId: 'test',
+      usage: { totalTokens: 0 },
+    }),
+    getEmbeddingDimension: vi.fn().mockResolvedValue(3),
+    getEmbeddingModelInfo: vi.fn().mockResolvedValue({
+      dimension: 3,
+      modelId: 'test',
+      providerId: 'test',
+      maxInputTokens: 8192,
+    }),
+    initialize: vi.fn(),
+    checkHealth: vi.fn().mockResolvedValue({ isHealthy: true }),
+    shutdown: vi.fn(),
+  };
+
+  const mockWorkingMemory = {
+    capacity: 7,
+    store: vi.fn(),
+    retrieve: vi.fn().mockResolvedValue([]),
+    clear: vi.fn(),
+    getSlots: vi.fn().mockReturnValue([]),
+  };
+
+  return { mockKnowledgeGraph, mockVectorStore, mockEmbeddingManager, mockWorkingMemory };
+}
+
+function makeManagerConfig(
+  mocks: ReturnType<typeof makeMocks>,
+  agentId: string,
+  extras: Record<string, unknown> = {},
+) {
+  return {
+    agentId,
+    traits: { emotionality: 0.5, conscientiousness: 0.5 },
+    moodProvider: () => MOOD,
+    featureDetectionStrategy: 'keyword',
+    workingMemory: mocks.mockWorkingMemory,
+    knowledgeGraph: mocks.mockKnowledgeGraph,
+    vectorStore: mocks.mockVectorStore,
+    embeddingManager: mocks.mockEmbeddingManager,
+    ...extras,
+  } as never;
+}
+
+describe('assembleForPrompt concurrency', () => {
+  let manager: CognitiveMemoryManager;
+  let mocks: ReturnType<typeof makeMocks>;
+  let persistentRead: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    manager = new CognitiveMemoryManager();
+    mocks = makeMocks();
+    persistentRead = vi.fn().mockResolvedValue('operator notes: keep answers short');
+    await manager.initialize({
+      agentId: 'assemble-concurrency-test',
+      traits: { emotionality: 0.5, conscientiousness: 0.5 },
+      moodProvider: () => MOOD,
+      featureDetectionStrategy: 'keyword',
+      persistentMemory: { read: persistentRead },
+      workingMemory: mocks.mockWorkingMemory as never,
+      knowledgeGraph: mocks.mockKnowledgeGraph as never,
+      vectorStore: mocks.mockVectorStore as never,
+      embeddingManager: mocks.mockEmbeddingManager as never,
+    } as never);
+  });
+
+  it('runs persistent read + prospective embed while retrieval is still in flight', async () => {
+    // Latch the vector search open so retrieval cannot complete until released.
+    let releaseQuery!: () => void;
+    const queryGate = new Promise<void>((resolve) => {
+      releaseQuery = resolve;
+    });
+    mocks.mockVectorStore.query.mockImplementation(async () => {
+      await queryGate;
+      return { documents: [] };
+    });
+
+    const checkSpy = vi.spyOn(
+      (manager as unknown as { prospective: { check: (...a: unknown[]) => Promise<unknown[]> } })
+        .prospective,
+      'check',
+    );
+
+    const pending = manager.assembleForPrompt('what did we plan for friday', 2048, MOOD);
+
+    // Let the event loop drain everything that isn't blocked on the latch.
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    // Serial implementation: neither fires until retrieve() resolves.
+    // Concurrent implementation: both have already started. Identical query
+    // embeds can be served from the embedding cache (one manager hit shared
+    // by the store and prospective paths), so assert the prospective stage
+    // itself ran during the latch window instead of counting embed calls.
+    expect(persistentRead).toHaveBeenCalledTimes(1);
+    expect(checkSpy).toHaveBeenCalledTimes(1);
+    expect(
+      mocks.mockEmbeddingManager.generateEmbeddings.mock.calls.length,
+    ).toBeGreaterThanOrEqual(1);
+
+    releaseQuery();
+    const out = await pending;
+    expect(out.contextText).toContain('operator notes: keep answers short');
+  });
+
+  it('a throwing prospective backend degrades to no alerts instead of failing assembly', async () => {
+    (manager as unknown as { prospective: { check: unknown } }).prospective.check = vi
+      .fn()
+      .mockRejectedValue(new Error('prospective backend down'));
+
+    const out = await manager.assembleForPrompt('anything scheduled?', 2048, MOOD);
+    expect(typeof out.contextText).toBe('string');
+    expect(out.contextText).toContain('operator notes: keep answers short');
+  });
+
+  it('a failing persistent-memory read degrades to undefined text', async () => {
+    persistentRead.mockRejectedValue(new Error('backing store unreadable'));
+
+    const out = await manager.assembleForPrompt('hello there', 2048, MOOD);
+    expect(typeof out.contextText).toBe('string');
+    expect(out.contextText).not.toContain('operator notes');
+  });
+
+  it('does not inject a deleted graph-associated trace into the prompt', async () => {
+    const deletedTrace = {
+      id: 'deleted-associated',
+      type: 'episodic',
+      scope: 'user',
+      scopeId: 'u1',
+      content: 'deleted association must stay out of prompts',
+      entities: [],
+      tags: [],
+      provenance: {
+        sourceType: 'user_statement',
+        sourceTimestamp: Date.now(),
+        confidence: 1,
+        verificationCount: 0,
+      },
+      emotionalContext: {
+        valence: 0,
+        arousal: 0,
+        dominance: 0,
+        intensity: 0,
+        gmiMood: '',
+      },
+      encodingStrength: 0.8,
+      stability: 0.5,
+      retrievalCount: 0,
+      lastAccessedAt: Date.now(),
+      accessCount: 0,
+      reinforcementInterval: 0,
+      associatedTraceIds: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      isActive: true,
+    } as const;
+    await manager.getStore().store(deletedTrace as never);
+    await manager.getStore().softDelete(deletedTrace.id);
+
+    vi.spyOn(manager, 'retrieve').mockResolvedValue({
+      retrieved: [{
+        ...deletedTrace,
+        id: 'active-seed',
+        content: 'active seed',
+        isActive: true,
+        retrievalScore: 0.9,
+        vectorSimilarity: 0.9,
+        scoreBreakdown: {
+          strengthScore: 0.9,
+          similarityScore: 0.9,
+          recencyScore: 0.9,
+          emotionalCongruenceScore: 0.5,
+          graphActivationScore: 0,
+          importanceScore: 0.8,
+        },
+      }],
+      partiallyRetrieved: [],
+      diagnostics: {
+        candidatesScanned: 1,
+        vectorSearchTimeMs: 0,
+        scoringTimeMs: 0,
+        totalTimeMs: 0,
+      },
+    } as never);
+    vi.spyOn(manager.getGraph()!, 'spreadingActivation').mockResolvedValue([{
+      memoryId: deletedTrace.id,
+      activation: 0.8,
+      depth: 1,
+      activatedBy: ['active-seed'],
+    }]);
+
+    const out = await manager.assembleForPrompt('recall the active seed', 2048, MOOD);
+    expect(out.contextText).not.toContain(deletedTrace.content);
+  });
+
+  it('manager shutdown disposes its memory store registration', async () => {
+    const store = manager.getStore();
+    await manager.shutdown();
+    await expect(store.query('after shutdown', MOOD)).rejects.toThrow(
+      'operation attempted after dispose',
+    );
+  });
+
+  it('manager shutdown waits for an active consolidation cycle', async () => {
+    const store = manager.getStore();
+    let signalCycleStarted: (() => void) | undefined;
+    let releaseCycle: (() => void) | undefined;
+    const cycleStarted = new Promise<void>((resolve) => {
+      signalCycleStarted = resolve;
+    });
+    const cycleGate = new Promise<void>((resolve) => {
+      releaseCycle = resolve;
+    });
+    vi.spyOn(store, 'getByScope').mockImplementationOnce(async () => {
+      signalCycleStarted?.();
+      await cycleGate;
+      return [];
+    });
+    const disposeSpy = vi.spyOn(store, 'dispose');
+
+    const consolidation = manager.runConsolidation();
+    await cycleStarted;
+    const shuttingDown = manager.shutdown();
+    try {
+      await Promise.resolve();
+      expect(disposeSpy).not.toHaveBeenCalled();
+    } finally {
+      releaseCycle?.();
+      await Promise.all([consolidation, shuttingDown]);
+    }
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('manager shutdown blocks new consolidation admission before disposal', async () => {
+    const store = manager.getStore();
+    const consolidation = (
+      manager as unknown as {
+        consolidation: { stop: () => void; waitForIdle: () => Promise<void> };
+      }
+    ).consolidation;
+    let releaseDrain: (() => void) | undefined;
+    const drainGate = new Promise<void>((resolve) => {
+      releaseDrain = resolve;
+    });
+    const stopSpy = vi.spyOn(consolidation, 'stop');
+    const waitSpy = vi.spyOn(consolidation, 'waitForIdle').mockImplementation(
+      async () => drainGate,
+    );
+    const disposeSpy = vi.spyOn(store, 'dispose');
+
+    const shuttingDown = manager.shutdown();
+    try {
+      await Promise.resolve();
+      expect(stopSpy).toHaveBeenCalledTimes(1);
+      expect(waitSpy).toHaveBeenCalledTimes(1);
+      expect(disposeSpy).not.toHaveBeenCalled();
+      await expect(manager.runConsolidation()).rejects.toThrow('is shutting down');
+    } finally {
+      releaseDrain?.();
+      await shuttingDown;
+    }
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects consolidation until initialization completes', async () => {
+    const freshManager = new CognitiveMemoryManager();
+    await expect(freshManager.runConsolidation()).rejects.toThrow('not initialized');
+  });
+
+  it('rejects consolidation while initialization is still pending', async () => {
+    const freshManager = new CognitiveMemoryManager();
+    const pendingMocks = makeMocks();
+    let signalGraphInitializeStarted: (() => void) | undefined;
+    let releaseGraphInitialize: (() => void) | undefined;
+    const graphInitializeStarted = new Promise<void>((resolve) => {
+      signalGraphInitializeStarted = resolve;
+    });
+    const graphInitializeGate = new Promise<void>((resolve) => {
+      releaseGraphInitialize = resolve;
+    });
+    pendingMocks.mockKnowledgeGraph.initialize.mockImplementation(async () => {
+      signalGraphInitializeStarted?.();
+      await graphInitializeGate;
+    });
+
+    const initializing = freshManager.initialize(
+      makeManagerConfig(pendingMocks, 'pending-initialization'),
+    );
+    try {
+      await graphInitializeStarted;
+      await expect(freshManager.runConsolidation()).rejects.toThrow('not initialized');
+    } finally {
+      releaseGraphInitialize?.();
+      await initializing;
+      await freshManager.shutdown();
+    }
+  });
+
+  it('cleans a late initialization failure and permits a retry', async () => {
+    const freshManager = new CognitiveMemoryManager();
+    const failingMocks = makeMocks();
+    const disposeSpy = vi.spyOn(MemoryStore.prototype, 'dispose');
+    try {
+      await expect(freshManager.initialize(makeManagerConfig(
+        failingMocks,
+        'late-init-failure',
+        { typedNetwork: { variant: 'minimal' } },
+      ))).rejects.toThrow('observerLLM is missing');
+      expect(disposeSpy).toHaveBeenCalled();
+      await expect(freshManager.getStore().query('disposed generation', MOOD)).rejects.toThrow(
+        'operation attempted after dispose',
+      );
+      await expect(freshManager.runConsolidation()).rejects.toThrow('not initialized');
+
+      const retryMocks = makeMocks();
+      await freshManager.initialize(makeManagerConfig(retryMocks, 'retry-success'));
+      expect(freshManager.getStore()).toBeInstanceOf(MemoryStore);
+      await freshManager.shutdown();
+    } finally {
+      disposeSpy.mockRestore();
+      await freshManager.shutdown().catch(() => undefined);
+    }
+  });
+
+  it('serializes reinitialization behind an in-flight shutdown', async () => {
+    const oldStore = manager.getStore();
+    const consolidation = (
+      manager as unknown as {
+        consolidation: { waitForIdle: () => Promise<void> };
+      }
+    ).consolidation;
+    let releaseDrain: (() => void) | undefined;
+    const drainGate = new Promise<void>((resolve) => {
+      releaseDrain = resolve;
+    });
+    vi.spyOn(consolidation, 'waitForIdle').mockImplementation(async () => drainGate);
+
+    const shuttingDown = manager.shutdown();
+    const nextMocks = makeMocks();
+    const reinitializing = manager.initialize(
+      makeManagerConfig(nextMocks, 'replacement-generation'),
+    );
+    try {
+      await Promise.resolve();
+      expect(manager.getStore()).toBe(oldStore);
+      expect(nextMocks.mockKnowledgeGraph.initialize).not.toHaveBeenCalled();
+    } finally {
+      releaseDrain?.();
+      await Promise.all([shuttingDown, reinitializing]);
+    }
+
+    expect(manager.getStore()).not.toBe(oldStore);
+    await expect(oldStore.query('retired generation', MOOD)).rejects.toThrow(
+      'operation attempted after dispose',
+    );
+    await manager.shutdown();
+  });
+
+  it('resets lifecycle state even when consolidation drain rejects', async () => {
+    const store = manager.getStore();
+    const consolidation = (
+      manager as unknown as {
+        consolidation: { waitForIdle: () => Promise<void> };
+      }
+    ).consolidation;
+    const graph = manager.getGraph();
+    if (!graph) throw new Error('expected initialized memory graph');
+    const disposeSpy = vi.spyOn(store, 'dispose');
+    const graphShutdownSpy = vi.spyOn(graph, 'shutdown');
+    vi.spyOn(consolidation, 'waitForIdle').mockRejectedValue(
+      new Error('simulated drain failure'),
+    );
+
+    await expect(manager.shutdown()).rejects.toThrow('simulated drain failure');
+    expect(graphShutdownSpy).toHaveBeenCalledTimes(1);
+    expect(disposeSpy).toHaveBeenCalledTimes(1);
+    expect(manager.getStore()).toBe(store);
+    await expect(manager.runConsolidation()).rejects.toThrow('not initialized');
+  });
+
+  it('resets lifecycle state even when store disposal rejects cleanup', async () => {
+    const store = manager.getStore();
+    const realDispose = store.dispose.bind(store);
+    vi.spyOn(store, 'dispose').mockImplementation(() => {
+      realDispose();
+      throw new Error('simulated dispose failure');
+    });
+
+    await expect(manager.shutdown()).rejects.toThrow('simulated dispose failure');
+    await expect(manager.runConsolidation()).rejects.toThrow('not initialized');
+    await expect(store.query('after failed cleanup', MOOD)).rejects.toThrow(
+      'operation attempted after dispose',
+    );
+  });
+});
