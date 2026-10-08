@@ -18,7 +18,7 @@ import { IUtilityAI } from '../nlp/ai_utilities/IUtilityAI';
 // Assuming IToolOrchestrator is correctly exported from this path
 import { IToolOrchestrator } from '../../core/tools/IToolOrchestrator';
 import type { ToolEffectRecord } from '../../core/tools/ITool';
-import { ModelUsage } from '../../core/llm/providers/IProvider';
+import type { ChatMessage, ModelUsage, ThinkingBlock } from '../../core/llm/providers/IProvider';
 
 /**
  * Defines the possible moods a GMI can be in, influencing its behavior and responses.
@@ -164,6 +164,19 @@ export interface CostAggregator {
 }
 
 
+/** What `GMIBaseConfig.beforeModelCall` receives for one model attempt. */
+export interface GMIModelCallContext {
+  turnId: string;
+  /** 0-based model step within the turn, as on the step's STEP_FINISHED. */
+  stepIndex: number;
+  /** 0 for the primary, n for the n-th fallback hop. */
+  hop: number;
+  providerId: string;
+  modelId: string;
+  /** The attempt's prompt, system messages included. A copy: return the messages to send instead. */
+  messages: ChatMessage[];
+}
+
 /**
  * Base configuration required to initialize a GMI instance.
  * @interface GMIBaseConfig
@@ -200,6 +213,14 @@ export interface GMIBaseConfig {
    * `GatewayProviderManager` (see `src/api/runtime/gatewayProviderManager.ts`).
    */
   completionGateway?: import('../../api/runtime/completionGateway.js').CompletionGateway;
+  /**
+   * Called for every model attempt after its prompt is built and before it is
+   * sent, a fallback hop's rebuilt prompt included. Messages it returns replace
+   * that attempt's prompt and do not enter the history; a hook that throws or
+   * returns an empty list is recorded on the reasoning trace and the built
+   * prompt is sent. `agent({ runtime: 'gmi' })` routes `onBeforeGeneration` here.
+   */
+  beforeModelCall?: (context: GMIModelCallContext) => Promise<ChatMessage[] | void> | ChatMessage[] | void;
 }
 
 /**
@@ -344,6 +365,8 @@ export interface StepFinishedChunkPayload {
    * returned it as a forced tool call (Anthropic); other hops return the JSON as the step's text.
    */
   structuredOutput?: unknown;
+  /** The step's extended-thinking blocks (Anthropic), so a session store can replay the step. */
+  thinkingBlocks?: ThinkingBlock[];
 }
 
 /** Content of a TOOL_RESULT chunk. */
