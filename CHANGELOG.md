@@ -1,3 +1,9 @@
+## [0.12.9](https://github.com/framerslab/agentos/compare/v0.12.8...v0.12.9) (2026-10-08)
+
+### fix
+
+* **emergent:** six hardening fixes for the forged-tool ceiling (#144) ([06a8a96](https://github.com/framerslab/agentos/commit/06a8a96ecf5479b81b2847d395c8e77a889fb4a3))
+
 ## [0.12.8](https://github.com/framerslab/agentos/compare/v0.12.7...v0.12.8) (2026-10-08)
 
 ### fix
