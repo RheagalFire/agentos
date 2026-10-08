@@ -1,3 +1,9 @@
+## [0.12.11](https://github.com/framerslab/agentos/compare/v0.12.10...v0.12.11) (2026-10-08)
+
+### fix
+
+* **emergent:** a forged tool's result past the in-process output limit fails the call instead of coming back cut (#149) ([45570bb](https://github.com/framerslab/agentos/commit/45570bb0c2afc99a789b4117179c2f72b5a27227))
+
 ## [0.12.10](https://github.com/framerslab/agentos/compare/v0.12.9...v0.12.10) (2026-10-08)
 
 ### feat
