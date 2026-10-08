@@ -1,3 +1,13 @@
+## [0.12.6](https://github.com/framerslab/agentos/compare/v0.12.5...v0.12.6) (2026-10-08)
+
+### chore
+
+* **examples:** the Mars example's forged code runs under a ceiling (#138) ([a95ce08](https://github.com/framerslab/agentos/commit/a95ce0890564b2be918049ae813f825c84ca5743))
+
+### fix
+
+* **images:** a processing instruction in a DOCTYPE subset is read whole (#137) ([1452648](https://github.com/framerslab/agentos/commit/1452648735ecc62f92fcc1a87b260f8faddde035))
+
 ## [0.12.5](https://github.com/framerslab/agentos/compare/v0.12.4...v0.12.5) (2026-10-08)
 
 ### fix
