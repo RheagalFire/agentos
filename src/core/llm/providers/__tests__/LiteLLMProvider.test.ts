@@ -11,51 +11,56 @@ import { OpenAIProvider } from '../implementations/OpenAIProvider.js';
 
 // Mock OpenAIProvider to avoid real HTTP calls
 vi.mock('../implementations/OpenAIProvider.js', () => {
-  const MockOpenAIProvider = vi.fn().mockImplementation(() => ({
-    initialize: vi.fn().mockResolvedValue(undefined),
-    generateCompletion: vi.fn().mockResolvedValue({
-      id: 'chatcmpl-test',
-      object: 'chat.completion',
-      created: 0,
-      modelId: 'anthropic/claude-sonnet-4-6',
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: 'OK' },
-          finishReason: 'stop',
-        },
-      ],
-      usage: { promptTokens: 13, completionTokens: 4, totalTokens: 17 },
-    }),
-    generateCompletionStream: vi.fn().mockImplementation(async function* () {
-      yield {
+  // A `function` implementation, not an arrow: the provider calls
+  // `new OpenAIProvider()`, and Vitest constructs a mock with
+  // Reflect.construct, which throws on an arrow function.
+  const MockOpenAIProvider = vi.fn().mockImplementation(function () {
+    return {
+      initialize: vi.fn().mockResolvedValue(undefined),
+      generateCompletion: vi.fn().mockResolvedValue({
         id: 'chatcmpl-test',
-        object: 'chat.completion.chunk',
+        object: 'chat.completion',
         created: 0,
         modelId: 'anthropic/claude-sonnet-4-6',
         choices: [
           {
             index: 0,
-            message: { role: 'assistant', content: '' },
+            message: { role: 'assistant', content: 'OK' },
             finishReason: 'stop',
           },
         ],
-        responseTextDelta: 'OK',
-        isFinal: true,
         usage: { promptTokens: 13, completionTokens: 4, totalTokens: 17 },
-      };
-    }),
-    generateEmbeddings: vi.fn().mockResolvedValue({
-      object: 'list',
-      data: [{ object: 'embedding', embedding: [0.1, 0.2, 0.3], index: 0 }],
-      model: 'text-embedding-3-small',
-      usage: { prompt_tokens: 5, total_tokens: 5 },
-    }),
-    checkHealth: vi
-      .fn()
-      .mockResolvedValue({ isHealthy: true, details: 'OK' }),
-    shutdown: vi.fn().mockResolvedValue(undefined),
-  }));
+      }),
+      generateCompletionStream: vi.fn().mockImplementation(async function* () {
+        yield {
+          id: 'chatcmpl-test',
+          object: 'chat.completion.chunk',
+          created: 0,
+          modelId: 'anthropic/claude-sonnet-4-6',
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content: '' },
+              finishReason: 'stop',
+            },
+          ],
+          responseTextDelta: 'OK',
+          isFinal: true,
+          usage: { promptTokens: 13, completionTokens: 4, totalTokens: 17 },
+        };
+      }),
+      generateEmbeddings: vi.fn().mockResolvedValue({
+        object: 'list',
+        data: [{ object: 'embedding', embedding: [0.1, 0.2, 0.3], index: 0 }],
+        model: 'text-embedding-3-small',
+        usage: { prompt_tokens: 5, total_tokens: 5 },
+      }),
+      checkHealth: vi
+        .fn()
+        .mockResolvedValue({ isHealthy: true, details: 'OK' }),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+    };
+  });
   return { OpenAIProvider: MockOpenAIProvider };
 });
 
