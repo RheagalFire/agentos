@@ -1,3 +1,9 @@
+## [0.12.13](https://github.com/framerslab/agentos/compare/v0.12.12...v0.12.13) (2026-10-08)
+
+### fix
+
+* **hitl:** close the review findings on the approval gate (#153) ([53547bc](https://github.com/framerslab/agentos/commit/53547bccdea440518a2c68e44e3266e44561ac9e))
+
 ## [0.12.12](https://github.com/framerslab/agentos/compare/v0.12.11...v0.12.12) (2026-10-08)
 
 ### fix
