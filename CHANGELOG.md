@@ -1,3 +1,10 @@
+## [0.12.7](https://github.com/framerslab/agentos/compare/v0.12.6...v0.12.7) (2026-10-08)
+
+### fix
+
+* **emergent:** fifteen defects from a cold read of the stored-tool and composition code (#140) ([f515e1b](https://github.com/framerslab/agentos/commit/f515e1b3bfb5254ced50d424eb9cc4f43d23dd18))
+* **openrouter:** a choice-level stream error waits for its usage line, and the written-id exclusion is pinned (#141) ([91dce0d](https://github.com/framerslab/agentos/commit/91dce0d7714dc58e4e8109fe1e59b0f80492f0f9))
+
 ## [0.12.6](https://github.com/framerslab/agentos/compare/v0.12.5...v0.12.6) (2026-10-08)
 
 ### chore
